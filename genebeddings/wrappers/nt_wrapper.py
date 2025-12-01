@@ -276,8 +276,13 @@ class NTWrapper(BaseWrapper):
                 logits_cache[t_idx] = self._masked_token_logits(token_ids, t_idx)
             logits_vec = logits_cache[t_idx]
 
-            pattern = ["N"] * self.k
-            pattern = "".join(pattern[:rel] + ["N"] + pattern[rel + 1:])
+            # Get the actual k-mer from the sequence to use as pattern
+            # Per the paper: filter to only k-mers matching reference at all positions EXCEPT rel
+            kmer_start = t_idx * self.k
+            kmer_end = kmer_start + self.k
+            ref_kmer = list(s[kmer_start:kmer_end])
+            ref_kmer[rel] = "N"  # wildcard only at the position of interest
+            pattern = "".join(ref_kmer)
             out_list.append(self._pattern_filter(logits_vec, pattern, masked_idx_in_token=rel))
 
         if return_dict:

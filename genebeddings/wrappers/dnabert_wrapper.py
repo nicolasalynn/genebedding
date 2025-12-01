@@ -360,9 +360,26 @@ class DNABERTWrapper(BaseWrapper):
 
         out = backbone(**enc, output_hidden_states=True)
 
+        # Handle both tuple and named output formats (DNABERT-2 returns tuples)
         if layer is None:
-            return out.last_hidden_state
-        return out.hidden_states[layer]
+            # Get last hidden state
+            if hasattr(out, 'last_hidden_state'):
+                return out.last_hidden_state
+            else:
+                # Tuple format: (last_hidden_state, ...)
+                return out[0]
+        else:
+            # Get specific layer
+            if hasattr(out, 'hidden_states'):
+                return out.hidden_states[layer]
+            else:
+                # Tuple format: (last_hidden_state, hidden_states, ...)
+                # hidden_states is typically the second element when output_hidden_states=True
+                if isinstance(out, tuple) and len(out) > 1:
+                    hidden_states = out[1]
+                    if isinstance(hidden_states, tuple):
+                        return hidden_states[layer]
+                raise ValueError(f"Cannot extract layer {layer} from model output format")
 
     def _normalize_seq(self, seq: str) -> str:
         """Clean to A/C/G/T/N, uppercase."""
