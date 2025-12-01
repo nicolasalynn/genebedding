@@ -79,7 +79,10 @@ class BorzoiWrapper:
 
         # Final heads should work in float32 (Borzoi does x.float() before them)
         self.model.human_head = self.model.human_head.to(torch.float32)
-        self.model.mouse_head = self.model.mouse_head.to(torch.float32)
+        if repo == "johahi/flashzoi-replicate-0":
+            self.model.mouse_head = self.model.mouse_head.to(torch.float32)
+        else:
+            self.model.mouse_head = None
 
         # Crop length of Borzoi outputs
         self.target_len = _get_target_len(self.model, default=6144)
