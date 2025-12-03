@@ -107,6 +107,10 @@ __all__ = [
     # Distance functions
     "cosine_distance",
     "l2_distance",
+    # Dependency map
+    "DependencyMapResult",
+    "compute_pairwise_epistasis",
+    "compute_dependency_map",
 ]
 
 __version__ = "0.1.0"
@@ -270,7 +274,12 @@ class EpistasisComplexCoords:
 
     The plane is defined by:
     - e_par: unit vector along WT→expected (additive prediction)
-    - e_perp: orthogonal unit vector derived from single-mutant effect
+    - e_perp: orthogonal axis derived from (v1 - v2), pointing from M2's
+      effect toward M1's effect (after removing the parallel component)
+
+    This construction gives directional meaning to the y-axis:
+    - y_obs > 0: epistasis is "M1-like" (double mutant resembles M1 more)
+    - y_obs < 0: epistasis is "M2-like" (double mutant resembles M2 more)
 
     Coordinates are normalized so expected lies at approximately (1, 0).
 
@@ -283,7 +292,8 @@ class EpistasisComplexCoords:
     x_obs : float
         Observed double-mutant x-coordinate.
     y_obs : float
-        Observed double-mutant y-coordinate.
+        Observed double-mutant y-coordinate. Positive means the epistatic
+        deviation is in the M1 direction; negative means M2 direction.
     rho : float
         Magnitude |ε| of complex epistasis.
     theta : float
@@ -968,8 +978,18 @@ class EpistasisGeometry(_GeometryBase):
         Compute canonical complex epistasis coordinates.
 
         Builds a 2D plane in embedding space:
-        - e_par: unit vector along WT→expected
-        - e_perp: orthogonal unit vector from v1
+        - e_par: unit vector along WT→expected (additive direction)
+        - e_perp: orthogonal axis derived from (v1 - v2), giving directional
+          meaning to the perpendicular component:
+            * +y: deviation is "M1-like" (double mutant resembles M1 more)
+            * -y: deviation is "M2-like" (double mutant resembles M2 more)
+
+        The perpendicular axis is constructed by taking the difference vector
+        (v1 - v2), which points from the M2 effect toward the M1 effect, and
+        removing its component along e_par. This gives a geometrically
+        meaningful interpretation: epistasis that "cancels" M2's effect will
+        appear at +y, while epistasis that "cancels" M1's effect will appear
+        at -y.
 
         Projects WT, expected, and observed into this plane, normalizing
         so expected lies at approximately (1, 0).
@@ -987,8 +1007,13 @@ class EpistasisGeometry(_GeometryBase):
             v_exp = self.v12_obs.clone()
 
         e_par = self._unit(v_exp)
-        v1_res = self.v1 - torch.dot(self.v1, e_par) * e_par
-        e_perp = self._unit(v1_res)
+
+        # Perpendicular axis: derived from (v1 - v2) to give directional meaning
+        # v1 - v2 points from M2's effect toward M1's effect
+        # After removing the parallel component, +y means "M1-like", -y means "M2-like"
+        v_diff = self.v1 - self.v2
+        v_diff_perp = v_diff - torch.dot(v_diff, e_par) * e_par
+        e_perp = self._unit(v_diff_perp)
 
         x_exp_raw = float(torch.dot(self.v12_exp, e_par))
         y_exp_raw = float(torch.dot(self.v12_exp, e_perp))
@@ -2849,6 +2874,444 @@ def add_epistasis_metrics(
     )
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Dependency Map Analysis
+# ---------------------------------------------------------------------------
+
+NUCLEOTIDES = ["A", "C", "G", "T"]
+
+
+@dataclass
+class DependencyMapResult:
+    """
+    Result of a dependency map computation.
+
+    Attributes
+    ----------
+    positions : np.ndarray
+        Array of genomic positions analyzed.
+    matrix : np.ndarray
+        NxN matrix where entry (i, j) is the dependency score between
+        positions[i] and positions[j]. Symmetric, with NaN on diagonal.
+    aggregation : str
+        How mutation combinations were aggregated ("max" or "mean").
+    metric : str
+        Which epistasis metric was used ("epi_R_raw", "epi_R_expected", "rho").
+    sequence : str
+        The reference sequence used.
+    details : dict
+        Full results for each position pair, keyed by (pos_i, pos_j).
+    """
+
+    positions: np.ndarray
+    matrix: np.ndarray
+    aggregation: str
+    metric: str
+    sequence: str
+    details: dict = field(default_factory=dict)
+
+    def to_dataframe(self) -> "pd.DataFrame":
+        """Convert matrix to a labeled DataFrame."""
+        _require_pandas()
+        import pandas as pd
+
+        return pd.DataFrame(
+            self.matrix,
+            index=self.positions,
+            columns=self.positions,
+        )
+
+    def plot(
+        self,
+        figsize: tuple[float, float] = (10, 8),
+        cmap: str = "viridis",
+        title: str = "",
+        figure_name: str = "",
+        show: bool = True,
+    ) -> plt.Figure:
+        """
+        Plot dependency map as a heatmap.
+
+        Parameters
+        ----------
+        figsize : tuple
+            Figure size.
+        cmap : str
+            Colormap name.
+        title : str
+            Plot title.
+        figure_name : str
+            If provided, save figure to {figure_name}.png.
+        show : bool
+            Call plt.show().
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+        """
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Mask diagonal
+        mask = np.eye(len(self.positions), dtype=bool)
+        masked_matrix = np.ma.array(self.matrix, mask=mask)
+
+        im = ax.imshow(masked_matrix, cmap=cmap, aspect="equal")
+        plt.colorbar(im, ax=ax, label=f"Dependency ({self.metric})")
+
+        # Labels
+        n = len(self.positions)
+        if n <= 50:
+            ax.set_xticks(range(n))
+            ax.set_yticks(range(n))
+            ax.set_xticklabels(self.positions, rotation=90, fontsize=8)
+            ax.set_yticklabels(self.positions, fontsize=8)
+        else:
+            # Too many positions, use sparse labels
+            step = max(1, n // 10)
+            ax.set_xticks(range(0, n, step))
+            ax.set_yticks(range(0, n, step))
+            ax.set_xticklabels(self.positions[::step], rotation=90, fontsize=8)
+            ax.set_yticklabels(self.positions[::step], fontsize=8)
+
+        ax.set_xlabel("Position j")
+        ax.set_ylabel("Position i")
+
+        if title:
+            ax.set_title(title)
+        else:
+            ax.set_title(f"Dependency Map ({self.metric}, {self.aggregation})")
+
+        plt.tight_layout()
+
+        if figure_name:
+            fig.savefig(f"{figure_name}.png", dpi=300, bbox_inches="tight")
+            logger.info("Saved dependency map to %s.png", figure_name)
+
+        if show:
+            plt.show()
+
+        return fig
+
+    def top_pairs(self, n: int = 10) -> list[tuple[int, int, float]]:
+        """
+        Get the top N position pairs by dependency score.
+
+        Returns list of (pos_i, pos_j, score) tuples, sorted descending.
+        """
+        pairs = []
+        m = len(self.positions)
+        for i in range(m):
+            for j in range(i + 1, m):
+                score = self.matrix[i, j]
+                if not np.isnan(score):
+                    pairs.append((self.positions[i], self.positions[j], score))
+
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        return pairs[:n]
+
+
+def compute_pairwise_epistasis(
+    model,
+    sequence: str,
+    pos1: int,
+    pos2: int,
+    diff: Union[str, DiffFn] = "cosine",
+    eps: float = DEFAULT_EPS,
+) -> dict:
+    """
+    Compute epistasis for all mutation combinations at two positions.
+
+    For each position, tries all 3 alternative nucleotides (excluding the
+    reference). Returns 9 epistasis computations (3 x 3 combinations).
+
+    Parameters
+    ----------
+    model : object
+        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+    sequence : str
+        Reference sequence.
+    pos1 : int
+        First position (0-indexed into sequence).
+    pos2 : int
+        Second position (0-indexed into sequence).
+    diff : str or callable
+        Distance metric for epistasis computation.
+    eps : float
+        Numerical stability constant.
+
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - "ref1", "ref2": reference nucleotides
+        - "combinations": list of dicts, each with:
+            - "alt1", "alt2": alternative nucleotides
+            - "metrics": EpistasisMetrics
+            - "complex": EpistasisComplexCoords
+    """
+    if pos1 >= pos2:
+        raise ValueError(f"pos1 ({pos1}) must be < pos2 ({pos2})")
+    if pos1 < 0 or pos2 >= len(sequence):
+        raise ValueError(f"Positions out of bounds for sequence length {len(sequence)}")
+
+    ref1 = sequence[pos1]
+    ref2 = sequence[pos2]
+
+    # Get WT embedding
+    h_wt = model.embed(sequence, pool="mean")
+
+    results = {
+        "ref1": ref1,
+        "ref2": ref2,
+        "pos1": pos1,
+        "pos2": pos2,
+        "combinations": [],
+    }
+
+    # All alternative alleles
+    alts1 = [n for n in NUCLEOTIDES if n != ref1]
+    alts2 = [n for n in NUCLEOTIDES if n != ref2]
+
+    for alt1 in alts1:
+        # Create M1 sequence
+        seq_m1 = sequence[:pos1] + alt1 + sequence[pos1 + 1:]
+        h_m1 = model.embed(seq_m1, pool="mean")
+
+        for alt2 in alts2:
+            # Create M2 sequence
+            seq_m2 = sequence[:pos2] + alt2 + sequence[pos2 + 1:]
+            h_m2 = model.embed(seq_m2, pool="mean")
+
+            # Create M12 sequence (both mutations)
+            seq_m12 = sequence[:pos1] + alt1 + sequence[pos1 + 1:pos2] + alt2 + sequence[pos2 + 1:]
+            h_m12 = model.embed(seq_m12, pool="mean")
+
+            # Compute epistasis geometry
+            geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, eps=eps, diff=diff)
+
+            results["combinations"].append({
+                "alt1": alt1,
+                "alt2": alt2,
+                "metrics": geom.metrics(),
+                "complex": geom.complex_coords(),
+            })
+
+    return results
+
+
+def compute_dependency_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    metric: str = "epi_R_expected",
+    aggregation: str = "max",
+    diff: Union[str, DiffFn] = "cosine",
+    eps: float = DEFAULT_EPS,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    cache_embeddings: bool = True,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map showing epistasis between all position pairs.
+
+    For each pair of positions (i, j), computes epistasis for all 9 mutation
+    combinations and aggregates to a single dependency score.
+
+    Parameters
+    ----------
+    model : object
+        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+    sequence : str
+        Reference sequence.
+    positions : list[int], optional
+        Specific positions to analyze (0-indexed). If None, uses start/end.
+    start : int, optional
+        Start position (inclusive). Default: 0.
+    end : int, optional
+        End position (exclusive). Default: len(sequence).
+    step : int, optional
+        Step size between positions. Default: 1.
+    metric : str, optional
+        Epistasis metric to use: "epi_R_raw", "epi_R_expected", "epi_R_singles",
+        or "rho" (complex magnitude). Default: "epi_R_expected".
+    aggregation : str, optional
+        How to aggregate across mutation combinations: "max" or "mean".
+        Default: "max".
+    diff : str or callable
+        Distance metric for epistasis computation. Default: "cosine".
+    eps : float
+        Numerical stability constant.
+    progress_callback : callable, optional
+        Called with (current_pair, total_pairs, description) for progress.
+    cache_embeddings : bool, optional
+        Cache single-mutant embeddings to avoid recomputation. Default: True.
+
+    Returns
+    -------
+    DependencyMapResult
+        Object containing the dependency matrix and metadata.
+
+    Examples
+    --------
+    >>> # Analyze region around two positions
+    >>> result = compute_dependency_map(
+    ...     model, sequence,
+    ...     positions=[2900, 2950, 3000, 3050, 3100],
+    ...     metric="epi_R_expected",
+    ... )
+    >>> result.plot()
+    >>> print(result.top_pairs(5))
+
+    >>> # Scan a range with step size
+    >>> result = compute_dependency_map(
+    ...     model, sequence,
+    ...     start=2800, end=3200, step=10,
+    ... )
+    """
+    # Determine positions to analyze
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for dependency map")
+
+    logger.info(
+        "Computing dependency map: %d positions, %d pairs",
+        n, n * (n - 1) // 2
+    )
+
+    # Validate positions
+    for p in pos_array:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(f"Position {p} out of bounds for sequence length {len(sequence)}")
+
+    # Initialize result matrix
+    matrix = np.full((n, n), np.nan)
+    details = {}
+
+    # Cache for single-mutant embeddings: (pos, alt) -> embedding
+    embedding_cache: dict[tuple[int, str], torch.Tensor] = {}
+
+    # Get WT embedding once
+    h_wt = model.embed(sequence, pool="mean")
+
+    def get_single_mutant_embedding(pos: int, alt: str) -> torch.Tensor:
+        """Get or compute single-mutant embedding."""
+        key = (pos, alt)
+        if cache_embeddings and key in embedding_cache:
+            return embedding_cache[key]
+
+        seq_mut = sequence[:pos] + alt + sequence[pos + 1:]
+        h_mut = model.embed(seq_mut, pool="mean")
+
+        if cache_embeddings:
+            embedding_cache[key] = h_mut
+
+        return h_mut
+
+    # Compute all pairs
+    total_pairs = n * (n - 1) // 2
+    pair_idx = 0
+
+    for i in range(n):
+        pos_i = pos_array[i]
+        ref_i = sequence[pos_i]
+        alts_i = [nuc for nuc in NUCLEOTIDES if nuc != ref_i]
+
+        for j in range(i + 1, n):
+            pos_j = pos_array[j]
+            ref_j = sequence[pos_j]
+            alts_j = [nuc for nuc in NUCLEOTIDES if nuc != ref_j]
+
+            if progress_callback:
+                progress_callback(
+                    pair_idx, total_pairs,
+                    f"Pair ({pos_i}, {pos_j})"
+                )
+
+            # Compute all 9 combinations
+            scores = []
+            pair_details = []
+
+            for alt_i in alts_i:
+                h_m1 = get_single_mutant_embedding(pos_i, alt_i)
+
+                for alt_j in alts_j:
+                    h_m2 = get_single_mutant_embedding(pos_j, alt_j)
+
+                    # Double mutant
+                    seq_m12 = (
+                        sequence[:pos_i] + alt_i +
+                        sequence[pos_i + 1:pos_j] + alt_j +
+                        sequence[pos_j + 1:]
+                    )
+                    h_m12 = model.embed(seq_m12, pool="mean")
+
+                    # Epistasis geometry
+                    geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, eps=eps, diff=diff)
+                    metrics = geom.metrics()
+                    complex_coords = geom.complex_coords()
+
+                    # Extract score based on metric
+                    if metric == "rho":
+                        score = complex_coords.rho
+                    elif hasattr(metrics, metric):
+                        score = getattr(metrics, metric)
+                    else:
+                        raise ValueError(f"Unknown metric: {metric}")
+
+                    scores.append(score)
+                    pair_details.append({
+                        "alt_i": alt_i,
+                        "alt_j": alt_j,
+                        "score": score,
+                        "metrics": metrics,
+                        "complex": complex_coords,
+                    })
+
+            # Aggregate scores
+            if aggregation == "max":
+                agg_score = max(scores)
+            elif aggregation == "mean":
+                agg_score = sum(scores) / len(scores)
+            else:
+                raise ValueError(f"Unknown aggregation: {aggregation}")
+
+            # Store in matrix (symmetric)
+            matrix[i, j] = agg_score
+            matrix[j, i] = agg_score
+
+            # Store details
+            details[(pos_i, pos_j)] = {
+                "ref_i": ref_i,
+                "ref_j": ref_j,
+                "aggregated_score": agg_score,
+                "all_combinations": pair_details,
+            }
+
+            pair_idx += 1
+
+    logger.info("Dependency map complete: %d pairs computed", total_pairs)
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation=aggregation,
+        metric=metric,
+        sequence=sequence,
+        details=details,
+    )
 
 
 # =============================================================================
