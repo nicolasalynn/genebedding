@@ -2631,6 +2631,7 @@ def add_epistasis_metrics(
     include_triangle: bool = True,
     include_distances: bool = True,
     inplace: bool = False,
+    show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> "pd.DataFrame":
     """
@@ -2679,6 +2680,8 @@ def add_epistasis_metrics(
         Include all distance/length metrics. Default: True.
     inplace : bool, optional
         Modify DataFrame in place. Default: False.
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: False.
     progress_callback : callable, optional
         Called with (current_index, total, epistasis_id) for progress.
 
@@ -2748,7 +2751,11 @@ def add_epistasis_metrics(
     n_skipped = 0
     total = len(df)
 
-    for i, (idx, row) in enumerate(df.iterrows()):
+    iterator = df.iterrows()
+    if show_progress:
+        iterator = tqdm(iterator, total=total, desc="Epistasis metrics")
+
+    for i, (idx, row) in enumerate(iterator):
         epi_id = row[id_col]
 
         if progress_callback:
@@ -2768,18 +2775,22 @@ def add_epistasis_metrics(
             pos2 = int(row[pos2_col])
             ref2 = str(row[ref2_col])
             alt2 = str(row[alt2_col])
+            rev_from_id = None
         else:
             # Parse from epistasis_id
             try:
-                (chrom, pos1, ref1, alt1, _), (_, pos2, ref2, alt2, _) = parse_epistasis_id(epi_id)
+                (chrom, pos1, ref1, alt1, rev1), (_, pos2, ref2, alt2, rev2) = parse_epistasis_id(epi_id)
+                rev_from_id = rev1  # rev1 == rev2 guaranteed by parse_epistasis_id
             except ValueError as e:
                 logger.warning("Cannot parse %s: %s", epi_id, e)
                 n_skipped += 1
                 continue
 
-        # Determine strand
+        # Determine strand: strand_col > parsed from id > reverse_complement default
         if strand_col and strand_col in df.columns:
             rev = _parse_strand(row[strand_col])
+        elif rev_from_id is not None:
+            rev = rev_from_id
         else:
             rev = reverse_complement
 
