@@ -73,6 +73,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from sklearn.manifold import MDS
+from tqdm import tqdm
 
 # SeqMat is imported locally in embed functions to avoid hard dependency
 
@@ -3224,6 +3225,7 @@ def compute_dependency_map(
     total_pairs = n * (n - 1) // 2
     pair_idx = 0
 
+    pbar = tqdm(total=total_pairs, desc="Computing dependency map")
     for i in range(n):
         pos_i = pos_array[i]
         ref_i = sequence[pos_i]
@@ -3234,6 +3236,7 @@ def compute_dependency_map(
             ref_j = sequence[pos_j]
             alts_j = [nuc for nuc in NUCLEOTIDES if nuc != ref_j]
 
+            pbar.set_postfix(pair=f"({pos_i}, {pos_j})")
             if progress_callback:
                 progress_callback(
                     pair_idx, total_pairs,
@@ -3301,7 +3304,9 @@ def compute_dependency_map(
             }
 
             pair_idx += 1
+            pbar.update(1)
 
+    pbar.close()
     logger.info("Dependency map complete: %d pairs computed", total_pairs)
 
     return DependencyMapResult(

@@ -30,27 +30,14 @@ Usage:
 >>> tracks = borzoi.predict_tracks("ACGT" * 131_072)  # Returns (num_tracks, length) numpy array
 """
 
-# Support both package import and direct sys.path import
-try:
-    from .base_wrapper import BaseWrapper
-    # Import all wrappers
-    from .borzoi_wrapper import BorzoiWrapper
-    from .caduceus_wrapper import CaduceusWrapper
-    from .convnova_wrapper import ConvNovaWrapper
-    from .evo2_wrapper import Evo2Wrapper
-    from .nt_wrapper import NTWrapper
-    from .rinalmo_wrapper import RiNALMoWrapper
-    from .specieslm_wrapper import SpeciesLMWrapper
-except ImportError:
-    from base_wrapper import BaseWrapper
-    # Import all wrappers
-    from borzoi_wrapper import BorzoiWrapper
-    from caduceus_wrapper import CaduceusWrapper
-    from convnova_wrapper import ConvNovaWrapper
-    from evo2_wrapper import Evo2Wrapper
-    from nt_wrapper import NTWrapper
-    from rinalmo_wrapper import RiNALMoWrapper
-    from specieslm_wrapper import SpeciesLMWrapper
+from .base_wrapper import BaseWrapper
+from .borzoi_wrapper import BorzoiWrapper
+from .caduceus_wrapper import CaduceusWrapper
+from .convnova_wrapper import ConvNovaWrapper
+from .evo2_wrapper import Evo2Wrapper
+from .nt_wrapper import NTWrapper
+from .rinalmo_wrapper import RiNALMoWrapper
+from .specieslm_wrapper import SpeciesLMWrapper
 
 __all__ = [
     "BaseWrapper",
