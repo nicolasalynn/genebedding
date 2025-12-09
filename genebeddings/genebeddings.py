@@ -2663,6 +2663,7 @@ def add_single_variant_metrics(
     inplace: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     pool: str = "mean",
+    show_progress: bool = True,
 ) -> "pd.DataFrame":
     """
     Add single-variant geometry metrics to a DataFrame.
@@ -2710,6 +2711,8 @@ def add_single_variant_metrics(
     pool : str, optional
         Pooling method for embeddings. "mean" for mean-pooled (default),
         "tokens" for full token embeddings (flattened).
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: True.
 
     Returns
     -------
@@ -2760,7 +2763,11 @@ def add_single_variant_metrics(
     n_skipped = 0
     total = len(df)
 
-    for i, (idx, row) in enumerate(df.iterrows()):
+    iterator = df.iterrows()
+    if show_progress:
+        iterator = tqdm(iterator, total=total, desc="Single-variant metrics")
+
+    for i, (idx, row) in enumerate(iterator):
         mut_id = row[id_col]
 
         if progress_callback:
@@ -4153,6 +4160,65 @@ class EpistasisExpectationModel:
             pred = pred.squeeze(0)
 
         return pred.cpu()
+
+    def as_expectation_function(self) -> Callable:
+        """
+        Return a callable that can be used as the `expectation` parameter
+        in EpistasisGeometry or classify_epistasis_from_embeddings.
+
+        The returned function takes (WT, M1, M2) embeddings and returns
+        the predicted M12_expected embedding.
+
+        Returns
+        -------
+        callable
+            Function with signature (WT, M1, M2) -> M12_expected
+
+        Examples
+        --------
+        >>> model = EpistasisExpectationModel.load("model.pt")
+        >>> expectation_fn = model.as_expectation_function()
+        >>>
+        >>> # Use with EpistasisGeometry
+        >>> geom = EpistasisGeometry(wt, m1, m2, m12, expectation=expectation_fn)
+        >>>
+        >>> # Use with classify_epistasis_from_embeddings
+        >>> result = classify_epistasis_from_embeddings(
+        ...     wt, m1, m2, m12, expectation=expectation_fn
+        ... )
+        """
+        if not self._trained:
+            raise RuntimeError("Model not trained. Call fit() or load() first.")
+
+        def expectation_fn(WT, M1, M2):
+            """Predict M12_expected from (WT, M1, M2) embeddings."""
+            # Convert to tensors
+            WT = torch.as_tensor(WT).float()
+            M1 = torch.as_tensor(M1).float()
+            M2 = torch.as_tensor(M2).float()
+
+            # Pool if needed (handle 2D inputs)
+            if WT.ndim == 2:
+                WT = WT.mean(dim=0)
+            if M1.ndim == 2:
+                M1 = M1.mean(dim=0)
+            if M2.ndim == 2:
+                M2 = M2.mean(dim=0)
+
+            # Compute deltas
+            delta1 = M1 - WT
+            delta2 = M2 - WT
+
+            # Predict delta12
+            if self.include_wt:
+                delta12_pred = self.predict(delta1, delta2, wt=WT)
+            else:
+                delta12_pred = self.predict(delta1, delta2)
+
+            # Return M12_expected
+            return WT + delta12_pred
+
+        return expectation_fn
 
     def save(self, path: Union[str, Path]) -> None:
         """Save model to file."""

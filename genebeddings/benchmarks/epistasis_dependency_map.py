@@ -8,17 +8,66 @@ epistatic residual across all possible double mutations at positions i and j.
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Union, Optional, Literal, Dict
+from typing import Union, Optional, Literal, Dict, Callable
 from tqdm import tqdm
 
 
-def classify_epistasis_from_embeddings(h_ref, h_m1, h_m2, h_m12, eps=1e-8):
+# Built-in expectation models
+def _additive_expectation(WT, M1, M2):
+    """Classical additive model: M12_exp = M1 + M2 - WT"""
+    return M1 + M2 - WT
+
+
+def _geometric_expectation(WT, M1, M2, eps=1e-8):
+    """Geometric mean of effect vectors: WT + sqrt(||v1|| * ||v2||) * normalized_mean_direction"""
+    v1 = M1 - WT
+    v2 = M2 - WT
+    # Geometric mean of magnitudes
+    mag = torch.sqrt(v1.norm() * v2.norm() + eps)
+    # Average direction (normalized)
+    direction = v1 + v2
+    direction = direction / (direction.norm() + eps)
+    return WT + mag * direction
+
+
+def _pythagorean_expectation(WT, M1, M2, eps=1e-8):
+    """Pythagorean combination: WT + sqrt(||v1||^2 + ||v2||^2) * normalized_mean_direction"""
+    v1 = M1 - WT
+    v2 = M2 - WT
+    # Pythagorean magnitude
+    mag = torch.sqrt(v1.norm()**2 + v2.norm()**2)
+    # Average direction (normalized)
+    direction = v1 + v2
+    direction = direction / (direction.norm() + eps)
+    return WT + mag * direction
+
+
+EXPECTATION_MODELS = {
+    "additive": _additive_expectation,
+    "geometric": _geometric_expectation,
+    "pythagorean": _pythagorean_expectation,
+}
+
+
+def classify_epistasis_from_embeddings(h_ref, h_m1, h_m2, h_m12, eps=1e-8, expectation="additive"):
     """
     Classify epistasis from four pooled embeddings:
         WT, M1, M2, M12
 
     Inputs can be numpy arrays, lists, or torch tensors of shape (D,) or (L,D).
     If (L,D), they will be mean-pooled automatically.
+
+    Args:
+        h_ref: Reference (wild-type) embedding
+        h_m1: Single mutant 1 embedding
+        h_m2: Single mutant 2 embedding
+        h_m12: Double mutant embedding
+        eps: Small constant for numerical stability
+        expectation: How to compute expected double-mutant embedding. Options:
+            - "additive": M1 + M2 - WT (default, classical model)
+            - "geometric": Geometric mean of effect magnitudes
+            - "pythagorean": sqrt(||v1||^2 + ||v2||^2) combination
+            - callable: Custom function(WT, M1, M2) -> M12_expected
     """
     def pool(h):
         h = torch.as_tensor(h).float()
@@ -37,8 +86,17 @@ def classify_epistasis_from_embeddings(h_ref, h_m1, h_m2, h_m12, eps=1e-8):
     v2  = M2  - WT          # effect of mutation 2
     v12 = M12 - WT          # effect of double mutant
 
-    # Additive predicted double-mutant
-    M12_exp = M1 + M2 - WT
+    # ---- Compute expected double-mutant ----
+    if callable(expectation):
+        M12_exp = expectation(WT, M1, M2)
+    elif isinstance(expectation, str):
+        if expectation not in EXPECTATION_MODELS:
+            raise ValueError(f"Unknown expectation model: {expectation}. "
+                           f"Options: {list(EXPECTATION_MODELS.keys())} or a callable")
+        M12_exp = EXPECTATION_MODELS[expectation](WT, M1, M2)
+    else:
+        raise ValueError(f"expectation must be a string or callable, got {type(expectation)}")
+
     v12_exp = M12_exp - WT
 
     # ---- Norms ----
@@ -141,6 +199,7 @@ def compute_epistasis_dependency_map(
     metric: Literal["residual_norm", "epi_rel_singles", "epi_rel_expected"] = "residual_norm",
     pool: str = "mean",
     show_progress: bool = True,
+    expectation: Union[str, Callable] = "additive",
 ) -> np.ndarray:
     """
     Compute epistasis dependency map where each cell (i, j) is the maximum
@@ -157,6 +216,11 @@ def compute_epistasis_dependency_map(
             - "epi_rel_expected": Normalized by expected double-mutant magnitude
         pool: Pooling method for embeddings ('mean', 'cls', 'tokens')
         show_progress: Whether to show progress bar
+        expectation: How to compute expected double-mutant embedding. Options:
+            - "additive": M1 + M2 - WT (default, classical model)
+            - "geometric": Geometric mean of effect magnitudes
+            - "pythagorean": sqrt(||v1||^2 + ||v2||^2) combination
+            - callable: Custom function(WT, M1, M2) -> M12_expected
 
     Returns:
         Dependency matrix [W, W] where W = range_end - range_start
@@ -242,7 +306,8 @@ def compute_epistasis_dependency_map(
                             h_ref=ref_emb,
                             h_m1=emb_i,
                             h_m2=emb_j,
-                            h_m12=emb_ij
+                            h_m12=emb_ij,
+                            expectation=expectation
                         )
 
                         epistasis_value = result[metric]

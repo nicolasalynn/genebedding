@@ -38,10 +38,15 @@ __all__ = [
     "BorzoiWrapper",
     "CaduceusWrapper",
     "ConvNovaWrapper",
+    "DNABERTWrapper",
     "Evo2Wrapper",
+    "GPNMSAWrapper",
+    "HyenaDNAWrapper",
+    "MutBERTWrapper",
     "NTWrapper",
     "RiNALMoWrapper",
     "SpeciesLMWrapper",
+    "SpliceBertWrapper",
 ]
 
 # Mapping of wrapper names to their modules
@@ -49,10 +54,15 @@ _WRAPPER_MODULES = {
     "BorzoiWrapper": "borzoi_wrapper",
     "CaduceusWrapper": "caduceus_wrapper",
     "ConvNovaWrapper": "convnova_wrapper",
+    "DNABERTWrapper": "dnabert_wrapper",
     "Evo2Wrapper": "evo2_wrapper",
+    "GPNMSAWrapper": "gpn_msa_wrapper",
+    "HyenaDNAWrapper": "hyenadna_wrapper",
+    "MutBERTWrapper": "mutbert_wrapper",
     "NTWrapper": "nt_wrapper",
     "RiNALMoWrapper": "rinalmo_wrapper",
     "SpeciesLMWrapper": "specieslm_wrapper",
+    "SpliceBertWrapper": "splicebert_wrapper",
 }
 
 

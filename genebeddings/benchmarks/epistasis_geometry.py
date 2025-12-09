@@ -1,8 +1,10 @@
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.manifold import MDS
 import matplotlib.pyplot as plt
+from typing import Optional, Dict, Union, Callable
 
 
 class EpistasisGeometry:
@@ -22,10 +24,45 @@ class EpistasisGeometry:
         * arrows WT→M1, WT→M2, WT→M12_obs, WT→M12_exp
         * distances from WT on arrows
         * a small table with epistasis metrics
+
+    Parameters
+    ----------
+    h_ref : array-like
+        Wild-type embedding
+    h_m1 : array-like
+        Single mutant 1 embedding
+    h_m2 : array-like
+        Single mutant 2 embedding
+    h_m12 : array-like
+        Double mutant embedding
+    eps : float
+        Small constant for numerical stability
+    expectation : str or callable, optional
+        How to compute expected double-mutant embedding. Options:
+        - "additive": v1 + v2 (default, classical model)
+        - "geometric": Geometric mean of effect magnitudes
+        - "pythagorean": sqrt(||v1||^2 + ||v2||^2) combination
+        - callable: Custom function(WT, M1, M2) -> M12_expected
     """
 
-    def __init__(self, h_ref, h_m1, h_m2, h_m12, eps: float = 1e-8):
+    # Built-in expectation models
+    _EXPECTATION_MODELS = {
+        "additive": lambda self: self.v1 + self.v2,
+        "geometric": "_geometric_expectation",
+        "pythagorean": "_pythagorean_expectation",
+    }
+
+    def __init__(
+        self,
+        h_ref,
+        h_m1,
+        h_m2,
+        h_m12,
+        eps: float = 1e-8,
+        expectation: Union[str, Callable] = "additive",
+    ):
         self.eps = eps
+        self.expectation = expectation
 
         # ---- pool inputs ----
         self.WT  = self._pool(h_ref)
@@ -37,13 +74,49 @@ class EpistasisGeometry:
         self.v1       = self.M1  - self.WT          # WT→M1
         self.v2       = self.M2  - self.WT          # WT→M2
         self.v12_obs  = self.M12 - self.WT          # WT→M12 (observed)
-        self.v12_exp  = self.v1 + self.v2           # WT→M12 (additive expectation)
+        self.v12_exp  = self._compute_v12_exp()     # WT→M12 (expected)
         self.v_1to2   = self.M1 - self.M2          # M1↔M2
 
         # cached things
         self._metrics: Optional[Dict[str, float]] = None
         self._coords:  Optional[Dict[str, np.ndarray]] = None
         self._D:       Optional[np.ndarray] = None
+
+    def _compute_v12_exp(self) -> torch.Tensor:
+        """Compute expected v12 based on the expectation model."""
+        if callable(self.expectation):
+            # Custom model: expects (WT, M1, M2) -> M12_expected
+            M12_exp = self.expectation(self.WT, self.M1, self.M2)
+            M12_exp = torch.as_tensor(M12_exp).float()
+            return M12_exp - self.WT
+        elif isinstance(self.expectation, str):
+            if self.expectation == "additive":
+                return self.v1 + self.v2
+            elif self.expectation == "geometric":
+                return self._geometric_expectation()
+            elif self.expectation == "pythagorean":
+                return self._pythagorean_expectation()
+            else:
+                raise ValueError(
+                    f"Unknown expectation model: {self.expectation}. "
+                    f"Options: 'additive', 'geometric', 'pythagorean', or a callable"
+                )
+        else:
+            raise ValueError(f"expectation must be a string or callable, got {type(self.expectation)}")
+
+    def _geometric_expectation(self) -> torch.Tensor:
+        """Geometric mean of effect magnitudes with averaged direction."""
+        mag = torch.sqrt(self.v1.norm() * self.v2.norm() + self.eps)
+        direction = self.v1 + self.v2
+        direction = direction / (direction.norm() + self.eps)
+        return mag * direction
+
+    def _pythagorean_expectation(self) -> torch.Tensor:
+        """Pythagorean combination: sqrt(||v1||^2 + ||v2||^2) with averaged direction."""
+        mag = torch.sqrt(self.v1.norm()**2 + self.v2.norm()**2)
+        direction = self.v1 + self.v2
+        direction = direction / (direction.norm() + self.eps)
+        return mag * direction
 
     # ----------------- helpers ----------------- #
 
