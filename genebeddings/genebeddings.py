@@ -150,6 +150,8 @@ DEFAULT_RANDOM_STATE = 42
 COLOR_WT = "#1f77b4"
 COLOR_OBSERVED = "#d62728"
 COLOR_EXPECTED = "#555555"
+COLOR_M1 = "#2ca02c"  # green
+COLOR_M2 = "#9467bd"  # purple
 
 
 # ---------------------------------------------------------------------------
@@ -892,8 +894,6 @@ class EpistasisGeometry(_GeometryBase):
         Observed double-mutant effect vector.
     v12_exp : torch.Tensor
         Expected (additive) double-mutant effect vector.
-    mut_swapped : bool
-        True if M1 and M2 were swapped to enforce d(WT,M1) <= d(WT,M2).
 
     Examples
     --------
@@ -924,31 +924,38 @@ class EpistasisGeometry(_GeometryBase):
         ]:
             self._validate_embedding(emb, name)
 
-        # Pool inputs
+        # Pool inputs - keep original order (M1 = first mutation, M2 = second mutation)
         self.WT = self._pool(h_ref)
-        m1_vec = self._pool(h_m1)
-        m2_vec = self._pool(h_m2)
+        self.M1 = self._pool(h_m1)
+        self.M2 = self._pool(h_m2)
         self.M12 = self._pool(h_m12)
 
-        # Enforce convention: M1 is closer to WT than M2
-        d1 = self._embed_dist(self.WT, m1_vec)
-        d2 = self._embed_dist(self.WT, m2_vec)
-
-        if d1 > d2:
-            m1_vec, m2_vec = m2_vec, m1_vec
-            self.mut_swapped = True
-            logger.debug("Swapped M1 and M2 to enforce d(WT,M1) <= d(WT,M2)")
-        else:
-            self.mut_swapped = False
-
-        self.M1 = m1_vec
-        self.M2 = m2_vec
-
+        # # Effect vectors
+        # self.v1 = self.M1 - self.WT
+        # self.v2 = self.M2 - self.WT
+        # self.v12_obs = self.M12 - self.WT
+        # self.v12_exp = self.v1 + self.v2
+        # self.v_1to2 = self.M1 - self.M2
         # Effect vectors
         self.v1 = self.M1 - self.WT
         self.v2 = self.M2 - self.WT
         self.v12_obs = self.M12 - self.WT
+
+        # Simple additive expectation: v12_exp = v1 + v2
         self.v12_exp = self.v1 + self.v2
+
+        # --- Pythagorean baseline (commented out) ---
+        # a1 = torch.norm(self.v1)
+        # a2 = torch.norm(self.v2)
+        # R_pyth = torch.sqrt(a1**2 + a2**2 + torch.tensor(self.eps, device=a1.device))
+        # sum_vec = self.v1 + self.v2
+        # sum_norm = torch.norm(sum_vec)
+        # if sum_norm < self.eps:
+        #     e_par = self._unit(self.v1)
+        # else:
+        #     e_par = sum_vec / (sum_norm + self.eps)
+        # self.v12_exp = e_par * R_pyth
+
         self.v_1to2 = self.M1 - self.M2
 
         # Cached results
@@ -958,10 +965,9 @@ class EpistasisGeometry(_GeometryBase):
         self._cached_mds: Optional[tuple[dict[str, np.ndarray], np.ndarray]] = None
 
         logger.debug(
-            "EpistasisGeometry initialized: dim=%d, diff=%s, swapped=%s",
+            "EpistasisGeometry initialized: dim=%d, diff=%s",
             self.WT.shape[0],
             self.diff_name,
-            self.mut_swapped,
         )
 
     def __repr__(self) -> str:
@@ -970,7 +976,6 @@ class EpistasisGeometry(_GeometryBase):
             f"EpistasisGeometry("
             f"R_raw={m.epi_R_raw:.4f}, "
             f"R_expected={m.epi_R_expected:.4f}, "
-            f"swapped={self.mut_swapped}, "
             f"diff={self.diff_name!r})"
         )
 
@@ -1021,12 +1026,19 @@ class EpistasisGeometry(_GeometryBase):
         x_obs_raw = float(torch.dot(self.v12_obs, e_par))
         y_obs_raw = float(torch.dot(self.v12_obs, e_perp))
 
-        r_exp = math.sqrt(x_exp_raw**2 + y_exp_raw**2) + self.eps
+        r_exp_raw = math.sqrt(x_exp_raw**2 + y_exp_raw**2)
+        r_obs_raw = math.sqrt(x_obs_raw**2 + y_obs_raw**2)
 
-        x_exp = x_exp_raw / r_exp
-        y_exp = y_exp_raw / r_exp
-        x_obs = x_obs_raw / r_exp
-        y_obs = y_obs_raw / r_exp
+        # Additive expectation normalization: expected at radius 1
+        r_norm = r_exp_raw + self.eps
+
+        # Geometric mean normalization (centers rho around 1 for typical interactions):
+        # r_norm = math.sqrt(r_exp_raw * r_obs_raw) + self.eps
+
+        x_exp = x_exp_raw / r_norm
+        y_exp = y_exp_raw / r_norm
+        x_obs = x_obs_raw / r_norm
+        y_obs = y_obs_raw / r_norm
 
         rho = math.sqrt(x_obs**2 + y_obs**2)
         theta = math.atan2(y_obs, x_obs)
@@ -1186,8 +1198,9 @@ class EpistasisGeometry(_GeometryBase):
         M1 = self.M1
         M2 = self.M2
         M12 = self.M12
-        M12_exp = WT + (M1 - WT) + (M2 - WT)
-
+        # M12_exp = WT + (M1 - WT) + (M2 - WT)
+        M12_exp = WT + self.v12_exp
+        
         X = torch.stack([WT, M1, M2, M12, M12_exp], dim=0).float()
         n = X.shape[0]
         D = np.zeros((n, n), dtype=float)
@@ -1429,6 +1442,203 @@ class EpistasisGeometry(_GeometryBase):
         if figure_name:
             fig.savefig(f"{figure_name}_triangle.png", dpi=300, bbox_inches="tight")
             logger.info("Saved figure to %s_triangle.png", figure_name)
+        if show:
+            plt.show()
+
+        return fig
+
+    def plot_story(
+        self,
+        figsize: tuple[float, float] = (12, 10),
+        figure_name: str = "",
+        show: bool = True,
+    ) -> plt.Figure:
+        """
+        Plot the epistasis story as a visual narrative.
+
+        Shows the journey from WT through individual mutations to the double
+        mutant, highlighting the deviation from additive expectation.
+        Projects to 2D using PCA, scaled to emphasize the epistasis.
+
+        Parameters
+        ----------
+        figsize : tuple, optional
+            Figure size. Default: (10, 6).
+        figure_name : str, optional
+            If provided, save figure to {figure_name}.png.
+        show : bool, optional
+            Call plt.show(). Default: True.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure object.
+        """
+        # Use MDS-like approach: preserve pairwise distances as best as possible
+        # Stack the 5 points: WT, M1, M2, M12_exp, M12_obs
+        M12_exp = self.WT + self.v12_exp
+
+        points = [self.WT, self.M1, self.M2, M12_exp, self.M12]
+        n = len(points)
+
+        # Compute pairwise distance matrix using the configured distance metric
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                D[i, j] = self._embed_dist(points[i], points[j])
+
+        # Classical MDS: convert distances to coordinates
+        # Center the squared distance matrix
+        D_sq = D ** 2
+        H = np.eye(n) - np.ones((n, n)) / n
+        B = -0.5 * H @ D_sq @ H
+
+        # Eigendecomposition
+        eigvals, eigvecs = np.linalg.eigh(B)
+        # Sort by eigenvalue descending
+        idx = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[idx]
+        eigvecs = eigvecs[:, idx]
+
+        # Take top 2 dimensions
+        coords_2d = eigvecs[:, :2] * np.sqrt(np.maximum(eigvals[:2], 0))
+
+        WT_2d = coords_2d[0]
+        M1_2d = coords_2d[1]
+        M2_2d = coords_2d[2]
+        EXP_2d = coords_2d[3]
+        OBS_2d = coords_2d[4]
+
+        # Center on WT
+        M1_2d = M1_2d - WT_2d
+        M2_2d = M2_2d - WT_2d
+        EXP_2d = EXP_2d - WT_2d
+        OBS_2d = OBS_2d - WT_2d
+        WT_2d = np.array([0.0, 0.0])
+
+        # Get metrics
+        m = self.metrics()
+        c = self.complex_coords()
+        epistasis_R = m.epi_R_expected
+        rho = c.rho
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.set_facecolor("#fafafa")
+
+        # Subtle parallelogram fill to show additive expectation region
+        parallelogram = plt.Polygon(
+            [WT_2d, M1_2d, EXP_2d, M2_2d],
+            fill=True,
+            facecolor="#e8e8e8",
+            edgecolor="0.7",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.5,
+            zorder=1,
+        )
+        ax.add_patch(parallelogram)
+
+        # Draw the story arrows with varying thickness to show narrative flow
+        # WT -> M1 (first mutation)
+        _draw_arrow(ax, WT_2d, M1_2d, COLOR_M1, linewidth=2.5, alpha=0.85)
+        # WT -> M2 (second mutation)
+        _draw_arrow(ax, WT_2d, M2_2d, COLOR_M2, linewidth=2.5, alpha=0.85)
+        # M1 -> Expected (what M2 would add)
+        _draw_arrow(ax, M1_2d, EXP_2d, COLOR_M2, linewidth=1.5, alpha=0.4, linestyle="--")
+        # M2 -> Expected (what M1 would add)
+        _draw_arrow(ax, M2_2d, EXP_2d, COLOR_M1, linewidth=1.5, alpha=0.4, linestyle="--")
+
+        # The key: WT -> Observed (actual double mutant) - bold
+        _draw_arrow(ax, WT_2d, OBS_2d, COLOR_OBSERVED, linewidth=3.5, alpha=0.95)
+
+        # Epistasis vector: expected -> observed (the punchline)
+        _draw_arrow(ax, EXP_2d, OBS_2d, "black", linewidth=3.0, alpha=1.0, zorder=10)
+
+        # Points - sized by importance in the story
+        ax.scatter(*WT_2d, s=180, color=COLOR_WT, edgecolor="white", linewidth=2, zorder=15)
+        ax.scatter(*M1_2d, s=120, color=COLOR_M1, edgecolor="white", linewidth=1.5, zorder=14)
+        ax.scatter(*M2_2d, s=120, color=COLOR_M2, edgecolor="white", linewidth=1.5, zorder=14)
+        ax.scatter(*EXP_2d, s=140, facecolor="white", edgecolor="0.4", linewidth=2.5, zorder=16)
+        ax.scatter(*OBS_2d, s=200, color=COLOR_OBSERVED, edgecolor="white", linewidth=2, zorder=17)
+
+        # Clean labels
+        fs_label = 11
+        ax.annotate("WT", WT_2d, textcoords="offset points", xytext=(-12, -12),
+                    fontsize=fs_label, fontweight="bold", color=COLOR_WT)
+        ax.annotate("M1", M1_2d, textcoords="offset points", xytext=(8, 8),
+                    fontsize=fs_label, fontweight="bold", color=COLOR_M1)
+        ax.annotate("M2", M2_2d, textcoords="offset points", xytext=(8, 8),
+                    fontsize=fs_label, fontweight="bold", color=COLOR_M2)
+        ax.annotate("expected", EXP_2d, textcoords="offset points", xytext=(10, -12),
+                    fontsize=10, color="0.4", style="italic")
+        ax.annotate("M12", OBS_2d, textcoords="offset points", xytext=(10, 8),
+                    fontsize=fs_label, fontweight="bold", color=COLOR_OBSERVED)
+
+        # Scale to fit with minimum spacing - compute first so we can use it for label offset
+        all_points = np.array([WT_2d, M1_2d, M2_2d, EXP_2d, OBS_2d])
+        x_min, x_max = all_points[:, 0].min(), all_points[:, 0].max()
+        y_min, y_max = all_points[:, 1].min(), all_points[:, 1].max()
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        max_range = max(x_range, y_range, 1e-9)
+
+        # Padding relative to data range
+        pad = max_range * 0.15
+
+        # Center the view
+        x_center = (x_min + x_max) / 2
+        y_center = (y_min + y_max) / 2
+        half_span = (max_range / 2) + pad
+
+        ax.set_xlim(x_center - half_span, x_center + half_span)
+        ax.set_ylim(y_center - half_span, y_center + half_span)
+        ax.set_aspect("equal")
+
+        # Epistasis label on the black arrow - offset relative to plot scale
+        epi_midpoint = (EXP_2d + OBS_2d) / 2
+        epi_vec = OBS_2d - EXP_2d
+        # Perpendicular offset scaled to plot size
+        perp = np.array([-epi_vec[1], epi_vec[0]])
+        perp_norm = np.linalg.norm(perp)
+        if perp_norm > 1e-9:
+            perp = perp / perp_norm * max_range * 0.05  # 5% of plot range
+        ax.annotate(
+            "epistasis",
+            epi_midpoint + perp,
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+            ha="center",
+            va="center",
+        )
+
+        # Minimal axis styling
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # Display metrics: R (normalized epistasis) and rho (complex magnitude)
+        ax.text(
+            0.98, 0.02,
+            f"R = {epistasis_R:.3f}\nρ = {rho:.3f}",
+            transform=ax.transAxes,
+            fontsize=14,
+            fontweight="bold",
+            ha="right",
+            va="bottom",
+            color="black",
+            bbox=dict(facecolor="white", edgecolor="0.3", alpha=0.9, pad=6, boxstyle="round,pad=0.4"),
+        )
+
+        # Title
+        title = figure_name if figure_name else "Epistasis Story"
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+
+        plt.tight_layout()
+        if figure_name:
+            fig.savefig(f"{figure_name}.png", dpi=300, bbox_inches="tight")
+            logger.info("Saved figure to %s.png", figure_name)
         if show:
             plt.show()
 
@@ -1915,6 +2125,7 @@ def embed_single_variant(
     mut_id: str,
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
+    pool: str = "mean",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate embeddings for a single variant.
@@ -1922,13 +2133,16 @@ def embed_single_variant(
     Parameters
     ----------
     model : object
-        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+        Model with `.embed(sequence: str, pool=...) -> Tensor` method.
     mut_id : str
         Mutation identifier (see parse_single_mut_id).
     context : int, optional
         Context window size (bases on each side). Default: 3000.
     genome : str, optional
         Genome assembly name. Default: "hg38".
+    pool : str, optional
+        Pooling method for embeddings. "mean" for mean-pooled (default),
+        "tokens" for full token embeddings (flattened).
 
     Returns
     -------
@@ -1958,8 +2172,8 @@ def embed_single_variant(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_ref = model.embed(s.seq, pool="mean")
-    h_mut = model.embed(m.seq, pool="mean")
+    h_ref = model.embed(s.seq, pool=pool)
+    h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_ref
 
     return h_ref, h_mut, delta
@@ -1970,6 +2184,7 @@ def embed_epistasis(
     epistasis_id: str,
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
+    pool: str = "mean",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate embeddings for an epistasis pair.
@@ -1977,13 +2192,16 @@ def embed_epistasis(
     Parameters
     ----------
     model : object
-        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+        Model with `.embed(sequence: str, pool=...) -> Tensor` method.
     epistasis_id : str
         Epistasis identifier (see parse_epistasis_id).
     context : int, optional
         Context window size. Default: 3000.
     genome : str, optional
         Genome assembly name. Default: "hg38".
+    pool : str, optional
+        Pooling method for embeddings. "mean" for mean-pooled (default),
+        "tokens" for full token embeddings (flattened).
 
     Returns
     -------
@@ -2025,10 +2243,10 @@ def embed_epistasis(
     m2.apply_mutations([var2])
     m12.apply_mutations([var1, var2])
 
-    h_ref = model.embed(s.seq, pool="mean")
-    h_m1 = model.embed(m1.seq, pool="mean")
-    h_m2 = model.embed(m2.seq, pool="mean")
-    h_m12 = model.embed(m12.seq, pool="mean")
+    h_ref = model.embed(s.seq, pool=pool)
+    h_m1 = model.embed(m1.seq, pool=pool)
+    h_m2 = model.embed(m2.seq, pool=pool)
+    h_m12 = model.embed(m12.seq, pool=pool)
 
     return h_ref, h_m1, h_m2, h_m12
 
@@ -2336,11 +2554,12 @@ def _embed_single_variant_direct(
     reverse_complement: bool = False,
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
+    pool: str = "mean",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute embeddings for a single variant from genomic coordinates.
 
-    Returns (h_wt, h_mut, delta) as mean-pooled embeddings.
+    Returns (h_wt, h_mut, delta) embeddings with specified pooling.
     """
     from seqmat import SeqMat
 
@@ -2359,8 +2578,8 @@ def _embed_single_variant_direct(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_wt = model.embed(s.seq, pool="mean")
-    h_mut = model.embed(m.seq, pool="mean")
+    h_wt = model.embed(s.seq, pool=pool)
+    h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_wt
 
     return h_wt, h_mut, delta
@@ -2378,11 +2597,12 @@ def _embed_epistasis_direct(
     reverse_complement: bool = False,
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
+    pool: str = "mean",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute embeddings for epistasis from genomic coordinates.
 
-    Returns (h_wt, h_m1, h_m2, h_m12) as mean-pooled embeddings.
+    Returns (h_wt, h_m1, h_m2, h_m12) embeddings with specified pooling.
     """
     from seqmat import SeqMat
 
@@ -2411,10 +2631,10 @@ def _embed_epistasis_direct(
     m2.apply_mutations([var2])
     m12.apply_mutations([var1, var2])
 
-    h_wt = model.embed(s.seq, pool="mean")
-    h_m1 = model.embed(m1.seq, pool="mean")
-    h_m2 = model.embed(m2.seq, pool="mean")
-    h_m12 = model.embed(m12.seq, pool="mean")
+    h_wt = model.embed(s.seq, pool=pool)
+    h_m1 = model.embed(m1.seq, pool=pool)
+    h_m2 = model.embed(m2.seq, pool=pool)
+    h_m12 = model.embed(m12.seq, pool=pool)
 
     return h_wt, h_m1, h_m2, h_m12
 
@@ -2436,6 +2656,7 @@ def add_single_variant_metrics(
     prefix: str = "",
     inplace: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    pool: str = "mean",
 ) -> "pd.DataFrame":
     """
     Add single-variant geometry metrics to a DataFrame.
@@ -2452,7 +2673,7 @@ def add_single_variant_metrics(
     db : VariantEmbeddingDB
         Database for storing/loading embeddings.
     model : object, optional
-        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+        Model with `.embed(sequence: str, pool=...) -> Tensor` method.
         Required for computing new embeddings.
     id_col : str, optional
         Column with mutation IDs (format: GENE:CHROM:POS:REF:ALT). Default: "mut_id".
@@ -2480,6 +2701,9 @@ def add_single_variant_metrics(
         Modify DataFrame in place. Default: False.
     progress_callback : callable, optional
         Called with (current_index, total, mut_id) for progress tracking.
+    pool : str, optional
+        Pooling method for embeddings. "mean" for mean-pooled (default),
+        "tokens" for full token embeddings (flattened).
 
     Returns
     -------
@@ -2504,6 +2728,9 @@ def add_single_variant_metrics(
     ...     df, db, model=borzoi,
     ...     reverse_complement=True
     ... )
+
+    >>> # With full token embeddings
+    >>> df = add_single_variant_metrics(df, db, model=borzoi, pool="tokens")
     """
     _require_pandas()
 
@@ -2575,6 +2802,7 @@ def add_single_variant_metrics(
                     reverse_complement=rev,
                     context=context,
                     genome=genome,
+                    pool=pool,
                 )
                 # Save to database
                 db.store(wt_key, h_wt)
@@ -2633,6 +2861,7 @@ def add_epistasis_metrics(
     inplace: bool = False,
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    pool: str = "mean",
 ) -> "pd.DataFrame":
     """
     Add epistasis geometry metrics to a DataFrame.
@@ -2649,7 +2878,7 @@ def add_epistasis_metrics(
     db : VariantEmbeddingDB
         Database for storing/loading embeddings.
     model : object, optional
-        Model with `.embed(sequence: str, pool='mean') -> Tensor` method.
+        Model with `.embed(sequence: str, pool=...) -> Tensor` method.
     id_col : str, optional
         Column with epistasis IDs (format: mut1|mut2). Default: "epistasis_id".
     chrom_col : str, optional
@@ -2684,6 +2913,9 @@ def add_epistasis_metrics(
         Show tqdm progress bar. Default: False.
     progress_callback : callable, optional
         Called with (current_index, total, epistasis_id) for progress.
+    pool : str, optional
+        Pooling method for embeddings. "mean" for mean-pooled (default),
+        "tokens" for full token embeddings (flattened).
 
     Returns
     -------
@@ -2706,6 +2938,9 @@ def add_epistasis_metrics(
     ...     df, db, model=borzoi,
     ...     strand_col="gene_strand"
     ... )
+
+    >>> # With full token embeddings
+    >>> df = add_epistasis_metrics(df, db, model=borzoi, pool="tokens")
     """
     _require_pandas()
 
@@ -2716,7 +2951,7 @@ def add_epistasis_metrics(
         df = df.copy()
 
     # Build list of metric columns to add
-    metric_cols: list[str] = ["mut_swapped"]
+    metric_cols: list[str] = []
 
     if include_complex:
         metric_cols.extend([
@@ -2740,10 +2975,7 @@ def add_epistasis_metrics(
 
     # Initialize columns
     for name in metric_cols:
-        if name == "mut_swapped":
-            df[f"{prefix}{name}"] = None
-        else:
-            df[f"{prefix}{name}"] = float("nan")
+        df[f"{prefix}{name}"] = float("nan")
 
     n_processed = 0
     n_computed = 0
@@ -2822,6 +3054,7 @@ def add_epistasis_metrics(
                     reverse_complement=rev,
                     context=context,
                     genome=genome,
+                    pool=pool,
                 )
                 # Save all embeddings to database
                 db.store(wt_key, h_wt)
@@ -2845,9 +3078,6 @@ def add_epistasis_metrics(
 
         # Compute geometry
         geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
-
-        # Assign mut_swapped
-        df.at[idx, f"{prefix}mut_swapped"] = geom.mut_swapped
 
         # Assign complex coords
         if include_complex:

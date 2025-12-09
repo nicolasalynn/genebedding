@@ -30,14 +30,8 @@ Usage:
 >>> tracks = borzoi.predict_tracks("ACGT" * 131_072)  # Returns (num_tracks, length) numpy array
 """
 
+# Lazy imports - wrappers are only loaded when accessed
 from .base_wrapper import BaseWrapper
-from .borzoi_wrapper import BorzoiWrapper
-from .caduceus_wrapper import CaduceusWrapper
-from .convnova_wrapper import ConvNovaWrapper
-from .evo2_wrapper import Evo2Wrapper
-from .nt_wrapper import NTWrapper
-from .rinalmo_wrapper import RiNALMoWrapper
-from .specieslm_wrapper import SpeciesLMWrapper
 
 __all__ = [
     "BaseWrapper",
@@ -49,3 +43,22 @@ __all__ = [
     "RiNALMoWrapper",
     "SpeciesLMWrapper",
 ]
+
+# Mapping of wrapper names to their modules
+_WRAPPER_MODULES = {
+    "BorzoiWrapper": "borzoi_wrapper",
+    "CaduceusWrapper": "caduceus_wrapper",
+    "ConvNovaWrapper": "convnova_wrapper",
+    "Evo2Wrapper": "evo2_wrapper",
+    "NTWrapper": "nt_wrapper",
+    "RiNALMoWrapper": "rinalmo_wrapper",
+    "SpeciesLMWrapper": "specieslm_wrapper",
+}
+
+
+def __getattr__(name):
+    if name in _WRAPPER_MODULES:
+        import importlib
+        module = importlib.import_module(f".{_WRAPPER_MODULES[name]}", __name__)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
