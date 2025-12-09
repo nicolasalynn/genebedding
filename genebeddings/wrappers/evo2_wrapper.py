@@ -219,19 +219,19 @@ class Evo2Wrapper(BaseWrapper):
 
         if not is_batch:
             emb_out = results[0]
-            return emb_out.detach().cpu().numpy() if return_numpy else emb_out.detach().cpu()
+            return emb_out.detach().cpu().float().numpy() if return_numpy else emb_out.detach().cpu()
 
         # Batched return
         if pool == "tokens":
             # Variable lengths -> return list
             return [
-                r.detach().cpu().numpy() if return_numpy else r.detach().cpu()
+                r.detach().cpu().float().numpy() if return_numpy else r.detach().cpu()
                 for r in results
             ]
 
         # Stack for mean/cls
         stacked = torch.stack(results, dim=0)  # (B, H)
-        return stacked.detach().cpu().numpy() if return_numpy else stacked.detach().cpu()
+        return stacked.detach().cpu().float().numpy() if return_numpy else stacked.detach().cpu()
 
     @torch.no_grad()
     def predict_nucleotides(
