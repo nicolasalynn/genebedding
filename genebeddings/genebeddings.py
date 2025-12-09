@@ -112,6 +112,9 @@ __all__ = [
     "DependencyMapResult",
     "compute_pairwise_epistasis",
     "compute_dependency_map",
+    # Epistasis expectation model
+    "EpistasisDataset",
+    "EpistasisExpectationModel",
 ]
 
 __version__ = "0.1.0"
@@ -883,6 +886,10 @@ class EpistasisGeometry(_GeometryBase):
         Numerical stability constant. Default: 1e-20.
     diff : str or callable, optional
         Distance metric. Default: "cosine".
+    expectation_model : EpistasisExpectationModel, optional
+        Trained model for predicting expected Δ₁₂. If provided, v12_exp is
+        computed using the model instead of simple additivity (v1 + v2).
+        Default: None (use additive expectation).
 
     Attributes
     ----------
@@ -893,7 +900,7 @@ class EpistasisGeometry(_GeometryBase):
     v12_obs : torch.Tensor
         Observed double-mutant effect vector.
     v12_exp : torch.Tensor
-        Expected (additive) double-mutant effect vector.
+        Expected double-mutant effect vector (additive or model-predicted).
 
     Examples
     --------
@@ -902,6 +909,9 @@ class EpistasisGeometry(_GeometryBase):
     >>> print(f"Epistasis magnitude: {metrics.epi_R_raw:.4f}")
     >>> epi.plot()
     >>> epi.plot_triangle()
+    >>>
+    >>> # With trained expectation model
+    >>> epi = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, expectation_model=model)
     """
 
     def __init__(
@@ -912,6 +922,7 @@ class EpistasisGeometry(_GeometryBase):
         h_m12: torch.Tensor,
         eps: float = DEFAULT_EPS,
         diff: Union[str, DiffFn] = "cosine",
+        expectation_model: Optional["EpistasisExpectationModel"] = None,
     ):
         super().__init__(eps=eps, diff=diff)
 
@@ -930,31 +941,22 @@ class EpistasisGeometry(_GeometryBase):
         self.M2 = self._pool(h_m2)
         self.M12 = self._pool(h_m12)
 
-        # # Effect vectors
-        # self.v1 = self.M1 - self.WT
-        # self.v2 = self.M2 - self.WT
-        # self.v12_obs = self.M12 - self.WT
-        # self.v12_exp = self.v1 + self.v2
-        # self.v_1to2 = self.M1 - self.M2
         # Effect vectors
         self.v1 = self.M1 - self.WT
         self.v2 = self.M2 - self.WT
         self.v12_obs = self.M12 - self.WT
 
-        # Simple additive expectation: v12_exp = v1 + v2
-        self.v12_exp = self.v1 + self.v2
-
-        # --- Pythagorean baseline (commented out) ---
-        # a1 = torch.norm(self.v1)
-        # a2 = torch.norm(self.v2)
-        # R_pyth = torch.sqrt(a1**2 + a2**2 + torch.tensor(self.eps, device=a1.device))
-        # sum_vec = self.v1 + self.v2
-        # sum_norm = torch.norm(sum_vec)
-        # if sum_norm < self.eps:
-        #     e_par = self._unit(self.v1)
-        # else:
-        #     e_par = sum_vec / (sum_norm + self.eps)
-        # self.v12_exp = e_par * R_pyth
+        # Expected v12: use model if provided, otherwise simple additive
+        self.expectation_model = expectation_model
+        if expectation_model is not None:
+            # Use trained model to predict expected delta
+            wt_input = self.WT if expectation_model.include_wt else None
+            self.v12_exp = expectation_model.predict(self.v1, self.v2, wt=wt_input)
+            self._uses_learned_expectation = True
+        else:
+            # Simple additive expectation: v12_exp = v1 + v2
+            self.v12_exp = self.v1 + self.v2
+            self._uses_learned_expectation = False
 
         self.v_1to2 = self.M1 - self.M2
 
@@ -964,19 +966,23 @@ class EpistasisGeometry(_GeometryBase):
         self._cached_triangle: Optional[EpistasisTriangleCoords] = None
         self._cached_mds: Optional[tuple[dict[str, np.ndarray], np.ndarray]] = None
 
+        exp_type = "learned" if self._uses_learned_expectation else "additive"
         logger.debug(
-            "EpistasisGeometry initialized: dim=%d, diff=%s",
+            "EpistasisGeometry initialized: dim=%d, diff=%s, expectation=%s",
             self.WT.shape[0],
             self.diff_name,
+            exp_type,
         )
 
     def __repr__(self) -> str:
         m = self.metrics()
+        exp_type = "learned" if self._uses_learned_expectation else "additive"
         return (
             f"EpistasisGeometry("
             f"R_raw={m.epi_R_raw:.4f}, "
             f"R_expected={m.epi_R_expected:.4f}, "
-            f"diff={self.diff_name!r})"
+            f"diff={self.diff_name!r}, "
+            f"expectation={exp_type!r})"
         )
 
     def complex_coords(self) -> EpistasisComplexCoords:
@@ -3558,6 +3564,642 @@ def compute_dependency_map(
         sequence=sequence,
         details=details,
     )
+
+
+# =============================================================================
+# EPISTASIS EXPECTATION MODEL
+# =============================================================================
+
+
+@dataclass
+class EpistasisDataset:
+    """
+    Dataset for training epistasis expectation models.
+
+    Stores delta vectors (Δ₁, Δ₂, Δ₁₂) and optionally wild-type embeddings
+    for a set of epistasis pairs.
+
+    Attributes
+    ----------
+    delta1 : torch.Tensor
+        Single mutant 1 deltas, shape (N, D).
+    delta2 : torch.Tensor
+        Single mutant 2 deltas, shape (N, D).
+    delta12 : torch.Tensor
+        Double mutant deltas (targets), shape (N, D).
+    wt : torch.Tensor or None
+        Wild-type embeddings, shape (N, D). None if not included.
+    epistasis_ids : list[str]
+        Original epistasis IDs for each sample.
+    embedding_dim : int
+        Dimensionality of embeddings.
+    """
+
+    delta1: torch.Tensor
+    delta2: torch.Tensor
+    delta12: torch.Tensor
+    wt: Optional[torch.Tensor]
+    epistasis_ids: list
+    embedding_dim: int
+
+    def __len__(self) -> int:
+        return len(self.epistasis_ids)
+
+    def __getitem__(self, idx: int) -> dict:
+        """Get a single sample as a dictionary."""
+        item = {
+            "delta1": self.delta1[idx],
+            "delta2": self.delta2[idx],
+            "delta12": self.delta12[idx],
+            "epistasis_id": self.epistasis_ids[idx],
+        }
+        if self.wt is not None:
+            item["wt"] = self.wt[idx]
+        return item
+
+    @classmethod
+    def from_dataframe(
+        cls,
+        df: "pd.DataFrame",
+        db: VariantEmbeddingDB,
+        id_col: str = "epistasis_id",
+        include_wt: bool = True,
+        show_progress: bool = True,
+    ) -> "EpistasisDataset":
+        """
+        Create dataset from DataFrame and embedding database.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with epistasis IDs.
+        db : VariantEmbeddingDB
+            Database containing embeddings. Must have Δ₁, Δ₂, Δ₁₂ stored
+            (use store_deltas=True when computing embeddings).
+        id_col : str, optional
+            Column containing epistasis IDs. Default: "epistasis_id".
+        include_wt : bool, optional
+            Include wild-type embeddings as input features. Default: True.
+        show_progress : bool, optional
+            Show progress bar. Default: True.
+
+        Returns
+        -------
+        EpistasisDataset
+            Dataset ready for training.
+
+        Examples
+        --------
+        >>> dataset = EpistasisDataset.from_dataframe(df, db, include_wt=True)
+        >>> print(f"Loaded {len(dataset)} samples, dim={dataset.embedding_dim}")
+        """
+        _require_pandas()
+
+        if id_col not in df.columns:
+            raise ValueError(f"Column {id_col!r} not found in DataFrame")
+
+        delta1_list = []
+        delta2_list = []
+        delta12_list = []
+        wt_list = [] if include_wt else None
+        valid_ids = []
+        skipped = 0
+
+        iterator = df[id_col]
+        if show_progress:
+            iterator = tqdm(iterator, desc="Loading embeddings")
+
+        for epi_id in iterator:
+            # Check for required keys
+            d1_key = f"{epi_id}{KEY_DELTA1}"
+            d2_key = f"{epi_id}{KEY_DELTA2}"
+            d12_key = f"{epi_id}{KEY_DELTA12}"
+            wt_key = f"{epi_id}{KEY_WT}"
+
+            required_keys = [d1_key, d2_key, d12_key]
+            if include_wt:
+                required_keys.append(wt_key)
+
+            if not all(db.has(k) for k in required_keys):
+                skipped += 1
+                continue
+
+            # Load embeddings
+            d1 = db.load(d1_key, as_torch=True)
+            d2 = db.load(d2_key, as_torch=True)
+            d12 = db.load(d12_key, as_torch=True)
+
+            delta1_list.append(d1)
+            delta2_list.append(d2)
+            delta12_list.append(d12)
+
+            if include_wt:
+                wt = db.load(wt_key, as_torch=True)
+                wt_list.append(wt)
+
+            valid_ids.append(epi_id)
+
+        if not valid_ids:
+            raise ValueError("No valid epistasis samples found in database")
+
+        if skipped > 0:
+            logger.warning("Skipped %d epistasis IDs (missing embeddings)", skipped)
+
+        # Stack into tensors
+        delta1 = torch.stack(delta1_list, dim=0)
+        delta2 = torch.stack(delta2_list, dim=0)
+        delta12 = torch.stack(delta12_list, dim=0)
+        wt = torch.stack(wt_list, dim=0) if include_wt else None
+
+        embedding_dim = delta1.shape[1]
+
+        logger.info(
+            "Created EpistasisDataset: %d samples, dim=%d, include_wt=%s",
+            len(valid_ids),
+            embedding_dim,
+            include_wt,
+        )
+
+        return cls(
+            delta1=delta1,
+            delta2=delta2,
+            delta12=delta12,
+            wt=wt,
+            epistasis_ids=valid_ids,
+            embedding_dim=embedding_dim,
+        )
+
+    def to_torch_dataset(self) -> "torch.utils.data.TensorDataset":
+        """Convert to PyTorch TensorDataset for DataLoader."""
+        if self.wt is not None:
+            return torch.utils.data.TensorDataset(
+                self.delta1, self.delta2, self.wt, self.delta12
+            )
+        return torch.utils.data.TensorDataset(
+            self.delta1, self.delta2, self.delta12
+        )
+
+    def train_val_split(
+        self,
+        val_fraction: float = 0.2,
+        seed: int = DEFAULT_RANDOM_STATE,
+    ) -> tuple["EpistasisDataset", "EpistasisDataset"]:
+        """
+        Split into training and validation datasets.
+
+        Parameters
+        ----------
+        val_fraction : float, optional
+            Fraction for validation. Default: 0.2.
+        seed : int, optional
+            Random seed. Default: 42.
+
+        Returns
+        -------
+        tuple[EpistasisDataset, EpistasisDataset]
+            (train_dataset, val_dataset)
+        """
+        n = len(self)
+        n_val = int(n * val_fraction)
+        n_train = n - n_val
+
+        rng = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(n, generator=rng)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:]
+
+        def subset(idx: torch.Tensor) -> "EpistasisDataset":
+            return EpistasisDataset(
+                delta1=self.delta1[idx],
+                delta2=self.delta2[idx],
+                delta12=self.delta12[idx],
+                wt=self.wt[idx] if self.wt is not None else None,
+                epistasis_ids=[self.epistasis_ids[i] for i in idx.tolist()],
+                embedding_dim=self.embedding_dim,
+            )
+
+        return subset(train_idx), subset(val_idx)
+
+
+class EpistasisExpectationModel:
+    """
+    Trainable model for predicting expected double-mutant delta vectors.
+
+    Learns to predict Δ₁₂ from (Δ₁, Δ₂) or (Δ₁, Δ₂, E_WT), enabling
+    data-driven epistasis expectations instead of assuming additivity.
+
+    Parameters
+    ----------
+    architecture : str, optional
+        Model architecture: "linear", "mlp", or "bilinear". Default: "linear".
+    include_wt : bool, optional
+        Include wild-type embedding as input. Default: False.
+    hidden_dims : list[int], optional
+        Hidden layer dimensions for MLP. Default: [256].
+    dropout : float, optional
+        Dropout rate for MLP. Default: 0.1.
+    activation : str, optional
+        Activation function: "relu", "gelu", "tanh". Default: "relu".
+    device : str, optional
+        Device for training. Default: "cpu".
+
+    Examples
+    --------
+    >>> # Train a model
+    >>> model = EpistasisExpectationModel(architecture="mlp", include_wt=True)
+    >>> model.fit(dataset, epochs=100, lr=1e-3)
+    >>>
+    >>> # Predict expected delta
+    >>> delta12_exp = model.predict(delta1, delta2, wt=h_wt)
+    >>>
+    >>> # Use in EpistasisGeometry
+    >>> geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, expectation_model=model)
+    """
+
+    def __init__(
+        self,
+        architecture: str = "linear",
+        include_wt: bool = False,
+        hidden_dims: Optional[list] = None,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        device: str = "cpu",
+    ):
+        self.architecture = architecture
+        self.include_wt = include_wt
+        self.hidden_dims = hidden_dims or [256]
+        self.dropout = dropout
+        self.activation = activation
+        self.device = torch.device(device)
+        self._model: Optional[torch.nn.Module] = None
+        self._embedding_dim: Optional[int] = None
+        self._trained = False
+
+    def _build_model(self, embedding_dim: int) -> torch.nn.Module:
+        """Build the neural network architecture."""
+        self._embedding_dim = embedding_dim
+
+        # Input size: Δ₁ + Δ₂ (+ E_WT if included)
+        input_dim = 2 * embedding_dim
+        if self.include_wt:
+            input_dim += embedding_dim
+
+        output_dim = embedding_dim
+
+        if self.architecture == "linear":
+            # Simple linear combination: W₁·Δ₁ + W₂·Δ₂ + b (or with W_wt·E_WT)
+            return torch.nn.Linear(input_dim, output_dim)
+
+        elif self.architecture == "mlp":
+            # Multi-layer perceptron
+            layers = []
+            prev_dim = input_dim
+
+            act_fn = {
+                "relu": torch.nn.ReLU,
+                "gelu": torch.nn.GELU,
+                "tanh": torch.nn.Tanh,
+            }.get(self.activation, torch.nn.ReLU)
+
+            for hidden_dim in self.hidden_dims:
+                layers.extend([
+                    torch.nn.Linear(prev_dim, hidden_dim),
+                    act_fn(),
+                    torch.nn.Dropout(self.dropout),
+                ])
+                prev_dim = hidden_dim
+
+            layers.append(torch.nn.Linear(prev_dim, output_dim))
+            return torch.nn.Sequential(*layers)
+
+        elif self.architecture == "bilinear":
+            # Bilinear interaction between Δ₁ and Δ₂
+            class BilinearModel(torch.nn.Module):
+                def __init__(self, dim: int, include_wt: bool):
+                    super().__init__()
+                    self.include_wt = include_wt
+                    self.bilinear = torch.nn.Bilinear(dim, dim, dim)
+                    self.linear = torch.nn.Linear(dim * 2, dim)
+                    if include_wt:
+                        self.wt_linear = torch.nn.Linear(dim, dim)
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    dim = x.shape[-1] // (3 if self.include_wt else 2)
+                    d1 = x[..., :dim]
+                    d2 = x[..., dim:2*dim]
+
+                    bilin = self.bilinear(d1, d2)
+                    linear = self.linear(torch.cat([d1, d2], dim=-1))
+                    out = bilin + linear
+
+                    if self.include_wt:
+                        wt = x[..., 2*dim:]
+                        out = out + self.wt_linear(wt)
+
+                    return out
+
+            return BilinearModel(embedding_dim, self.include_wt)
+
+        else:
+            raise ValueError(f"Unknown architecture: {self.architecture}")
+
+    def _prepare_input(
+        self,
+        delta1: torch.Tensor,
+        delta2: torch.Tensor,
+        wt: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Concatenate inputs for the model."""
+        inputs = [delta1, delta2]
+        if self.include_wt:
+            if wt is None:
+                raise ValueError("Model requires wt but none provided")
+            inputs.append(wt)
+        return torch.cat(inputs, dim=-1)
+
+    def fit(
+        self,
+        dataset: EpistasisDataset,
+        epochs: int = 100,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-5,
+        batch_size: int = 32,
+        val_fraction: float = 0.2,
+        directional_weight: float = 0.5,
+        early_stopping_patience: int = 10,
+        verbose: bool = True,
+    ) -> dict:
+        """
+        Train the model on an epistasis dataset.
+
+        Parameters
+        ----------
+        dataset : EpistasisDataset
+            Training data.
+        epochs : int, optional
+            Number of training epochs. Default: 100.
+        lr : float, optional
+            Learning rate. Default: 1e-3.
+        weight_decay : float, optional
+            L2 regularization. Default: 1e-5.
+        batch_size : int, optional
+            Batch size. Default: 32.
+        val_fraction : float, optional
+            Validation split fraction. Default: 0.2.
+        directional_weight : float, optional
+            Weight for cosine similarity loss (0=MSE only, 1=cosine only).
+            Default: 0.5 (equal weight).
+        early_stopping_patience : int, optional
+            Epochs without improvement before stopping. Default: 10.
+        verbose : bool, optional
+            Print training progress. Default: True.
+
+        Returns
+        -------
+        dict
+            Training history with 'train_loss', 'val_loss', 'best_epoch'.
+        """
+        if self.include_wt and dataset.wt is None:
+            raise ValueError("Model requires wt but dataset has include_wt=False")
+
+        # Build model
+        self._model = self._build_model(dataset.embedding_dim).to(self.device)
+
+        # Split data
+        train_data, val_data = dataset.train_val_split(val_fraction)
+
+        # Create data loaders
+        train_loader = torch.utils.data.DataLoader(
+            train_data.to_torch_dataset(),
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_data.to_torch_dataset(),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        # Optimizer
+        optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+        # Training loop
+        history = {"train_loss": [], "val_loss": [], "best_epoch": 0}
+        best_val_loss = float("inf")
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            # Training
+            self._model.train()
+            train_losses = []
+
+            for batch in train_loader:
+                if self.include_wt:
+                    d1, d2, wt, d12_target = [b.to(self.device) for b in batch]
+                else:
+                    d1, d2, d12_target = [b.to(self.device) for b in batch]
+                    wt = None
+
+                optimizer.zero_grad()
+
+                x = self._prepare_input(d1, d2, wt)
+                d12_pred = self._model(x)
+
+                loss = self._compute_loss(d12_pred, d12_target, directional_weight)
+                loss.backward()
+                optimizer.step()
+
+                train_losses.append(loss.item())
+
+            # Validation
+            self._model.eval()
+            val_losses = []
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    if self.include_wt:
+                        d1, d2, wt, d12_target = [b.to(self.device) for b in batch]
+                    else:
+                        d1, d2, d12_target = [b.to(self.device) for b in batch]
+                        wt = None
+
+                    x = self._prepare_input(d1, d2, wt)
+                    d12_pred = self._model(x)
+
+                    loss = self._compute_loss(d12_pred, d12_target, directional_weight)
+                    val_losses.append(loss.item())
+
+            train_loss = np.mean(train_losses)
+            val_loss = np.mean(val_losses)
+
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in self._model.state_dict().items()}
+                history["best_epoch"] = epoch
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if verbose and (epoch + 1) % 10 == 0:
+                print(
+                    f"Epoch {epoch+1}/{epochs} - "
+                    f"train: {train_loss:.6f}, val: {val_loss:.6f}"
+                )
+
+            if patience_counter >= early_stopping_patience:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch+1}")
+                break
+
+        # Restore best model
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+
+        self._model.to(self.device)
+        self._trained = True
+
+        if verbose:
+            print(
+                f"Training complete. Best val loss: {best_val_loss:.6f} "
+                f"at epoch {history['best_epoch']+1}"
+            )
+
+        return history
+
+    def _compute_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        directional_weight: float,
+    ) -> torch.Tensor:
+        """Compute combined MSE and directional (cosine) loss."""
+        # MSE loss (magnitude)
+        mse_loss = torch.nn.functional.mse_loss(pred, target)
+
+        if directional_weight == 0:
+            return mse_loss
+
+        # Cosine similarity loss (direction)
+        cos_sim = torch.nn.functional.cosine_similarity(pred, target, dim=-1)
+        cosine_loss = (1 - cos_sim).mean()  # 0 when perfect alignment
+
+        # Combined loss
+        return (1 - directional_weight) * mse_loss + directional_weight * cosine_loss
+
+    def predict(
+        self,
+        delta1: TensorLike,
+        delta2: TensorLike,
+        wt: Optional[TensorLike] = None,
+    ) -> torch.Tensor:
+        """
+        Predict expected Δ₁₂ from single-mutant deltas.
+
+        Parameters
+        ----------
+        delta1 : array-like
+            Single mutant 1 delta vector.
+        delta2 : array-like
+            Single mutant 2 delta vector.
+        wt : array-like, optional
+            Wild-type embedding (required if include_wt=True).
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted Δ₁₂ (expected double-mutant delta).
+        """
+        if not self._trained:
+            raise RuntimeError("Model not trained. Call fit() first.")
+
+        # Convert to tensors
+        d1 = torch.as_tensor(delta1, dtype=torch.float32)
+        d2 = torch.as_tensor(delta2, dtype=torch.float32)
+
+        # Handle batched vs single input
+        squeeze_output = False
+        if d1.ndim == 1:
+            d1 = d1.unsqueeze(0)
+            d2 = d2.unsqueeze(0)
+            squeeze_output = True
+
+        if wt is not None:
+            wt = torch.as_tensor(wt, dtype=torch.float32)
+            if wt.ndim == 1:
+                wt = wt.unsqueeze(0)
+
+        # Move to device
+        d1 = d1.to(self.device)
+        d2 = d2.to(self.device)
+        if wt is not None:
+            wt = wt.to(self.device)
+
+        # Predict
+        self._model.eval()
+        with torch.no_grad():
+            x = self._prepare_input(d1, d2, wt)
+            pred = self._model(x)
+
+        if squeeze_output:
+            pred = pred.squeeze(0)
+
+        return pred.cpu()
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Save model to file."""
+        if not self._trained:
+            raise RuntimeError("Cannot save untrained model")
+
+        state = {
+            "architecture": self.architecture,
+            "include_wt": self.include_wt,
+            "hidden_dims": self.hidden_dims,
+            "dropout": self.dropout,
+            "activation": self.activation,
+            "embedding_dim": self._embedding_dim,
+            "model_state": self._model.state_dict(),
+        }
+        torch.save(state, path)
+        logger.info("Saved EpistasisExpectationModel to %s", path)
+
+    @classmethod
+    def load(cls, path: Union[str, Path], device: str = "cpu") -> "EpistasisExpectationModel":
+        """Load model from file."""
+        state = torch.load(path, map_location=device, weights_only=False)
+
+        model = cls(
+            architecture=state["architecture"],
+            include_wt=state["include_wt"],
+            hidden_dims=state["hidden_dims"],
+            dropout=state["dropout"],
+            activation=state["activation"],
+            device=device,
+        )
+
+        model._model = model._build_model(state["embedding_dim"]).to(model.device)
+        model._model.load_state_dict(state["model_state"])
+        model._trained = True
+
+        logger.info("Loaded EpistasisExpectationModel from %s", path)
+        return model
+
+    def __repr__(self) -> str:
+        status = "trained" if self._trained else "untrained"
+        return (
+            f"EpistasisExpectationModel("
+            f"architecture={self.architecture!r}, "
+            f"include_wt={self.include_wt}, "
+            f"status={status})"
+        )
 
 
 # =============================================================================

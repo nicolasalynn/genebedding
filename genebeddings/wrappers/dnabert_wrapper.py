@@ -36,11 +36,13 @@ class DNABERTWrapper(BaseWrapper):
         model_id: HuggingFace model identifier
         device: Device to load model on (auto-detected if None)
         dtype: Model dtype (default: float32)
+        trust_remote_code: Whether to use DNABERT-2's custom code (includes flash attention).
+                          Set to False to use standard HuggingFace BERT and avoid Triton issues.
+                          Default is False for compatibility.
         attn_implementation: Attention implementation ("eager" for PyTorch, "flash_attention_2" for FlashAttn)
-                           Default is "eager" to avoid Triton compatibility issues with flash attention.
+                           Only used when trust_remote_code=False. Default is "eager".
     """
     MODEL_ID = "zhihan1996/DNABERT-2-117M"
-    TRUST_REMOTE = True
 
     def __init__(
         self,
@@ -48,6 +50,7 @@ class DNABERTWrapper(BaseWrapper):
         *,
         device: Optional[str] = None,
         dtype: torch.dtype = torch.float32,
+        trust_remote_code: bool = False,
         attn_implementation: str = "eager",
     ):
         super().__init__()
@@ -60,15 +63,27 @@ class DNABERTWrapper(BaseWrapper):
             )
         self.device = torch.device(device)
         self.dtype = dtype
+        self._trust_remote_code = trust_remote_code
 
         # tokenizer / model (use MLM model for predictions)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=self.TRUST_REMOTE)
-        self.model = AutoModelForMaskedLM.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
-            trust_remote_code=self.TRUST_REMOTE,
-            attn_implementation=attn_implementation,  # Use "eager" to avoid Triton flash-attn issues
-        ).to(self.device).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+        # Load model - if trust_remote_code=False, use standard BERT implementation
+        # This avoids the Triton flash attention incompatibility in DNABERT-2's custom code
+        if trust_remote_code:
+            self.model = AutoModelForMaskedLM.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            ).to(self.device).eval()
+        else:
+            # Use standard HuggingFace implementation (no custom flash attention)
+            self.model = AutoModelForMaskedLM.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                trust_remote_code=False,
+                attn_implementation=attn_implementation,
+            ).to(self.device).eval()
 
         # Get mask token id
         self.mask_id = self.tokenizer.mask_token_id
