@@ -25,19 +25,22 @@ DNA_SET = set("ACGTN")
 # Model registry: short name -> model ID for Evo2
 EVO2_MODELS: Dict[str, str] = {
     "7b": "evo2_7b",
+    "7b_base": "evo2_7b_base",
     "1b": "evo2_1b",
     "evo2_7b": "evo2_7b",
+    "evo2_7b_base": "evo2_7b_base",
     "evo2_1b": "evo2_1b",
 }
 
 # Default embedding layers for each model size
 DEFAULT_EMBEDDING_LAYERS: Dict[str, str] = {
     "evo2_7b": "blocks.28.mlp.l3",
+    "evo2_7b_base": "blocks.28.mlp.l3",
     "evo2_1b": "blocks.14.mlp.l3",  # Approximate middle layer for 1b
 }
 
 # Type alias for model selection
-Evo2ModelName = Literal["7b", "1b", "evo2_7b", "evo2_1b"]
+Evo2ModelName = Literal["7b", "7b_base", "1b", "evo2_7b", "evo2_7b_base", "evo2_1b"]
 
 
 def list_available_models() -> List[str]:
