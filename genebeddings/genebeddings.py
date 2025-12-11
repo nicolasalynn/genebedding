@@ -2257,6 +2257,86 @@ def embed_epistasis(
     return h_ref, h_m1, h_m2, h_m12
 
 
+
+def embed_epistasis_to_gene(
+    model,
+    epistasis_id: str,
+    context: int = DEFAULT_CONTEXT,
+    genome: str = DEFAULT_GENOME,
+    pool: str = "mean",
+    mature_mrna: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate embeddings for an epistasis pair.
+
+    Parameters
+    ----------
+    model : object
+        Model with `.embed(sequence: str, pool=...) -> Tensor` method.
+    epistasis_id : str
+        Epistasis identifier (see parse_epistasis_id).
+    context : int, optional
+        Context window size. Default: 3000.
+    genome : str, optional
+        Genome assembly name. Default: "hg38".
+    pool : str, optional
+        Pooling method for embeddings. "mean" for mean-pooled (default),
+        "tokens" for full token embeddings (flattened).
+
+    Returns
+    -------
+    tuple[Tensor, Tensor, Tensor, Tensor]
+        (h_ref, h_m1, h_m2, h_m12) embeddings.
+    """
+    from seqmat.gene import Gene
+
+    gene = epistasis_id.split(':')[0]
+    (chrom, pos1, ref1, alt1, rev), (_, pos2, ref2, alt2, _) = parse_epistasis_id(
+        epistasis_id
+    )
+
+    p_min = min(pos1, pos2)
+    p_max = max(pos1, pos2)
+    start = p_min - context
+    end = p_max + context - 1
+
+    logger.debug(
+        "Embedding epistasis %s: chr%s:%d-%d (rev=%s)",
+        epistasis_id,
+        chrom,
+        start,
+        end,
+        rev,
+    )
+
+    s = Gene.from_file(gene).transcript().generate_pre_mrna().generate_mature_mrna().mature_mrna
+    # if rev:
+    #     s.reverse_complement()
+
+    var1 = (pos1, ref1, alt1)
+    var2 = (pos2, ref2, alt2)
+
+    m1 = s.clone()
+    m2 = s.clone()
+    m12 = s.clone()
+
+    m1.apply_mutations([var1])
+    m2.apply_mutations([var2])
+    m12.apply_mutations([var1, var2])
+
+    # seq = s.seq
+    # if len(seq) > context * 2:
+    #     seq = seq[:context * 2]
+
+    h_ref = model.embed(s.seq, pool=pool)
+    h_m1 = model.embed(m1.seq, pool=pool)
+    h_m2 = model.embed(m2.seq, pool=pool)
+    h_m12 = model.embed(m12.seq, pool=pool)
+
+    return h_ref, h_m1, h_m2, h_m12
+
+
+
 # ---------------------------------------------------------------------------
 # Database Storage Functions
 # ---------------------------------------------------------------------------
@@ -2875,6 +2955,7 @@ def add_epistasis_metrics(
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     pool: str = "mean",
+    force: bool = False,
 ) -> "pd.DataFrame":
     """
     Add epistasis geometry metrics to a DataFrame.
@@ -2929,6 +3010,9 @@ def add_epistasis_metrics(
     pool : str, optional
         Pooling method for embeddings. "mean" for mean-pooled (default),
         "tokens" for full token embeddings (flattened).
+    force : bool, optional
+        If True, recompute embeddings even if they exist in the database.
+        Default: False.
 
     Returns
     -------
@@ -2939,6 +3023,9 @@ def add_epistasis_metrics(
     --------
     >>> # With model - computes and saves all embeddings
     >>> df = add_epistasis_metrics(df, db, model=borzoi)
+
+    >>> # Force recomputation of all embeddings
+    >>> df = add_epistasis_metrics(df, db, model=borzoi, force=True)
 
     >>> # Negative strand genes
     >>> df = add_epistasis_metrics(
@@ -3045,7 +3132,7 @@ def add_epistasis_metrics(
         m2_key = f"{epi_id}{KEY_M2}"
         m12_key = f"{epi_id}{KEY_M12}"
 
-        if db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
+        if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
             # Load existing embeddings
             h_wt = db.load(wt_key)
             h_m1 = db.load(m1_key)
