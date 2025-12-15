@@ -415,6 +415,23 @@ class EpistasisMetrics:
         Residual normalized by sqrt(|v1|² + |v2|²).
     epi_R_expected : float
         Residual normalized by distance to expected.
+    epi_score : float
+        Bounded epistasis score in [0, 1]. Computed as R_raw / (R_raw + d_exp).
+        Handles small expected values gracefully. 0 = perfectly additive, 1 = maximal epistasis.
+    cos_v12_v1 : float
+        Cosine similarity between observed double-mutant effect and single-mutant 1 effect.
+    cos_v12_v2 : float
+        Cosine similarity between observed double-mutant effect and single-mutant 2 effect.
+    cos_v12_vexp : float
+        Cosine similarity between observed and expected double-mutant effects.
+    cos_v1_v2 : float
+        Cosine similarity between single-mutant effects (measures effect alignment).
+    magnitude_ratio : float
+        Ratio of observed to expected magnitude: |v12_obs| / |v12_exp|.
+        <1 = sub-additive, >1 = super-additive.
+    radial_deviation : float
+        Signed deviation: (|v12_obs| - |v12_exp|) / |v12_exp|.
+        Negative = closer to WT than expected, positive = further.
     """
 
     dist_WT_M1: float
@@ -431,6 +448,13 @@ class EpistasisMetrics:
     epi_R_raw: float
     epi_R_singles: float
     epi_R_expected: float
+    epi_score: float
+    cos_v12_v1: float
+    cos_v12_v2: float
+    cos_v12_vexp: float
+    cos_v1_v2: float
+    magnitude_ratio: float
+    radial_deviation: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -449,6 +473,13 @@ class EpistasisMetrics:
             "epi_R_raw": self.epi_R_raw,
             "epi_R_singles": self.epi_R_singles,
             "epi_R_expected": self.epi_R_expected,
+            "epi_score": self.epi_score,
+            "cos_v12_v1": self.cos_v12_v1,
+            "cos_v12_v2": self.cos_v12_v2,
+            "cos_v12_vexp": self.cos_v12_vexp,
+            "cos_v1_v2": self.cos_v1_v2,
+            "magnitude_ratio": self.magnitude_ratio,
+            "radial_deviation": self.radial_deviation,
         }
 
 
@@ -1101,6 +1132,26 @@ class EpistasisGeometry(_GeometryBase):
         R_singles = R_raw / single_scale
         R_expected = R_raw / (d_WT_M12_exp + self.eps)
 
+        # Bounded epistasis score: R_raw / (R_raw + d_exp) in [0, 1]
+        epi_score = R_raw / (R_raw + d_WT_M12_exp + self.eps)
+
+        # Cosine similarities between effect vectors
+        def _cosine(u: torch.Tensor, v: torch.Tensor) -> float:
+            nu = self._safe_norm(u)
+            nv = self._safe_norm(v)
+            if nu < self.eps or nv < self.eps:
+                return 0.0
+            return float(torch.dot(u, v) / (nu * nv))
+
+        cos_v12_v1 = _cosine(v12, v1)
+        cos_v12_v2 = _cosine(v12, v2)
+        cos_v12_vexp = _cosine(v12, v12_exp)
+        cos_v1_v2 = _cosine(v1, v2)
+
+        # Magnitude ratio and radial deviation
+        magnitude_ratio = a12 / (a12_exp + self.eps)
+        radial_deviation = (a12 - a12_exp) / (a12_exp + self.eps)
+
         self._cached_metrics = EpistasisMetrics(
             dist_WT_M1=d_WT_M1,
             dist_WT_M2=d_WT_M2,
@@ -1116,6 +1167,13 @@ class EpistasisGeometry(_GeometryBase):
             epi_R_raw=R_raw,
             epi_R_singles=R_singles,
             epi_R_expected=R_expected,
+            epi_score=epi_score,
+            cos_v12_v1=cos_v12_v1,
+            cos_v12_v2=cos_v12_v2,
+            cos_v12_vexp=cos_v12_vexp,
+            cos_v1_v2=cos_v1_v2,
+            magnitude_ratio=magnitude_ratio,
+            radial_deviation=radial_deviation,
         )
 
         return self._cached_metrics
@@ -2951,6 +3009,7 @@ def add_epistasis_metrics(
     include_complex: bool = True,
     include_triangle: bool = True,
     include_distances: bool = True,
+    full_features: bool = False,
     inplace: bool = False,
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -3001,6 +3060,11 @@ def add_epistasis_metrics(
         Include triangle-based coordinates. Default: True.
     include_distances : bool, optional
         Include all distance/length metrics. Default: True.
+    full_features : bool, optional
+        If True, compute metrics for all three expectation models (additive,
+        geometric, pythagorean) with prefixes "add_", "geo_", "pyth_".
+        Creates a comprehensive feature space for ML applications.
+        Default: False.
     inplace : bool, optional
         Modify DataFrame in place. Default: False.
     show_progress : bool, optional
@@ -3027,6 +3091,9 @@ def add_epistasis_metrics(
     >>> # Force recomputation of all embeddings
     >>> df = add_epistasis_metrics(df, db, model=borzoi, force=True)
 
+    >>> # Full feature space for ML with all expectation models
+    >>> df = add_epistasis_metrics(df, db, model=borzoi, full_features=True)
+
     >>> # Negative strand genes
     >>> df = add_epistasis_metrics(
     ...     df, db, model=borzoi,
@@ -3050,30 +3117,85 @@ def add_epistasis_metrics(
     if not inplace:
         df = df.copy()
 
+    # Expectation model definitions for full_features mode
+    def _geometric_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
+        """Geometric mean of effect magnitudes with average direction."""
+        mag = torch.sqrt(v1.norm() * v2.norm() + eps)
+        direction = v1 + v2
+        direction = direction / (direction.norm() + eps)
+        return mag * direction
+
+    def _pythagorean_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
+        """Pythagorean combination: sqrt(||v1||^2 + ||v2||^2) with average direction."""
+        mag = torch.sqrt(v1.norm()**2 + v2.norm()**2)
+        direction = v1 + v2
+        direction = direction / (direction.norm() + eps)
+        return mag * direction
+
+    # Define which expectation models to use
+    def _additive_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
+        """Additive expectation: v12_exp = v1 + v2."""
+        _ = eps  # unused but kept for consistent signature
+        return v1 + v2
+
+    if full_features:
+        expectation_models = [
+            ("add", _additive_v12_exp),     # additive
+            ("geo", _geometric_v12_exp),    # geometric
+            ("pyth", _pythagorean_v12_exp), # pythagorean
+        ]
+    else:
+        expectation_models = [("", _additive_v12_exp)]  # additive only, no prefix
+
+    # Core metrics that don't depend on expectation model
+    base_metrics = [
+        "dist_WT_M1", "dist_WT_M2", "dist_M1_M2",
+        "len_WT_M1", "len_WT_M2", "len_M1_M2",
+        "cos_v1_v2",
+    ]
+
+    # Expectation-dependent metrics
+    exp_metrics = [
+        "dist_WT_M12_obs", "dist_WT_M12_exp", "dist_obs_exp",
+        "len_WT_M12", "len_WT_M12_exp",
+        "epi_R_raw", "epi_R_singles", "epi_R_expected", "epi_score",
+        "cos_v12_v1", "cos_v12_v2", "cos_v12_vexp",
+        "magnitude_ratio", "radial_deviation",
+    ]
+
+    # Complex coords metrics (expectation-dependent)
+    complex_metrics = [
+        "x_exp", "y_exp", "x_obs", "y_obs",
+        "rho", "theta", "theta_over_pi"
+    ]
+
+    # Triangle coords metrics (expectation-dependent)
+    triangle_metrics = [
+        "x_exp_tri", "y_exp_tri", "x_obs_tri", "y_obs_tri",
+        "rho_tri", "theta_tri", "theta_tri_over_pi"
+    ]
+
     # Build list of metric columns to add
     metric_cols: list[str] = []
 
-    if include_complex:
-        metric_cols.extend([
-            "x_exp", "y_exp", "x_obs", "y_obs",
-            "rho", "theta", "theta_over_pi"
-        ])
-
-    if include_triangle:
-        metric_cols.extend([
-            "x_exp_tri", "y_exp_tri", "x_obs_tri", "y_obs_tri",
-            "rho_tri", "theta_tri", "theta_tri_over_pi"
-        ])
-
+    # Base metrics (only once, not per-expectation)
     if include_distances:
-        metric_cols.extend([
-            "dist_WT_M1", "dist_WT_M2", "dist_WT_M12_obs", "dist_WT_M12_exp",
-            "dist_M1_M2", "dist_obs_exp",
-            "len_WT_M1", "len_WT_M2", "len_WT_M12", "len_WT_M12_exp", "len_M1_M2",
-            "epi_R_raw", "epi_R_singles", "epi_R_expected"
-        ])
+        metric_cols.extend(base_metrics)
 
-    # Initialize columns
+    # Per-expectation metrics
+    for exp_prefix, _ in expectation_models:
+        full_prefix = f"{exp_prefix}_" if exp_prefix else ""
+
+        if include_distances:
+            metric_cols.extend([f"{full_prefix}{m}" for m in exp_metrics])
+
+        if include_complex:
+            metric_cols.extend([f"{full_prefix}{m}" for m in complex_metrics])
+
+        if include_triangle:
+            metric_cols.extend([f"{full_prefix}{m}" for m in triangle_metrics])
+
+    # Initialize columns with user prefix
     for name in metric_cols:
         df[f"{prefix}{name}"] = float("nan")
 
@@ -3176,37 +3298,62 @@ def add_epistasis_metrics(
             n_skipped += 1
             continue
 
-        # Compute geometry
-        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
+        # Compute effect vectors (needed for all expectation models)
+        v1 = h_m1 - h_wt
+        v2 = h_m2 - h_wt
 
-        # Assign complex coords
-        if include_complex:
-            coords = geom.complex_coords()
-            for name in ["x_exp", "y_exp", "x_obs", "y_obs",
-                         "rho", "theta", "theta_over_pi"]:
-                df.at[idx, f"{prefix}{name}"] = getattr(coords, name)
-
-        # Assign triangle coords
-        if include_triangle:
-            tri = geom.triangle_coords()
-            df.at[idx, f"{prefix}x_exp_tri"] = tri.x_exp
-            df.at[idx, f"{prefix}y_exp_tri"] = tri.y_exp
-            df.at[idx, f"{prefix}x_obs_tri"] = tri.x_obs
-            df.at[idx, f"{prefix}y_obs_tri"] = tri.y_obs
-            df.at[idx, f"{prefix}rho_tri"] = tri.rho
-            df.at[idx, f"{prefix}theta_tri"] = tri.theta
-            df.at[idx, f"{prefix}theta_tri_over_pi"] = tri.theta_over_pi
-
-        # Assign distance metrics
+        # Assign base metrics (only once, not per-expectation)
         if include_distances:
-            metrics = geom.metrics()
-            for name in [
-                "dist_WT_M1", "dist_WT_M2", "dist_WT_M12_obs", "dist_WT_M12_exp",
-                "dist_M1_M2", "dist_obs_exp",
-                "len_WT_M1", "len_WT_M2", "len_WT_M12", "len_WT_M12_exp", "len_M1_M2",
-                "epi_R_raw", "epi_R_singles", "epi_R_expected"
-            ]:
-                df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
+            # Use default geometry for base metrics
+            geom_base = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
+            metrics_base = geom_base.metrics()
+            for name in base_metrics:
+                df.at[idx, f"{prefix}{name}"] = getattr(metrics_base, name)
+
+        # Compute metrics for each expectation model
+        for exp_prefix, exp_fn in expectation_models:
+            full_prefix = f"{prefix}{exp_prefix}_" if exp_prefix else prefix
+
+            # Compute expected v12 using this expectation model
+            v12_exp = exp_fn(v1, v2, DEFAULT_EPS)
+
+            # Create geometry with custom v12_exp
+            # We need to create the geometry manually to use the custom expectation
+            geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
+            # Override v12_exp with our computed value
+            geom.v12_exp = v12_exp
+            geom._cached_metrics = None  # Clear cache to recompute with new v12_exp
+            geom._cached_complex = None
+            geom._cached_triangle = None
+
+            # Assign expectation-dependent distance metrics
+            if include_distances:
+                metrics = geom.metrics()
+                for name in exp_metrics:
+                    df.at[idx, f"{full_prefix}{name}"] = getattr(metrics, name)
+
+            # Assign complex coords
+            if include_complex:
+                coords = geom.complex_coords()
+                for name in complex_metrics:
+                    df.at[idx, f"{full_prefix}{name}"] = getattr(coords, name)
+
+            # Assign triangle coords
+            if include_triangle:
+                tri = geom.triangle_coords()
+                # Map column names to dataclass attributes
+                tri_attr_map = {
+                    "x_exp_tri": "x_exp",
+                    "y_exp_tri": "y_exp",
+                    "x_obs_tri": "x_obs",
+                    "y_obs_tri": "y_obs",
+                    "rho_tri": "rho",
+                    "theta_tri": "theta",
+                    "theta_tri_over_pi": "theta_over_pi",
+                }
+                for col_name in triangle_metrics:
+                    attr_name = tri_attr_map[col_name]
+                    df.at[idx, f"{full_prefix}{col_name}"] = getattr(tri, attr_name)
 
         n_processed += 1
 
