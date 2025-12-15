@@ -432,6 +432,15 @@ class EpistasisMetrics:
     radial_deviation : float
         Signed deviation: (|v12_obs| - |v12_exp|) / |v12_exp|.
         Negative = closer to WT than expected, positive = further.
+    epi_total : float
+        **Primary epistasis metric** capturing both angle AND magnitude deviation.
+        Computed as: sqrt((1 - cos_v12_vexp)^2 + (magnitude_ratio - 1)^2).
+        This is the Euclidean distance from the "no epistasis" point (cos=1, ratio=1).
+        0 = perfectly additive, higher = more epistatic.
+    epi_total_bounded : float
+        Bounded version of epi_total in [0, 1]: epi_total / (1 + epi_total).
+        0 = perfectly additive, approaches 1 for strong epistasis.
+        Recommended as a universal filter/score for epistasis strength.
     """
 
     dist_WT_M1: float
@@ -455,6 +464,8 @@ class EpistasisMetrics:
     cos_v1_v2: float
     magnitude_ratio: float
     radial_deviation: float
+    epi_total: float
+    epi_total_bounded: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -480,6 +491,8 @@ class EpistasisMetrics:
             "cos_v1_v2": self.cos_v1_v2,
             "magnitude_ratio": self.magnitude_ratio,
             "radial_deviation": self.radial_deviation,
+            "epi_total": self.epi_total,
+            "epi_total_bounded": self.epi_total_bounded,
         }
 
 
@@ -1152,6 +1165,13 @@ class EpistasisGeometry(_GeometryBase):
         magnitude_ratio = a12 / (a12_exp + self.eps)
         radial_deviation = (a12 - a12_exp) / (a12_exp + self.eps)
 
+        # Total epistasis: distance from "no epistasis" point (cos=1, ratio=1)
+        # Captures both angular AND magnitude deviation in one metric
+        angle_dev = 1.0 - cos_v12_vexp  # 0 when aligned, 2 when opposite
+        mag_dev = magnitude_ratio - 1.0  # 0 when equal magnitude
+        epi_total = math.sqrt(angle_dev**2 + mag_dev**2)
+        epi_total_bounded = epi_total / (1.0 + epi_total)
+
         self._cached_metrics = EpistasisMetrics(
             dist_WT_M1=d_WT_M1,
             dist_WT_M2=d_WT_M2,
@@ -1174,6 +1194,8 @@ class EpistasisGeometry(_GeometryBase):
             cos_v1_v2=cos_v1_v2,
             magnitude_ratio=magnitude_ratio,
             radial_deviation=radial_deviation,
+            epi_total=epi_total,
+            epi_total_bounded=epi_total_bounded,
         )
 
         return self._cached_metrics
@@ -3161,6 +3183,7 @@ def add_epistasis_metrics(
         "epi_R_raw", "epi_R_singles", "epi_R_expected", "epi_score",
         "cos_v12_v1", "cos_v12_v2", "cos_v12_vexp",
         "magnitude_ratio", "radial_deviation",
+        "epi_total", "epi_total_bounded",
     ]
 
     # Complex coords metrics (expectation-dependent)
