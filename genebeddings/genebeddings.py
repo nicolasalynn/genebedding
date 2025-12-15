@@ -440,7 +440,35 @@ class EpistasisMetrics:
     epi_total_bounded : float
         Bounded version of epi_total in [0, 1]: epi_total / (1 + epi_total).
         0 = perfectly additive, approaches 1 for strong epistasis.
-        Recommended as a universal filter/score for epistasis strength.
+    log_rho_tri : float
+        Log of magnitude ratio: log(|v12_obs| / |v12_exp|).
+        0 = same magnitude as expected (additive).
+        Positive = super-additive (observed > expected).
+        Negative = sub-additive (observed < expected).
+        High dynamic range, good for detecting outliers.
+    abs_log_rho_tri : float
+        **Recommended filter metric**: |log(|v12_obs| / |v12_exp|)|.
+        0 = perfectly additive, larger = more epistatic (either direction).
+        Unbounded with high dynamic range. Values:
+        0.1 = ~25% magnitude difference
+        0.3 = ~2x difference
+        0.7 = ~5x difference
+        1.0 = ~10x difference
+    len_WT_M12_L1 : float
+        L1 norm of observed effect vector: sum(|v12_obs|).
+    len_WT_M12_exp_L1 : float
+        L1 norm of expected effect vector: sum(|v12_exp|).
+    epi_R_raw_L1 : float
+        L1 norm of residual: sum(|v12_obs - v12_exp|).
+    epi_R_expected_L1 : float
+        L1 residual normalized by L1 expected: epi_R_raw_L1 / len_WT_M12_exp_L1.
+    magnitude_ratio_L1 : float
+        L1 magnitude ratio: len_WT_M12_L1 / len_WT_M12_exp_L1.
+    log_rho_L1 : float
+        Log of L1 magnitude ratio. 0 = additive, + = super, - = sub.
+    abs_log_rho_L1 : float
+        |log(L1 ratio)|. Recommended L1-based filter metric.
+        Symmetric: 2x and 0.5x both give ~0.69.
     """
 
     dist_WT_M1: float
@@ -466,6 +494,15 @@ class EpistasisMetrics:
     radial_deviation: float
     epi_total: float
     epi_total_bounded: float
+    log_rho_tri: float
+    abs_log_rho_tri: float
+    len_WT_M12_L1: float
+    len_WT_M12_exp_L1: float
+    epi_R_raw_L1: float
+    epi_R_expected_L1: float
+    magnitude_ratio_L1: float
+    log_rho_L1: float
+    abs_log_rho_L1: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -493,6 +530,15 @@ class EpistasisMetrics:
             "radial_deviation": self.radial_deviation,
             "epi_total": self.epi_total,
             "epi_total_bounded": self.epi_total_bounded,
+            "log_rho_tri": self.log_rho_tri,
+            "abs_log_rho_tri": self.abs_log_rho_tri,
+            "len_WT_M12_L1": self.len_WT_M12_L1,
+            "len_WT_M12_exp_L1": self.len_WT_M12_exp_L1,
+            "epi_R_raw_L1": self.epi_R_raw_L1,
+            "epi_R_expected_L1": self.epi_R_expected_L1,
+            "magnitude_ratio_L1": self.magnitude_ratio_L1,
+            "log_rho_L1": self.log_rho_L1,
+            "abs_log_rho_L1": self.abs_log_rho_L1,
         }
 
 
@@ -1172,6 +1218,21 @@ class EpistasisGeometry(_GeometryBase):
         epi_total = math.sqrt(angle_dev**2 + mag_dev**2)
         epi_total_bounded = epi_total / (1.0 + epi_total)
 
+        # Log-scale magnitude ratio: high dynamic range, centered at 0
+        # log(ratio) = 0 when additive, positive when super-additive, negative when sub-additive
+        log_rho_tri = math.log(magnitude_ratio + self.eps)
+        abs_log_rho_tri = abs(log_rho_tri)
+
+        # L1-based metrics (Manhattan distance)
+        len_WT_M12_L1 = float(torch.sum(torch.abs(v12)))
+        len_WT_M12_exp_L1 = float(torch.sum(torch.abs(v12_exp)))
+        residual = v12 - v12_exp
+        epi_R_raw_L1 = float(torch.sum(torch.abs(residual)))
+        epi_R_expected_L1 = epi_R_raw_L1 / (len_WT_M12_exp_L1 + self.eps)
+        magnitude_ratio_L1 = len_WT_M12_L1 / (len_WT_M12_exp_L1 + self.eps)
+        log_rho_L1 = math.log(magnitude_ratio_L1 + self.eps)
+        abs_log_rho_L1 = abs(log_rho_L1)
+
         self._cached_metrics = EpistasisMetrics(
             dist_WT_M1=d_WT_M1,
             dist_WT_M2=d_WT_M2,
@@ -1196,6 +1257,15 @@ class EpistasisGeometry(_GeometryBase):
             radial_deviation=radial_deviation,
             epi_total=epi_total,
             epi_total_bounded=epi_total_bounded,
+            log_rho_tri=log_rho_tri,
+            abs_log_rho_tri=abs_log_rho_tri,
+            len_WT_M12_L1=len_WT_M12_L1,
+            len_WT_M12_exp_L1=len_WT_M12_exp_L1,
+            epi_R_raw_L1=epi_R_raw_L1,
+            epi_R_expected_L1=epi_R_expected_L1,
+            magnitude_ratio_L1=magnitude_ratio_L1,
+            log_rho_L1=log_rho_L1,
+            abs_log_rho_L1=abs_log_rho_L1,
         )
 
         return self._cached_metrics
@@ -3184,6 +3254,11 @@ def add_epistasis_metrics(
         "cos_v12_v1", "cos_v12_v2", "cos_v12_vexp",
         "magnitude_ratio", "radial_deviation",
         "epi_total", "epi_total_bounded",
+        "log_rho_tri", "abs_log_rho_tri",
+        # L1-based metrics
+        "len_WT_M12_L1", "len_WT_M12_exp_L1",
+        "epi_R_raw_L1", "epi_R_expected_L1",
+        "magnitude_ratio_L1", "log_rho_L1", "abs_log_rho_L1",
     ]
 
     # Complex coords metrics (expectation-dependent)
