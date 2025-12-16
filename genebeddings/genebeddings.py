@@ -3397,8 +3397,9 @@ def add_epistasis_metrics(
             continue
 
         # Compute effect vectors (needed for all expectation models)
-        v1 = h_m1 - h_wt
-        v2 = h_m2 - h_wt
+        # Convert to tensors for expectation model computations
+        v1 = torch.as_tensor(h_m1 - h_wt, dtype=torch.float32)
+        v2 = torch.as_tensor(h_m2 - h_wt, dtype=torch.float32)
 
         # Assign base metrics (only once, not per-expectation)
         if include_distances:
