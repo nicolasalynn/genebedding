@@ -3,10 +3,13 @@
 # Standardized API: embed(), predict_nucleotides()
 #
 # SpliceBERT is a BERT-style model pre-trained on mRNA precursor sequences.
-# It uses the multimolecule library and supports RNA sequences (U instead of T).
-# Models are from the multimolecule HuggingFace org.
+# Supports both:
+# - Local models using standard HuggingFace transformers
+# - HuggingFace models via multimolecule library
 
+import os
 import re
+from pathlib import Path
 from typing import Dict, Optional, List, Union, Literal
 
 import numpy as np
@@ -21,7 +24,12 @@ except ImportError:
 BASES_RNA = ("A", "C", "G", "U")
 BASES_DNA = ("A", "C", "G", "T")
 
-# Model registry
+# Get package assets directory
+_PACKAGE_DIR = Path(__file__).parent.parent
+ASSETS_DIR = _PACKAGE_DIR / "assets"
+DEFAULT_LOCAL_PATH = ASSETS_DIR / "splicebert"
+
+# Model registry for HuggingFace models (via multimolecule)
 SPLICEBERT_MODELS: Dict[str, str] = {
     "splicebert": "multimolecule/splicebert",
     "510": "multimolecule/splicebert.510",
@@ -32,12 +40,15 @@ SPLICEBERT_MODELS: Dict[str, str] = {
     "human": "multimolecule/splicebert-human.510",
 }
 
-SpliceBertModelName = Literal["splicebert", "510", "510nt", "human-510", "default", "human"]
+SpliceBertModelName = Literal["splicebert", "510", "510nt", "human-510", "default", "human", "local"]
 
 
 def list_available_models() -> List[str]:
     """Return list of available model short names."""
-    return list(SPLICEBERT_MODELS.keys())
+    models = list(SPLICEBERT_MODELS.keys())
+    if DEFAULT_LOCAL_PATH.exists():
+        models.append("local")
+    return models
 
 
 class SpliceBertWrapper(BaseWrapper):
@@ -52,8 +63,10 @@ class SpliceBertWrapper(BaseWrapper):
 
     Parameters
     ----------
-    model : str, default="splicebert"
+    model : str, default="local"
         Model to use. Can be:
+        - "local": Load from assets/splicebert directory (default)
+        - A path to a local model directory
         - A short name from registry (e.g., "splicebert", "human-510")
         - A full HuggingFace model ID (e.g., "multimolecule/splicebert")
     device : str, optional
@@ -62,14 +75,19 @@ class SpliceBertWrapper(BaseWrapper):
         Data type for model weights.
     load_mlm : bool, default=True
         Whether to load MLM head for nucleotide prediction.
-    convert_dna_to_rna : bool, default=True
-        Whether to automatically convert T to U in input sequences.
 
     Examples
     --------
+    >>> # Load from local assets/splicebert (default)
+    >>> wrapper = SpliceBertWrapper()
+
+    >>> # Load from custom local path
+    >>> wrapper = SpliceBertWrapper(model="/path/to/splicebert")
+
+    >>> # Load from HuggingFace via multimolecule
     >>> wrapper = SpliceBertWrapper(model="splicebert")
 
-    >>> # Get embeddings (DNA input - auto-converted to RNA)
+    >>> # Get embeddings (DNA input - auto-converted)
     >>> emb = wrapper.embed("ACGTACGT", pool="mean")
 
     >>> # RNA input works directly
@@ -81,32 +99,21 @@ class SpliceBertWrapper(BaseWrapper):
     Notes
     -----
     - SpliceBERT works with RNA sequences (A, C, G, U)
-    - DNA sequences (with T) are automatically converted to RNA (U) by default
+    - DNA sequences (with T) work - local model converts to T, HuggingFace converts to U
     - Model may not work well on sequences shorter than 64nt
-    - Requires the multimolecule package: pip install multimolecule
+    - Local models use whitespace tokenization (char-level)
+    - HuggingFace models require multimolecule: pip install multimolecule
     """
 
     def __init__(
         self,
-        model: str = "splicebert",
+        model: str = "local",
         *,
         device: Optional[str] = None,
         dtype: torch.dtype = torch.float32,
         load_mlm: bool = True,
-        convert_dna_to_rna: bool = True,
     ):
         super().__init__()
-
-        # Resolve model ID
-        if model in SPLICEBERT_MODELS:
-            model_id = SPLICEBERT_MODELS[model]
-            self.model_name = model
-        else:
-            model_id = model
-            self.model_name = model
-
-        self.model_id = model_id
-        self.convert_dna_to_rna = convert_dna_to_rna
 
         # Device/dtype
         if device is None:
@@ -118,40 +125,111 @@ class SpliceBertWrapper(BaseWrapper):
         self.device = torch.device(device)
         self.dtype = dtype
 
-        # Import multimolecule (required to register models)
-        try:
-            import multimolecule  # noqa: F401
-            from multimolecule import RnaTokenizer, SpliceBertModel
-        except ImportError:
-            raise ImportError(
-                "SpliceBERT requires the multimolecule package. Install with:\n"
-                "pip install multimolecule"
+        # Determine if using local model or HuggingFace
+        self._is_local = False
+        model_path = None
+
+        if model == "local":
+            model_path = DEFAULT_LOCAL_PATH
+            self._is_local = True
+        elif os.path.isdir(model):
+            model_path = Path(model)
+            self._is_local = True
+        elif model in SPLICEBERT_MODELS:
+            model_path = SPLICEBERT_MODELS[model]
+        else:
+            # Assume it's a HuggingFace model ID
+            model_path = model
+
+        self.model_path = model_path
+        self.model_name = model
+
+        if self._is_local:
+            self._init_local_model(model_path, load_mlm)
+        else:
+            self._init_huggingface_model(model_path, load_mlm)
+
+    def _init_local_model(self, model_path: Path, load_mlm: bool):
+        """Initialize from local model directory using standard transformers."""
+        from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
+
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Local SpliceBERT model not found at {model_path}. "
+                f"Please download and place the model files there."
             )
 
         # Load tokenizer and model
-        self.tokenizer = RnaTokenizer.from_pretrained(model_id)
-        self.model = SpliceBertModel.from_pretrained(model_id).to(self.device).to(dtype).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+        self.model = AutoModel.from_pretrained(str(model_path)).to(self.device).to(self.dtype).eval()
 
         # Load MLM head if requested
         if load_mlm:
-            from multimolecule import SpliceBertForMaskedLM
-            self.mlm = SpliceBertForMaskedLM.from_pretrained(model_id).to(self.device).to(dtype).eval()
+            self.mlm = AutoModelForMaskedLM.from_pretrained(str(model_path)).to(self.device).to(self.dtype).eval()
             self.mask_id = self.tokenizer.mask_token_id
         else:
             self.mlm = None
             self.mask_id = None
 
+        # Get token IDs for nucleotides (local model uses T, not U)
+        self._base_token_ids = {}
+        for base in BASES_DNA:
+            tokens = self.tokenizer(base, add_special_tokens=False)["input_ids"]
+            if tokens:
+                self._base_token_ids[base] = tokens[0]
+
+    def _init_huggingface_model(self, model_id: str, load_mlm: bool):
+        """Initialize from HuggingFace via multimolecule."""
+        try:
+            import multimolecule  # noqa: F401
+            from multimolecule import RnaTokenizer, SpliceBertModel
+        except ImportError:
+            raise ImportError(
+                "HuggingFace SpliceBERT models require the multimolecule package. Install with:\n"
+                "pip install multimolecule\n"
+                "Or use a local model: SpliceBertWrapper(model='local')"
+            )
+
+        # Load tokenizer and model
+        self.tokenizer = RnaTokenizer.from_pretrained(model_id)
+        self.model = SpliceBertModel.from_pretrained(model_id).to(self.device).to(self.dtype).eval()
+
+        # Load MLM head if requested
+        if load_mlm:
+            from multimolecule import SpliceBertForMaskedLM
+            self.mlm = SpliceBertForMaskedLM.from_pretrained(model_id).to(self.device).to(self.dtype).eval()
+            self.mask_id = self.tokenizer.mask_token_id
+        else:
+            self.mlm = None
+            self.mask_id = None
+
+        # Get token IDs for nucleotides (HuggingFace model uses U)
+        self._base_token_ids = {}
+        for base in BASES_RNA:
+            tokens = self.tokenizer(base, add_special_tokens=False)["input_ids"]
+            if tokens:
+                self._base_token_ids[base] = tokens[0]
+
     def __repr__(self) -> str:
-        return f"SpliceBertWrapper(model='{self.model_name}', device={self.device})"
+        model_type = "local" if self._is_local else "huggingface"
+        return f"SpliceBertWrapper(model='{self.model_name}', type={model_type}, device={self.device})"
 
     def _normalize_seq(self, seq: str) -> str:
-        """Clean sequence and optionally convert DNA to RNA."""
+        """Clean sequence and convert for model."""
         seq = (seq or "").upper()
-        # Convert T to U if requested
-        if self.convert_dna_to_rna:
+
+        if self._is_local:
+            # Local model: convert U to T, add whitespace between chars
+            seq = seq.replace("U", "T")
+            seq = re.sub(r"[^ACGTN]", "N", seq)
+            # Add whitespace between nucleotides for char-level tokenization
+            seq = " ".join(list(seq))
+        else:
+            # HuggingFace model: convert T to U
             seq = seq.replace("T", "U")
-        # Replace invalid chars with N
-        seq = re.sub(r"[^ACGUN]", "N", seq)
+            seq = re.sub(r"[^ACGUN]", "N", seq)
+
         return seq
 
     def _encode_one(self, seq: str) -> Dict[str, torch.Tensor]:
@@ -189,7 +267,7 @@ class SpliceBertWrapper(BaseWrapper):
         Parameters
         ----------
         seq : str or list of str
-            Input sequence(s). DNA (T) is auto-converted to RNA (U).
+            Input sequence(s). DNA and RNA both work.
         pool : {'mean', 'cls', 'tokens'}, default='mean'
             Pooling strategy:
             - 'mean': Average over all positions
@@ -263,7 +341,7 @@ class SpliceBertWrapper(BaseWrapper):
         positions: Optional[List[int]] = None,
         *,
         return_dict: bool = True,
-        use_rna_bases: bool = True,
+        use_dna_bases: bool = True,
     ) -> Union[List[Dict[str, float]], np.ndarray]:
         """
         Predict nucleotide probabilities at specified positions.
@@ -275,9 +353,9 @@ class SpliceBertWrapper(BaseWrapper):
         positions : list of int, optional
             0-based positions to predict. If None, auto-detects 'N' positions.
         return_dict : bool, default=True
-            If True, return list of dicts with keys 'A', 'C', 'G', 'U' (or 'T')
-        use_rna_bases : bool, default=True
-            If True, return RNA bases (A, C, G, U); if False, return DNA (A, C, G, T)
+            If True, return list of dicts with keys 'A', 'C', 'G', 'T' (or 'U')
+        use_dna_bases : bool, default=True
+            If True, return DNA bases (A, C, G, T); if False, return RNA (A, C, G, U)
 
         Returns
         -------
@@ -286,31 +364,34 @@ class SpliceBertWrapper(BaseWrapper):
         if self.mlm is None:
             raise NotImplementedError("MLM head not loaded. Initialize with load_mlm=True")
 
-        seq = self._normalize_seq(seq)
+        # Normalize but keep original for position mapping
+        seq_upper = (seq or "").upper()
+        seq_clean = seq_upper.replace("U", "T") if self._is_local else seq_upper.replace("T", "U")
+        seq_clean = re.sub(r"[^ACGTUN]", "N", seq_clean)
 
         # Auto-detect N positions if not provided
         if not positions:
-            positions = [i for i, c in enumerate(seq) if c == "N"]
+            positions = [i for i, c in enumerate(seq_clean) if c == "N"]
         if not positions:
             raise ValueError("No positions provided and no 'N' bases found in seq.")
-
-        # Get token indices for RNA bases
-        base_tokens = {}
-        for base in BASES_RNA:
-            tokens = self.tokenizer(base, add_special_tokens=False)["input_ids"]
-            if tokens:
-                base_tokens[base] = tokens[0]
 
         results = []
 
         for pos in positions:
             # Create masked sequence
-            seq_list = list(seq)
-            seq_list[pos] = self.tokenizer.mask_token
+            seq_list = list(seq_clean)
+            seq_list[pos] = "[MASK]" if self._is_local else self.tokenizer.mask_token
             masked_seq = "".join(seq_list)
 
-            # Encode and get logits
-            enc = self._encode_one(masked_seq)
+            # For local model, normalize adds whitespace
+            if self._is_local:
+                masked_seq = " ".join(list(masked_seq.replace("[MASK]", self.tokenizer.mask_token)))
+
+            # Encode
+            enc = self.tokenizer(masked_seq, return_tensors="pt", padding=False, truncation=True)
+            enc = {k: v.to(self.device) for k, v in enc.items()}
+
+            # Get logits
             logits = self.mlm(**enc).logits  # (1, L, V)
 
             # Adjust for special tokens (CLS at start)
@@ -321,7 +402,7 @@ class SpliceBertWrapper(BaseWrapper):
             probs_tensor = torch.softmax(pos_logits, dim=-1)
 
             probs = {}
-            for base, tok_id in base_tokens.items():
+            for base, tok_id in self._base_token_ids.items():
                 probs[base] = float(probs_tensor[tok_id].cpu())
 
             # Normalize to sum to 1
@@ -329,14 +410,18 @@ class SpliceBertWrapper(BaseWrapper):
             if total > 0:
                 probs = {b: p / total for b, p in probs.items()}
 
-            # Convert to DNA bases if requested
-            if not use_rna_bases:
+            # Convert bases if needed
+            if self._is_local and not use_dna_bases:
+                # Local model has T, convert to U
+                probs = {b.replace("T", "U"): p for b, p in probs.items()}
+            elif not self._is_local and use_dna_bases:
+                # HuggingFace model has U, convert to T
                 probs = {b.replace("U", "T"): p for b, p in probs.items()}
 
             if return_dict:
                 results.append(probs)
             else:
-                bases = BASES_RNA if use_rna_bases else BASES_DNA
+                bases = BASES_DNA if use_dna_bases else BASES_RNA
                 results.append([probs[b] for b in bases])
 
         if return_dict:
@@ -346,5 +431,5 @@ class SpliceBertWrapper(BaseWrapper):
 
     def find_N_positions(self, seq: str) -> List[int]:
         """Indices where the input has 'N'."""
-        seq = self._normalize_seq(seq)
+        seq = (seq or "").upper()
         return [i for i, c in enumerate(seq) if c == "N"]
