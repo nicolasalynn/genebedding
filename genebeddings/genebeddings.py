@@ -112,9 +112,6 @@ __all__ = [
     "DependencyMapResult",
     "compute_pairwise_epistasis",
     "compute_dependency_map",
-    # Epistasis expectation model
-    "EpistasisDataset",
-    "EpistasisExpectationModel",
 ]
 
 __version__ = "0.1.0"
@@ -982,10 +979,6 @@ class EpistasisGeometry(_GeometryBase):
         Numerical stability constant. Default: 1e-20.
     diff : str or callable, optional
         Distance metric. Default: "cosine".
-    expectation_model : EpistasisExpectationModel, optional
-        Trained model for predicting expected Δ₁₂. If provided, v12_exp is
-        computed using the model instead of simple additivity (v1 + v2).
-        Default: None (use additive expectation).
 
     Attributes
     ----------
@@ -1005,9 +998,6 @@ class EpistasisGeometry(_GeometryBase):
     >>> print(f"Epistasis magnitude: {metrics.epi_R_raw:.4f}")
     >>> epi.plot()
     >>> epi.plot_triangle()
-    >>>
-    >>> # With trained expectation model
-    >>> epi = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, expectation_model=model)
     """
 
     def __init__(
@@ -1018,7 +1008,6 @@ class EpistasisGeometry(_GeometryBase):
         h_m12: torch.Tensor,
         eps: float = DEFAULT_EPS,
         diff: Union[str, DiffFn] = "cosine",
-        expectation_model: Optional["EpistasisExpectationModel"] = None,
     ):
         super().__init__(eps=eps, diff=diff)
 
@@ -1042,17 +1031,8 @@ class EpistasisGeometry(_GeometryBase):
         self.v2 = self.M2 - self.WT
         self.v12_obs = self.M12 - self.WT
 
-        # Expected v12: use model if provided, otherwise simple additive
-        self.expectation_model = expectation_model
-        if expectation_model is not None:
-            # Use trained model to predict expected delta
-            wt_input = self.WT if expectation_model.include_wt else None
-            self.v12_exp = expectation_model.predict(self.v1, self.v2, wt=wt_input)
-            self._uses_learned_expectation = True
-        else:
-            # Simple additive expectation: v12_exp = v1 + v2
-            self.v12_exp = self.v1 + self.v2
-            self._uses_learned_expectation = False
+        # Additive expectation: v12_exp = v1 + v2
+        self.v12_exp = self.v1 + self.v2
 
         self.v_1to2 = self.M1 - self.M2
 
@@ -1062,23 +1042,19 @@ class EpistasisGeometry(_GeometryBase):
         self._cached_triangle: Optional[EpistasisTriangleCoords] = None
         self._cached_mds: Optional[tuple[dict[str, np.ndarray], np.ndarray]] = None
 
-        exp_type = "learned" if self._uses_learned_expectation else "additive"
         logger.debug(
-            "EpistasisGeometry initialized: dim=%d, diff=%s, expectation=%s",
+            "EpistasisGeometry initialized: dim=%d, diff=%s",
             self.WT.shape[0],
             self.diff_name,
-            exp_type,
         )
 
     def __repr__(self) -> str:
         m = self.metrics()
-        exp_type = "learned" if self._uses_learned_expectation else "additive"
         return (
             f"EpistasisGeometry("
             f"R_raw={m.epi_R_raw:.4f}, "
             f"R_expected={m.epi_R_expected:.4f}, "
-            f"diff={self.diff_name!r}, "
-            f"expectation={exp_type!r})"
+            f"diff={self.diff_name!r})"
         )
 
     def complex_coords(self) -> EpistasisComplexCoords:
