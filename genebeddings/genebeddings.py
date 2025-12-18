@@ -377,171 +377,69 @@ class EpistasisTriangleCoords:
 @dataclass(frozen=True)
 class EpistasisMetrics:
     """
-    Comprehensive metrics for epistasis analysis.
+    Clean, minimal metrics for epistasis analysis.
 
-    Contains both distance-based metrics (using configured distance function)
-    and L2 norm-based vector lengths.
+    Focuses on interpretable metrics with minimal assumptions:
+    - Deviation magnitude (how much epistasis)
+    - Direction indicator (toward or away from WT)
+    - Raw effect sizes (for context)
 
     Attributes
     ----------
-    dist_WT_M1 : float
-        Distance from WT to single-mutant 1.
-    dist_WT_M2 : float
-        Distance from WT to single-mutant 2.
-    dist_WT_M12_obs : float
-        Distance from WT to observed double-mutant.
-    dist_WT_M12_exp : float
-        Distance from WT to expected double-mutant.
-    dist_M1_M2 : float
-        Distance between single-mutants.
-    dist_obs_exp : float
-        Distance between observed and expected double-mutants.
     len_WT_M1 : float
-        L2 norm of effect vector v1 = M1 - WT.
+        L2 norm of effect vector v1 = M1 - WT. Single mutation 1 effect size.
     len_WT_M2 : float
-        L2 norm of effect vector v2 = M2 - WT.
+        L2 norm of effect vector v2 = M2 - WT. Single mutation 2 effect size.
     len_WT_M12 : float
-        L2 norm of observed effect vector v12_obs = M12 - WT.
+        L2 norm of observed effect vector v12_obs = M12 - WT. Observed double effect.
     len_WT_M12_exp : float
-        L2 norm of expected effect vector v12_exp = v1 + v2.
-    len_M1_M2 : float
-        L2 norm of vector between single-mutants.
+        L2 norm of expected effect vector v12_exp = v1 + v2. Expected double effect.
     epi_R_raw : float
-        Raw epistasis residual (distance between observed and expected).
+        Raw epistasis residual: ||M12_obs - M12_exp||.
+        Absolute deviation from additive expectation.
     epi_R_singles : float
-        Residual normalized by sqrt(|v1|² + |v2|²).
-    epi_R_expected : float
-        Residual normalized by distance to expected.
-    epi_score : float
-        Bounded epistasis score in [0, 1]. Computed as R_raw / (R_raw + d_exp).
-        Handles small expected values gracefully. 0 = perfectly additive, 1 = maximal epistasis.
-    cos_v12_v1 : float
-        Cosine similarity between observed double-mutant effect and single-mutant 1 effect.
-    cos_v12_v2 : float
-        Cosine similarity between observed double-mutant effect and single-mutant 2 effect.
-    cos_v12_vexp : float
-        Cosine similarity between observed and expected double-mutant effects.
+        Normalized residual: epi_R_raw / sqrt(||v1||² + ||v2||²).
+        Allows comparison across events with different single-mutation magnitudes.
+        Fewer assumptions than normalizing by expected.
     cos_v1_v2 : float
-        Cosine similarity between single-mutant effects (measures effect alignment).
+        Cosine similarity between single-mutant effects v1 and v2.
+        +1 = same direction (effects reinforce)
+        -1 = opposite directions (effects cancel)
+        Useful context for interpreting epistasis.
+    cos_exp_to_obs : float
+        Cosine similarity between v12_exp and (v12_obs - v12_exp).
+        Indicates direction of deviation relative to WT:
+        -1 = observed moved back toward WT (corrective/sub-additive)
+        0 = orthogonal deviation
+        +1 = observed moved further from WT (synergistic/super-additive)
     magnitude_ratio : float
-        Ratio of observed to expected magnitude: |v12_obs| / |v12_exp|.
-        <1 = sub-additive, >1 = super-additive.
-    radial_deviation : float
-        Signed deviation: (|v12_obs| - |v12_exp|) / |v12_exp|.
-        Negative = closer to WT than expected, positive = further.
-    epi_total : float
-        **Primary epistasis metric** capturing both angle AND magnitude deviation.
-        Computed as: sqrt((1 - cos_v12_vexp)^2 + (magnitude_ratio - 1)^2).
-        This is the Euclidean distance from the "no epistasis" point (cos=1, ratio=1).
-        0 = perfectly additive, higher = more epistatic.
-    epi_total_bounded : float
-        Bounded version of epi_total in [0, 1]: epi_total / (1 + epi_total).
-        0 = perfectly additive, approaches 1 for strong epistasis.
-    epi_total_log : float
-        Log-transformed epi_total: log(1 + epi_total).
-        0 = perfectly additive, grows logarithmically with epistasis.
-        High dynamic range for detecting outliers.
-    log_rho_tri : float
-        Log of magnitude ratio: log(|v12_obs| / |v12_exp|).
-        0 = same magnitude as expected (additive).
-        Positive = super-additive (observed > expected).
-        Negative = sub-additive (observed < expected).
-        High dynamic range, good for detecting outliers.
-    abs_log_rho_tri : float
-        **Recommended filter metric**: |log(|v12_obs| / |v12_exp|)|.
-        0 = perfectly additive, larger = more epistatic (either direction).
-        Unbounded with high dynamic range. Values:
-        0.1 = ~25% magnitude difference
-        0.3 = ~2x difference
-        0.7 = ~5x difference
-        1.0 = ~10x difference
-    len_WT_M12_L1 : float
-        L1 norm of observed effect vector: sum(|v12_obs|).
-    len_WT_M12_exp_L1 : float
-        L1 norm of expected effect vector: sum(|v12_exp|).
-    epi_R_raw_L1 : float
-        L1 norm of residual: sum(|v12_obs - v12_exp|).
-    epi_R_expected_L1 : float
-        L1 residual normalized by L1 expected: epi_R_raw_L1 / len_WT_M12_exp_L1.
-    magnitude_ratio_L1 : float
-        L1 magnitude ratio: len_WT_M12_L1 / len_WT_M12_exp_L1.
-    log_rho_L1 : float
-        Log of L1 magnitude ratio. 0 = additive, + = super, - = sub.
-    abs_log_rho_L1 : float
-        |log(L1 ratio)|. Recommended L1-based filter metric.
-        Symmetric: 2x and 0.5x both give ~0.69.
+        Ratio of observed to expected magnitude: ||v12_obs|| / ||v12_exp||.
+        <1 = closer to WT than expected (sub-additive)
+        >1 = further from WT than expected (super-additive)
     """
 
-    dist_WT_M1: float
-    dist_WT_M2: float
-    dist_WT_M12_obs: float
-    dist_WT_M12_exp: float
-    dist_M1_M2: float
-    dist_obs_exp: float
     len_WT_M1: float
     len_WT_M2: float
     len_WT_M12: float
     len_WT_M12_exp: float
-    len_M1_M2: float
     epi_R_raw: float
     epi_R_singles: float
-    epi_R_expected: float
-    epi_score: float
-    cos_v12_v1: float
-    cos_v12_v2: float
-    cos_v12_vexp: float
     cos_v1_v2: float
+    cos_exp_to_obs: float
     magnitude_ratio: float
-    radial_deviation: float
-    epi_total: float
-    epi_total_bounded: float
-    epi_total_log: float
-    log_rho_tri: float
-    abs_log_rho_tri: float
-    len_WT_M12_L1: float
-    len_WT_M12_exp_L1: float
-    epi_R_raw_L1: float
-    epi_R_expected_L1: float
-    magnitude_ratio_L1: float
-    log_rho_L1: float
-    abs_log_rho_L1: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
         return {
-            "dist_WT_M1": self.dist_WT_M1,
-            "dist_WT_M2": self.dist_WT_M2,
-            "dist_WT_M12_obs": self.dist_WT_M12_obs,
-            "dist_WT_M12_exp": self.dist_WT_M12_exp,
-            "dist_M1_M2": self.dist_M1_M2,
-            "dist_obs_exp": self.dist_obs_exp,
             "len_WT_M1": self.len_WT_M1,
             "len_WT_M2": self.len_WT_M2,
             "len_WT_M12": self.len_WT_M12,
             "len_WT_M12_exp": self.len_WT_M12_exp,
-            "len_M1_M2": self.len_M1_M2,
             "epi_R_raw": self.epi_R_raw,
             "epi_R_singles": self.epi_R_singles,
-            "epi_R_expected": self.epi_R_expected,
-            "epi_score": self.epi_score,
-            "cos_v12_v1": self.cos_v12_v1,
-            "cos_v12_v2": self.cos_v12_v2,
-            "cos_v12_vexp": self.cos_v12_vexp,
             "cos_v1_v2": self.cos_v1_v2,
+            "cos_exp_to_obs": self.cos_exp_to_obs,
             "magnitude_ratio": self.magnitude_ratio,
-            "radial_deviation": self.radial_deviation,
-            "epi_total": self.epi_total,
-            "epi_total_bounded": self.epi_total_bounded,
-            "epi_total_log": self.epi_total_log,
-            "log_rho_tri": self.log_rho_tri,
-            "abs_log_rho_tri": self.abs_log_rho_tri,
-            "len_WT_M12_L1": self.len_WT_M12_L1,
-            "len_WT_M12_exp_L1": self.len_WT_M12_exp_L1,
-            "epi_R_raw_L1": self.epi_R_raw_L1,
-            "epi_R_expected_L1": self.epi_R_expected_L1,
-            "magnitude_ratio_L1": self.magnitude_ratio_L1,
-            "log_rho_L1": self.log_rho_L1,
-            "abs_log_rho_L1": self.abs_log_rho_L1,
         }
 
 
@@ -1136,9 +1034,7 @@ class EpistasisGeometry(_GeometryBase):
 
     def metrics(self) -> EpistasisMetrics:
         """
-        Compute comprehensive epistasis metrics.
-
-        Distances use the configured metric; vector lengths use L2 norm.
+        Compute clean, minimal epistasis metrics.
 
         Returns
         -------
@@ -1150,33 +1046,21 @@ class EpistasisGeometry(_GeometryBase):
 
         v1, v2, v12, v12_exp = self.v1, self.v2, self.v12_obs, self.v12_exp
 
-        # Vector lengths (L2)
+        # Vector lengths (L2 norms) - raw effect sizes
         a1 = self._safe_norm(v1)
         a2 = self._safe_norm(v2)
         a12 = self._safe_norm(v12)
         a12_exp = self._safe_norm(v12_exp)
-        a_1to2 = self._safe_norm(self.v_1to2)
 
-        # Distances (configured metric)
-        d_WT_M1 = self._embed_dist(self.WT, self.M1)
-        d_WT_M2 = self._embed_dist(self.WT, self.M2)
-        d_WT_M12_obs = self._embed_dist(self.WT, self.M12)
+        # Residual: difference between observed and expected
+        residual = v12 - v12_exp
+        R_raw = self._safe_norm(residual)
 
-        M12_exp_point = self.WT + v12_exp
-        d_WT_M12_exp = self._embed_dist(self.WT, M12_exp_point)
-        d_M1_M2 = self._embed_dist(self.M1, self.M2)
-        d_obs_exp = self._embed_dist(self.M12, M12_exp_point)
-
-        # Normalized residuals
-        R_raw = d_obs_exp
+        # Normalized by single mutation magnitudes (fewer assumptions)
         single_scale = math.sqrt(a1**2 + a2**2) + self.eps
         R_singles = R_raw / single_scale
-        R_expected = R_raw / (d_WT_M12_exp + self.eps)
 
-        # Bounded epistasis score: R_raw / (R_raw + d_exp) in [0, 1]
-        epi_score = R_raw / (R_raw + d_WT_M12_exp + self.eps)
-
-        # Cosine similarities between effect vectors
+        # Cosine helper
         def _cosine(u: torch.Tensor, v: torch.Tensor) -> float:
             nu = self._safe_norm(u)
             nv = self._safe_norm(v)
@@ -1184,72 +1068,27 @@ class EpistasisGeometry(_GeometryBase):
                 return 0.0
             return float(torch.dot(u, v) / (nu * nv))
 
-        cos_v12_v1 = _cosine(v12, v1)
-        cos_v12_v2 = _cosine(v12, v2)
-        cos_v12_vexp = _cosine(v12, v12_exp)
+        # Single mutation alignment
         cos_v1_v2 = _cosine(v1, v2)
 
-        # Magnitude ratio and radial deviation
+        # Direction indicator: cos(v12_exp, residual)
+        # -1 = moved back toward WT (corrective)
+        # +1 = moved further from WT (synergistic)
+        cos_exp_to_obs = _cosine(v12_exp, residual)
+
+        # Magnitude ratio: how much closer/further from WT than expected
         magnitude_ratio = a12 / (a12_exp + self.eps)
-        radial_deviation = (a12 - a12_exp) / (a12_exp + self.eps)
-
-        # Total epistasis: distance from "no epistasis" point (cos=1, ratio=1)
-        # Captures both angular AND magnitude deviation in one metric
-        angle_dev = 1.0 - cos_v12_vexp  # 0 when aligned, 2 when opposite
-        mag_dev = magnitude_ratio - 1.0  # 0 when equal magnitude
-        epi_total = math.sqrt(angle_dev**2 + mag_dev**2)
-        epi_total_bounded = epi_total / (1.0 + epi_total)
-        epi_total_log = math.log(1.0 + epi_total)
-
-        # Log-scale magnitude ratio: high dynamic range, centered at 0
-        # log(ratio) = 0 when additive, positive when super-additive, negative when sub-additive
-        log_rho_tri = math.log(magnitude_ratio + self.eps)
-        abs_log_rho_tri = abs(log_rho_tri)
-
-        # L1-based metrics (Manhattan distance)
-        len_WT_M12_L1 = float(torch.sum(torch.abs(v12)))
-        len_WT_M12_exp_L1 = float(torch.sum(torch.abs(v12_exp)))
-        residual = v12 - v12_exp
-        epi_R_raw_L1 = float(torch.sum(torch.abs(residual)))
-        epi_R_expected_L1 = epi_R_raw_L1 / (len_WT_M12_exp_L1 + self.eps)
-        magnitude_ratio_L1 = len_WT_M12_L1 / (len_WT_M12_exp_L1 + self.eps)
-        log_rho_L1 = math.log(magnitude_ratio_L1 + self.eps)
-        abs_log_rho_L1 = abs(log_rho_L1)
 
         self._cached_metrics = EpistasisMetrics(
-            dist_WT_M1=d_WT_M1,
-            dist_WT_M2=d_WT_M2,
-            dist_WT_M12_obs=d_WT_M12_obs,
-            dist_WT_M12_exp=d_WT_M12_exp,
-            dist_M1_M2=d_M1_M2,
-            dist_obs_exp=d_obs_exp,
             len_WT_M1=a1,
             len_WT_M2=a2,
             len_WT_M12=a12,
             len_WT_M12_exp=a12_exp,
-            len_M1_M2=a_1to2,
             epi_R_raw=R_raw,
             epi_R_singles=R_singles,
-            epi_R_expected=R_expected,
-            epi_score=epi_score,
-            cos_v12_v1=cos_v12_v1,
-            cos_v12_v2=cos_v12_v2,
-            cos_v12_vexp=cos_v12_vexp,
             cos_v1_v2=cos_v1_v2,
+            cos_exp_to_obs=cos_exp_to_obs,
             magnitude_ratio=magnitude_ratio,
-            radial_deviation=radial_deviation,
-            epi_total=epi_total,
-            epi_total_bounded=epi_total_bounded,
-            epi_total_log=epi_total_log,
-            log_rho_tri=log_rho_tri,
-            abs_log_rho_tri=abs_log_rho_tri,
-            len_WT_M12_L1=len_WT_M12_L1,
-            len_WT_M12_exp_L1=len_WT_M12_exp_L1,
-            epi_R_raw_L1=epi_R_raw_L1,
-            epi_R_expected_L1=epi_R_expected_L1,
-            magnitude_ratio_L1=magnitude_ratio_L1,
-            log_rho_L1=log_rho_L1,
-            abs_log_rho_L1=abs_log_rho_L1,
         )
 
         return self._cached_metrics
@@ -1275,9 +1114,9 @@ class EpistasisGeometry(_GeometryBase):
             return self._cached_triangle
 
         m = self.metrics()
-        A_o = m.dist_WT_M12_obs
-        A_e = m.dist_WT_M12_exp
-        A_r = m.dist_obs_exp
+        A_o = m.len_WT_M12       # observed effect magnitude
+        A_e = m.len_WT_M12_exp   # expected effect magnitude
+        A_r = m.epi_R_raw        # residual magnitude
 
         if A_e < self.eps:
             x_exp = 1.0
@@ -3083,10 +2922,6 @@ def add_epistasis_metrics(
     genome: str = DEFAULT_GENOME,
     diff: Union[str, DiffFn] = "cosine",
     prefix: str = "",
-    include_complex: bool = True,
-    include_triangle: bool = True,
-    include_distances: bool = True,
-    full_features: bool = False,
     inplace: bool = False,
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -3099,7 +2934,18 @@ def add_epistasis_metrics(
     For each row:
     1. Check if embeddings exist in database
     2. If not and model is provided, compute and save embeddings
-    3. Compute geometric metrics using EpistasisGeometry
+    3. Compute simplified epistasis metrics using EpistasisGeometry
+
+    Adds the following columns (with optional prefix):
+    - len_WT_M1: Single mutation 1 effect size
+    - len_WT_M2: Single mutation 2 effect size
+    - len_WT_M12: Observed double mutant effect size
+    - len_WT_M12_exp: Expected double mutant effect size (additive)
+    - epi_R_raw: Raw epistasis residual (absolute deviation)
+    - epi_R_singles: Normalized residual (comparable across events)
+    - cos_v1_v2: Alignment of single mutation effects
+    - cos_exp_to_obs: Direction indicator (-1=toward WT, +1=away from WT)
+    - magnitude_ratio: Ratio of observed to expected effect
 
     Parameters
     ----------
@@ -3131,17 +2977,6 @@ def add_epistasis_metrics(
         Distance metric. Default: "cosine".
     prefix : str, optional
         Prefix for new column names. Default: "".
-    include_complex : bool, optional
-        Include complex plane coordinates. Default: True.
-    include_triangle : bool, optional
-        Include triangle-based coordinates. Default: True.
-    include_distances : bool, optional
-        Include all distance/length metrics. Default: True.
-    full_features : bool, optional
-        If True, compute metrics for all three expectation models (additive,
-        geometric, pythagorean) with prefixes "add_", "geo_", "pyth_".
-        Creates a comprehensive feature space for ML applications.
-        Default: False.
     inplace : bool, optional
         Modify DataFrame in place. Default: False.
     show_progress : bool, optional
@@ -3168,23 +3003,11 @@ def add_epistasis_metrics(
     >>> # Force recomputation of all embeddings
     >>> df = add_epistasis_metrics(df, db, model=borzoi, force=True)
 
-    >>> # Full feature space for ML with all expectation models
-    >>> df = add_epistasis_metrics(df, db, model=borzoi, full_features=True)
-
-    >>> # Negative strand genes
-    >>> df = add_epistasis_metrics(
-    ...     df, db, model=borzoi,
-    ...     reverse_complement=True
-    ... )
-
     >>> # Per-row strand from column
     >>> df = add_epistasis_metrics(
     ...     df, db, model=borzoi,
     ...     strand_col="gene_strand"
     ... )
-
-    >>> # With full token embeddings
-    >>> df = add_epistasis_metrics(df, db, model=borzoi, pool="tokens")
     """
     _require_pandas()
 
@@ -3194,89 +3017,18 @@ def add_epistasis_metrics(
     if not inplace:
         df = df.copy()
 
-    # Expectation model definitions for full_features mode
-    def _geometric_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
-        """Geometric mean of effect magnitudes with average direction."""
-        mag = torch.sqrt(v1.norm() * v2.norm() + eps)
-        direction = v1 + v2
-        direction = direction / (direction.norm() + eps)
-        return mag * direction
-
-    def _pythagorean_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
-        """Pythagorean combination: sqrt(||v1||^2 + ||v2||^2) with average direction."""
-        mag = torch.sqrt(v1.norm()**2 + v2.norm()**2)
-        direction = v1 + v2
-        direction = direction / (direction.norm() + eps)
-        return mag * direction
-
-    # Define which expectation models to use
-    def _additive_v12_exp(v1: torch.Tensor, v2: torch.Tensor, eps: float) -> torch.Tensor:
-        """Additive expectation: v12_exp = v1 + v2."""
-        _ = eps  # unused but kept for consistent signature
-        return v1 + v2
-
-    if full_features:
-        expectation_models = [
-            ("add", _additive_v12_exp),     # additive
-            ("geo", _geometric_v12_exp),    # geometric
-            ("pyth", _pythagorean_v12_exp), # pythagorean
-        ]
-    else:
-        expectation_models = [("", _additive_v12_exp)]  # additive only, no prefix
-
-    # Core metrics that don't depend on expectation model
-    base_metrics = [
-        "dist_WT_M1", "dist_WT_M2", "dist_M1_M2",
-        "len_WT_M1", "len_WT_M2", "len_M1_M2",
-        "cos_v1_v2",
+    # Simplified metrics - clean, minimal set with interpretable meaning
+    metric_cols = [
+        "len_WT_M1",       # Single mutation 1 effect size
+        "len_WT_M2",       # Single mutation 2 effect size
+        "len_WT_M12",      # Observed double mutant effect size
+        "len_WT_M12_exp",  # Expected double mutant effect size (additive)
+        "epi_R_raw",       # Raw epistasis residual (absolute deviation)
+        "epi_R_singles",   # Normalized residual (comparable across events)
+        "cos_v1_v2",       # Alignment of single mutation effects
+        "cos_exp_to_obs",  # Direction indicator: -1=toward WT, +1=away from WT
+        "magnitude_ratio", # Ratio of observed to expected effect
     ]
-
-    # Expectation-dependent metrics
-    exp_metrics = [
-        "dist_WT_M12_obs", "dist_WT_M12_exp", "dist_obs_exp",
-        "len_WT_M12", "len_WT_M12_exp",
-        "epi_R_raw", "epi_R_singles", "epi_R_expected", "epi_score",
-        "cos_v12_v1", "cos_v12_v2", "cos_v12_vexp",
-        "magnitude_ratio", "radial_deviation",
-        "epi_total", "epi_total_bounded", "epi_total_log",
-        "log_rho_tri", "abs_log_rho_tri",
-        # L1-based metrics
-        "len_WT_M12_L1", "len_WT_M12_exp_L1",
-        "epi_R_raw_L1", "epi_R_expected_L1",
-        "magnitude_ratio_L1", "log_rho_L1", "abs_log_rho_L1",
-    ]
-
-    # Complex coords metrics (expectation-dependent)
-    complex_metrics = [
-        "x_exp", "y_exp", "x_obs", "y_obs",
-        "rho", "theta", "theta_over_pi"
-    ]
-
-    # Triangle coords metrics (expectation-dependent)
-    triangle_metrics = [
-        "x_exp_tri", "y_exp_tri", "x_obs_tri", "y_obs_tri",
-        "rho_tri", "theta_tri", "theta_tri_over_pi"
-    ]
-
-    # Build list of metric columns to add
-    metric_cols: list[str] = []
-
-    # Base metrics (only once, not per-expectation)
-    if include_distances:
-        metric_cols.extend(base_metrics)
-
-    # Per-expectation metrics
-    for exp_prefix, _ in expectation_models:
-        full_prefix = f"{exp_prefix}_" if exp_prefix else ""
-
-        if include_distances:
-            metric_cols.extend([f"{full_prefix}{m}" for m in exp_metrics])
-
-        if include_complex:
-            metric_cols.extend([f"{full_prefix}{m}" for m in complex_metrics])
-
-        if include_triangle:
-            metric_cols.extend([f"{full_prefix}{m}" for m in triangle_metrics])
 
     # Initialize columns with user prefix (all at once to avoid fragmentation)
     col_names = [f"{prefix}{name}" for name in metric_cols]
@@ -3382,63 +3134,13 @@ def add_epistasis_metrics(
             n_skipped += 1
             continue
 
-        # Compute effect vectors (needed for all expectation models)
-        # Convert to tensors for expectation model computations
-        v1 = torch.as_tensor(h_m1 - h_wt, dtype=torch.float32)
-        v2 = torch.as_tensor(h_m2 - h_wt, dtype=torch.float32)
+        # Create geometry with additive expectation (default)
+        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
 
-        # Assign base metrics (only once, not per-expectation)
-        if include_distances:
-            # Use default geometry for base metrics
-            geom_base = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
-            metrics_base = geom_base.metrics()
-            for name in base_metrics:
-                df.at[idx, f"{prefix}{name}"] = getattr(metrics_base, name)
-
-        # Compute metrics for each expectation model
-        for exp_prefix, exp_fn in expectation_models:
-            full_prefix = f"{prefix}{exp_prefix}_" if exp_prefix else prefix
-
-            # Compute expected v12 using this expectation model
-            v12_exp = exp_fn(v1, v2, DEFAULT_EPS)
-
-            # Create geometry with custom v12_exp
-            # We need to create the geometry manually to use the custom expectation
-            geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
-            # Override v12_exp with our computed value
-            geom.v12_exp = v12_exp
-            geom._cached_metrics = None  # Clear cache to recompute with new v12_exp
-            geom._cached_complex = None
-            geom._cached_triangle = None
-
-            # Assign expectation-dependent distance metrics
-            if include_distances:
-                metrics = geom.metrics()
-                for name in exp_metrics:
-                    df.at[idx, f"{full_prefix}{name}"] = getattr(metrics, name)
-
-            # Assign complex coords
-            if include_complex:
-                coords = geom.complex_coords()
-                for name in complex_metrics:
-                    df.at[idx, f"{full_prefix}{name}"] = getattr(coords, name)
-
-            # Assign triangle coords
-            if include_triangle:
-                tri = geom.triangle_coords()
-                # Map column names to dataclass attributes
-                tri_attr_map = {
-                    "x_exp_tri": "x_exp",
-                    "y_exp_tri": "y_exp",
-                    "x_obs_tri": "x_obs",
-                    "y_obs_tri": "y_obs",
-                    "rho_tri": "rho",
-                    "theta_tri": "theta",
-                    "theta_tri_over_pi": "theta_over_pi",
-                }
-                for col_name in triangle_metrics:
-                    attr_name = tri_attr_map[col_name]
-                    df.at[idx, f"{full_prefix}{col_name}"] = getattr(tri, attr_name)
+        # Assign all metrics
+        metrics = geom.metrics()
+        for name in metric_cols:
+            df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
 
         n_processed += 1
 
@@ -3964,13 +3666,14 @@ def compute_dependency_map(
 #     db,
 #     model=borzoi,
 #     strand_col="gene_strand",
-#     include_complex=True,            # Complex plane coords (rho, theta)
-#     include_triangle=True,           # Triangle-based coords
-#     include_distances=True,          # All distance metrics
 # )
 #
-# # Key metrics: rho (epistasis magnitude), theta_over_pi (epistasis direction)
-# print(df_epi[["epistasis_id", "rho", "theta_over_pi", "epi_R_raw"]])
+# # Key metrics:
+# # - epi_R_raw: absolute deviation from additive expectation
+# # - epi_R_singles: normalized (comparable across events)
+# # - cos_exp_to_obs: direction indicator (-1=toward WT, +1=away from WT)
+# # - magnitude_ratio: observed/expected effect ratio
+# print(df_epi[["epistasis_id", "epi_R_raw", "epi_R_singles", "cos_exp_to_obs"]])
 #
 # -------------------------------------------------------------------------
 # 4. USING EXPLICIT COORDINATE COLUMNS
