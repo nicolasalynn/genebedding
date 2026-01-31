@@ -1,6 +1,6 @@
 # splicebert_wrapper.py
 # SpliceBERT wrapper for RNA foundation models
-# Standardized API: embed(), predict_nucleotides()
+# Standardized API: embed(), predict_nucleotides(), forward()
 #
 # SpliceBERT is a BERT-style model pre-trained on mRNA precursor sequences.
 # Supports both:
@@ -9,8 +9,9 @@
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, List, Union, Literal
+from typing import Dict, Optional, List, Union, Literal, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +24,31 @@ except ImportError:
 
 BASES_RNA = ("A", "C", "G", "U")
 BASES_DNA = ("A", "C", "G", "T")
+
+
+@dataclass
+class SpliceBertOutput:
+    """
+    Output from SpliceBertWrapper.forward().
+
+    Attributes
+    ----------
+    last_hidden_state : torch.Tensor
+        Hidden states from the last layer, shape (batch_size, seq_len, hidden_dim).
+    hidden_states : Optional[Tuple[torch.Tensor, ...]]
+        Hidden states from all layers (if output_hidden_states=True).
+        Tuple of tensors, each with shape (batch_size, seq_len, hidden_dim).
+        Index 0 is embedding layer output, subsequent indices are transformer layers.
+    logits : Optional[torch.Tensor]
+        MLM logits if MLM head is loaded, shape (batch_size, seq_len, vocab_size).
+    attention_mask : torch.Tensor
+        Attention mask used for the forward pass, shape (batch_size, seq_len).
+    """
+    last_hidden_state: torch.Tensor
+    hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
+    logits: Optional[torch.Tensor] = None
+    attention_mask: Optional[torch.Tensor] = None
+
 
 # Get package assets directory
 _PACKAGE_DIR = Path(__file__).parent.parent
@@ -322,6 +348,176 @@ class SpliceBertWrapper(BaseWrapper):
             raise ValueError("pool must be one of {'mean', 'cls', 'tokens'}")
 
         return emb.detach().cpu().numpy() if return_numpy else emb.detach().cpu()
+
+    @torch.no_grad()
+    def forward(
+        self,
+        seq: Union[str, List[str]],
+        *,
+        output_hidden_states: bool = False,
+        return_logits: bool = True,
+    ) -> SpliceBertOutput:
+        """
+        Run forward pass and return full model outputs.
+
+        This gives direct access to the model's hidden states and MLM logits,
+        similar to calling the HuggingFace model directly.
+
+        Parameters
+        ----------
+        seq : str or list of str
+            Input sequence(s). DNA and RNA both work.
+        output_hidden_states : bool, default=False
+            If True, return hidden states from all layers.
+        return_logits : bool, default=True
+            If True and MLM head is loaded, return MLM logits.
+
+        Returns
+        -------
+        SpliceBertOutput
+            Dataclass with:
+            - last_hidden_state: (batch_size, seq_len, hidden_dim)
+            - hidden_states: tuple of all layer outputs (if output_hidden_states=True)
+            - logits: MLM logits (batch_size, seq_len, vocab_size) if return_logits=True
+            - attention_mask: (batch_size, seq_len)
+
+        Examples
+        --------
+        >>> wrapper = SpliceBertWrapper()
+        >>> out = wrapper.forward("ACGTACGT")
+        >>> out.last_hidden_state.shape  # (1, 10, 512)
+        >>> out.logits.shape  # (1, 10, vocab_size)
+
+        >>> # Get all hidden states
+        >>> out = wrapper.forward("ACGTACGT", output_hidden_states=True)
+        >>> len(out.hidden_states)  # num_layers + 1 (embedding layer)
+        """
+        is_batch = isinstance(seq, (list, tuple))
+
+        if is_batch:
+            enc = self._encode_many(list(seq))
+        else:
+            enc = self._encode_one(seq)
+
+        # Get hidden states from base model
+        model_out = self.model(**enc, output_hidden_states=output_hidden_states)
+        last_hidden_state = model_out.last_hidden_state
+
+        hidden_states = None
+        if output_hidden_states and hasattr(model_out, 'hidden_states'):
+            hidden_states = model_out.hidden_states
+
+        # Get MLM logits if requested and available
+        logits = None
+        if return_logits and self.mlm is not None:
+            mlm_out = self.mlm(**enc)
+            logits = mlm_out.logits
+
+        return SpliceBertOutput(
+            last_hidden_state=last_hidden_state,
+            hidden_states=hidden_states,
+            logits=logits,
+            attention_mask=enc.get("attention_mask"),
+        )
+
+    @torch.no_grad()
+    def get_logits(
+        self,
+        seq: Union[str, List[str]],
+        *,
+        return_numpy: bool = False,
+    ) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Get MLM logits for sequence(s).
+
+        This is a convenience method to directly get the masked language model
+        logits without the full model output structure.
+
+        Parameters
+        ----------
+        seq : str or list of str
+            Input sequence(s). DNA and RNA both work.
+        return_numpy : bool, default=False
+            If True, return numpy array; if False, return torch.Tensor.
+
+        Returns
+        -------
+        logits : np.ndarray or torch.Tensor
+            MLM logits with shape (batch_size, seq_len, vocab_size).
+
+        Raises
+        ------
+        RuntimeError
+            If MLM head was not loaded (load_mlm=False).
+
+        Examples
+        --------
+        >>> wrapper = SpliceBertWrapper()
+        >>> logits = wrapper.get_logits("ACGTACGT")
+        >>> logits.shape  # (1, 10, vocab_size)
+        >>> probs = torch.softmax(logits, dim=-1)
+        """
+        if self.mlm is None:
+            raise RuntimeError("MLM head not loaded. Initialize with load_mlm=True")
+
+        is_batch = isinstance(seq, (list, tuple))
+
+        if is_batch:
+            enc = self._encode_many(list(seq))
+        else:
+            enc = self._encode_one(seq)
+
+        logits = self.mlm(**enc).logits
+
+        if return_numpy:
+            return logits.detach().cpu().numpy()
+        return logits
+
+    @torch.no_grad()
+    def get_all_hidden_states(
+        self,
+        seq: Union[str, List[str]],
+        *,
+        return_numpy: bool = False,
+    ) -> Union[Tuple[np.ndarray, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Get hidden states from all transformer layers.
+
+        Parameters
+        ----------
+        seq : str or list of str
+            Input sequence(s). DNA and RNA both work.
+        return_numpy : bool, default=False
+            If True, return numpy arrays; if False, return torch.Tensors.
+
+        Returns
+        -------
+        hidden_states : tuple
+            Tuple of hidden states from each layer. Index 0 is embedding layer,
+            subsequent indices are transformer layers.
+            Each element has shape (batch_size, seq_len, hidden_dim).
+
+        Examples
+        --------
+        >>> wrapper = SpliceBertWrapper()
+        >>> hidden_states = wrapper.get_all_hidden_states("ACGTACGT")
+        >>> len(hidden_states)  # 7 (embedding + 6 transformer layers)
+        >>> hidden_states[0].shape  # (1, 10, 512) - embedding layer
+        >>> hidden_states[-1].shape  # (1, 10, 512) - last transformer layer
+        """
+        is_batch = isinstance(seq, (list, tuple))
+
+        if is_batch:
+            enc = self._encode_many(list(seq))
+        else:
+            enc = self._encode_one(seq)
+
+        out = self.model(**enc, output_hidden_states=True)
+        hidden_states = out.hidden_states
+
+        if return_numpy:
+            return tuple(h.detach().cpu().numpy() for h in hidden_states)
+        return hidden_states
 
     def _get_hidden_states(self, enc: Dict[str, torch.Tensor], layer: Optional[int] = None) -> torch.Tensor:
         """Get hidden states from model."""

@@ -34,6 +34,7 @@ Usage:
 from .base_wrapper import BaseWrapper
 
 __all__ = [
+    "AlphaGenomeWrapper",
     "BaseWrapper",
     "BorzoiWrapper",
     "CaduceusWrapper",
@@ -46,11 +47,15 @@ __all__ = [
     "NTWrapper",
     "RiNALMoWrapper",
     "SpeciesLMWrapper",
+    "SpliceAIWrapper",
+    "SpliceAIOutput",
     "SpliceBertWrapper",
+    "SpliceBertOutput",
 ]
 
 # Mapping of wrapper names to their modules
 _WRAPPER_MODULES = {
+    "AlphaGenomeWrapper": "alphagenome_wrapper",
     "BorzoiWrapper": "borzoi_wrapper",
     "CaduceusWrapper": "caduceus_wrapper",
     "ConvNovaWrapper": "convnova_wrapper",
@@ -62,7 +67,10 @@ _WRAPPER_MODULES = {
     "NTWrapper": "nt_wrapper",
     "RiNALMoWrapper": "rinalmo_wrapper",
     "SpeciesLMWrapper": "specieslm_wrapper",
+    "SpliceAIWrapper": "spliceai_wrapper",
+    "SpliceAIOutput": "spliceai_wrapper",
     "SpliceBertWrapper": "splicebert_wrapper",
+    "SpliceBertOutput": "splicebert_wrapper",
 }
 
 

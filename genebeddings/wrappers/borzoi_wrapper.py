@@ -51,7 +51,7 @@ def _get_target_len(model: nn.Module, default: int = 6144) -> int:
 
 
 
-class BorzoiWrapper:
+class BorzoiWrapper(BaseWrapper):
     """
     Minimal wrapper:
       - Pads/crops any input to a fixed min_input_len (default 524,288 bp)
@@ -69,6 +69,7 @@ class BorzoiWrapper:
         required_input_len: int = 524_288,
         targets_path: str = None,
     ):
+        super().__init__()
         from borzoi_pytorch import Borzoi
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -179,6 +180,23 @@ class BorzoiWrapper:
             raise RuntimeError("Unexpected Borzoi output shape.")
         y = y.squeeze(0)[:, sl_out]  # (C, Lret)
         return y.detach().cpu().numpy()
+
+    @torch.no_grad()
+    def predict_tracks(self, seq: str) -> np.ndarray:
+        """
+        Predict genomic tracks for a DNA sequence.
+
+        Parameters
+        ----------
+        seq : str
+            Input DNA sequence.
+
+        Returns
+        -------
+        tracks : np.ndarray
+            Shape (num_tracks, num_positions).
+        """
+        return self.tracks(seq)
 
     @torch.no_grad()
     def tracks_by_name(

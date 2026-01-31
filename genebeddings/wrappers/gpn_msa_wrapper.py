@@ -222,8 +222,32 @@ class GPNMSAWrapper(BaseWrapper):
 
         return input_ids, aux_features
 
-    @torch.no_grad()
     def embed(
+        self,
+        seq: str,
+        *,
+        pool: PoolMode = "mean",
+        return_numpy: bool = True,
+    ) -> Union[np.ndarray, torch.Tensor]:
+        """
+        GPN-MSA requires MSA (multiple sequence alignment) data, not raw sequences.
+
+        Use embed_msa() with pre-tokenized MSA data, or embed_region() with
+        genomic coordinates to automatically fetch MSA data.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. GPN-MSA cannot embed raw sequence strings.
+        """
+        raise NotImplementedError(
+            "GPNMSAWrapper requires MSA data, not raw sequence strings. "
+            "Use embed_msa(msa_array, pool=...) with pre-tokenized MSA data, "
+            "or embed_region(chrom, start, end, strand, pool=...) with genomic coordinates."
+        )
+
+    @torch.no_grad()
+    def embed_msa(
         self,
         msa: Union[np.ndarray, torch.Tensor],
         *,
@@ -320,7 +344,7 @@ class GPNMSAWrapper(BaseWrapper):
         embeddings : np.ndarray or torch.Tensor
         """
         msa = self.get_msa(chrom, start, end, strand=strand, tokenize=True)
-        return self.embed(msa, pool=pool, return_numpy=return_numpy, layer=layer)
+        return self.embed_msa(msa, pool=pool, return_numpy=return_numpy, layer=layer)
 
     @torch.no_grad()
     def predict_nucleotides(

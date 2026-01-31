@@ -6,11 +6,27 @@ This is a minimal test script to verify the basic API works.
 For comprehensive testing, use test_wrappers.py
 """
 
+import importlib
 import sys
+
+
+def test_package_import():
+    """Test that the main package imports correctly."""
+    print("Testing package import...")
+    import genebeddings
+    assert hasattr(genebeddings, '__version__')
+    assert hasattr(genebeddings, 'SingleVariantGeometry')
+    assert hasattr(genebeddings, 'EpistasisGeometry')
+    assert hasattr(genebeddings, 'VariantEmbeddingDB')
+    assert hasattr(genebeddings, 'DBMetadata')
+    print(f"  genebeddings v{genebeddings.__version__}")
+    print("  All public API symbols present")
+    return True
+
 
 def test_base_wrapper():
     """Test that BaseWrapper can be imported and has the right structure."""
-    print("Testing BaseWrapper...")
+    print("\nTesting BaseWrapper...")
     from genebeddings.wrappers import BaseWrapper
 
     # Check methods exist
@@ -20,7 +36,7 @@ def test_base_wrapper():
     assert hasattr(BaseWrapper, 'supports_capability')
     assert hasattr(BaseWrapper, 'get_capabilities')
 
-    print("✓ BaseWrapper has all required methods")
+    print("  BaseWrapper has all required methods")
     return True
 
 
@@ -30,24 +46,33 @@ def test_wrapper_imports():
 
     wrappers = [
         'BaseWrapper',
+        'AlphaGenomeWrapper',
         'BorzoiWrapper',
         'CaduceusWrapper',
         'ConvNovaWrapper',
+        'DNABERTWrapper',
+        'Evo2Wrapper',
+        'GPNMSAWrapper',
+        'HyenaDNAWrapper',
+        'MutBERTWrapper',
         'NTWrapper',
         'RiNALMoWrapper',
         'SpeciesLMWrapper',
+        'SpliceAIWrapper',
+        'SpliceBertWrapper',
     ]
 
     success_count = 0
     for wrapper in wrappers:
         try:
-            exec(f"from genebeddings.wrappers import {wrapper}")
-            print(f"✓ {wrapper} imported successfully")
+            mod = importlib.import_module('genebeddings.wrappers')
+            getattr(mod, wrapper)
+            print(f"  {wrapper} imported successfully")
             success_count += 1
-        except ImportError as e:
-            print(f"✗ Failed to import {wrapper}: {e}")
+        except (ImportError, AttributeError) as e:
+            print(f"  FAIL: {wrapper}: {e}")
 
-    print(f"\n{success_count}/{len(wrappers)} wrappers imported successfully")
+    print(f"\n  {success_count}/{len(wrappers)} wrappers imported successfully")
     return success_count == len(wrappers)
 
 
@@ -55,71 +80,66 @@ def test_wrapper_inheritance():
     """Test that all wrappers inherit from BaseWrapper."""
     print("\nTesting wrapper inheritance...")
 
-    from genebeddings.wrappers import (
-        BaseWrapper,
-        BorzoiWrapper,
-        CaduceusWrapper,
-        ConvNovaWrapper,
-        NTWrapper,
-        RiNALMoWrapper,
-        SpeciesLMWrapper,
-    )
+    from genebeddings.wrappers import BaseWrapper
 
-    wrappers = [
-        BorzoiWrapper,
-        CaduceusWrapper,
-        ConvNovaWrapper,
-        NTWrapper,
-        RiNALMoWrapper,
-        SpeciesLMWrapper,
+    wrapper_names = [
+        'BorzoiWrapper',
+        'CaduceusWrapper',
+        'ConvNovaWrapper',
+        'DNABERTWrapper',
+        'Evo2Wrapper',
+        'GPNMSAWrapper',
+        'HyenaDNAWrapper',
+        'MutBERTWrapper',
+        'NTWrapper',
+        'RiNALMoWrapper',
+        'SpeciesLMWrapper',
+        'SpliceAIWrapper',
+        'SpliceBertWrapper',
     ]
 
+    mod = importlib.import_module('genebeddings.wrappers')
     all_inherit = True
-    for wrapper_class in wrappers:
-        if issubclass(wrapper_class, BaseWrapper):
-            print(f"✓ {wrapper_class.__name__} inherits from BaseWrapper")
-        else:
-            print(f"✗ {wrapper_class.__name__} does NOT inherit from BaseWrapper")
-            all_inherit = False
+    for name in wrapper_names:
+        try:
+            wrapper_class = getattr(mod, name)
+            if issubclass(wrapper_class, BaseWrapper):
+                print(f"  {name} inherits from BaseWrapper")
+            else:
+                print(f"  FAIL: {name} does NOT inherit from BaseWrapper")
+                all_inherit = False
+        except (AttributeError, ImportError) as e:
+            print(f"  SKIP: {name}: {e}")
 
     return all_inherit
 
 
 def test_api_signatures():
-    """Test that all wrappers have the correct method signatures."""
+    """Test that key wrappers have the correct method signatures."""
     print("\nTesting API method signatures...")
 
-    from genebeddings.wrappers import (
-        BorzoiWrapper,
-        CaduceusWrapper,
-        NTWrapper,
-    )
-
     import inspect
+    mod = importlib.import_module('genebeddings.wrappers')
 
-    # Check embed signature
-    wrappers_to_check = [
-        ('BorzoiWrapper', BorzoiWrapper),
-        ('CaduceusWrapper', CaduceusWrapper),
-        ('NTWrapper', NTWrapper),
-    ]
+    wrappers_to_check = ['BorzoiWrapper', 'CaduceusWrapper', 'NTWrapper']
 
     all_correct = True
-    for name, wrapper_class in wrappers_to_check:
-        # Check embed method
-        if hasattr(wrapper_class, 'embed'):
-            sig = inspect.signature(wrapper_class.embed)
-            params = list(sig.parameters.keys())
-
-            # Should have: self, seq, pool (kwonly), return_numpy (kwonly)
-            if 'seq' in params and 'pool' in params and 'return_numpy' in params:
-                print(f"✓ {name}.embed() has correct signature")
+    for name in wrappers_to_check:
+        try:
+            wrapper_class = getattr(mod, name)
+            if hasattr(wrapper_class, 'embed'):
+                sig = inspect.signature(wrapper_class.embed)
+                params = list(sig.parameters.keys())
+                if 'seq' in params and 'pool' in params and 'return_numpy' in params:
+                    print(f"  {name}.embed() has correct signature")
+                else:
+                    print(f"  FAIL: {name}.embed() has incorrect signature: {params}")
+                    all_correct = False
             else:
-                print(f"✗ {name}.embed() has incorrect signature: {params}")
+                print(f"  FAIL: {name} missing embed() method")
                 all_correct = False
-        else:
-            print(f"✗ {name} missing embed() method")
-            all_correct = False
+        except (AttributeError, ImportError) as e:
+            print(f"  SKIP: {name}: {e}")
 
     return all_correct
 
@@ -128,29 +148,24 @@ def test_capability_methods():
     """Test that capability discovery methods work."""
     print("\nTesting capability discovery...")
 
-    try:
-        # Import a wrapper (don't initialize, just check the class)
-        from genebeddings.wrappers import BaseWrapper
+    from genebeddings.wrappers import BaseWrapper
 
-        # Check that the methods exist and have reasonable behavior
-        assert hasattr(BaseWrapper, 'supports_capability')
-        assert hasattr(BaseWrapper, 'get_capabilities')
-        assert hasattr(BaseWrapper, '_implements_predict_nucleotides')
-        assert hasattr(BaseWrapper, '_implements_predict_tracks')
+    assert hasattr(BaseWrapper, 'supports_capability')
+    assert hasattr(BaseWrapper, 'get_capabilities')
+    assert hasattr(BaseWrapper, '_implements_predict_nucleotides')
+    assert hasattr(BaseWrapper, '_implements_predict_tracks')
 
-        print("✓ Capability discovery methods present")
-        return True
-    except Exception as e:
-        print(f"✗ Capability discovery test failed: {e}")
-        return False
+    print("  Capability discovery methods present")
+    return True
 
 
 def main():
-    print("=" * 80)
-    print("QUICK SMOKE TEST FOR GENEBEDDINGS WRAPPERS")
-    print("=" * 80)
+    print("=" * 70)
+    print("QUICK SMOKE TEST FOR GENEBEDDINGS")
+    print("=" * 70)
 
     tests = [
+        ("Package Import", test_package_import),
         ("Base Wrapper Structure", test_base_wrapper),
         ("Wrapper Imports", test_wrapper_imports),
         ("Wrapper Inheritance", test_wrapper_inheritance),
@@ -164,34 +179,25 @@ def main():
             result = test_func()
             results.append((test_name, result))
         except Exception as e:
-            print(f"\n✗ Test '{test_name}' crashed: {e}")
+            print(f"\n  CRASH: '{test_name}': {e}")
             import traceback
             traceback.print_exc()
             results.append((test_name, False))
 
     # Summary
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 70)
     print("SUMMARY")
-    print("=" * 80)
+    print("=" * 70)
 
     passed = sum(1 for _, result in results if result)
     total = len(results)
 
     for test_name, result in results:
-        status = "✓ PASS" if result else "✗ FAIL"
-        print(f"{status:8} {test_name}")
+        status = "PASS" if result else "FAIL"
+        print(f"  [{status}] {test_name}")
 
     print(f"\nTotal: {passed}/{total} tests passed")
-
-    if passed == total:
-        print("\n🎉 All smoke tests passed! The API is properly structured.")
-        print("\nNext steps:")
-        print("  - Run: python test_wrappers.py")
-        print("  - This will let you test individual models with actual inference")
-        return 0
-    else:
-        print("\n⚠ Some tests failed. Please review the API implementation.")
-        return 1
+    return 0 if passed == total else 1
 
 
 if __name__ == '__main__':

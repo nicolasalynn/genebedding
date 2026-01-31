@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "genebeddings"
+version = "0.1.0"
+description = "Unified interface for genomic foundation model embeddings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+]
+
+[project.optional-dependencies]
+# Transformer-based DNA language models
+nt = ["transformers>=4.30"]
+dnabert = ["transformers>=4.30"]
+caduceus = ["transformers>=4.30"]
+specieslm = ["transformers>=4.30"]
+genomenet = ["transformers>=4.30"]
+rinalmo = ["rinalmo"]
+splicebert = ["transformers>=4.30"]
+
+# State-space / long-range models
+hyenadna = ["transformers>=4.30"]
+evo2 = ["evo2"]
+
+# Track prediction models
+borzoi = ["borzoi-pytorch>=0.4"]
+alphagenome = [
+    "jax[cuda12]",
+    "dm-haiku",
+    "jmp",
+    "orbax-checkpoint",
+    "alphagenome-research",
+]
+
+# CNN models
+spliceai = ["spliceai-pytorch"]
+
+# MSA models
+gpn-msa = ["gpn"]
+
+# Specialized models
+mutbert = ["transformers>=4.30"]
+conformer = ["transformers>=4.30"]
+convnova = ["transformers>=4.30"]
+
+# All wrappers
+all = [
+    "transformers>=4.30",
+    "borzoi-pytorch>=0.4",
+    "rinalmo",
+    "spliceai-pytorch",
+]
+
+# Development
+dev = [
+    "pytest>=7.0",
+    "black",
+    "isort",
+]
+
+[tool.setuptools.packages.find]
+include = ["genebeddings*"]
