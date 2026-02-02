@@ -1,0 +1,145 @@
+Metadata-Version: 2.4
+Name: genebeddings
+Version: 0.1.0
+Summary: Unified interface for genomic foundation model embeddings
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: torch>=2.0
+Requires-Dist: pandas>=2.0
+Requires-Dist: scipy>=1.10
+Requires-Dist: scikit-learn>=1.2
+Provides-Extra: nt
+Requires-Dist: transformers>=4.30; extra == "nt"
+Provides-Extra: dnabert
+Requires-Dist: transformers>=4.30; extra == "dnabert"
+Provides-Extra: caduceus
+Requires-Dist: transformers>=4.30; extra == "caduceus"
+Provides-Extra: specieslm
+Requires-Dist: transformers>=4.30; extra == "specieslm"
+Provides-Extra: genomenet
+Requires-Dist: transformers>=4.30; extra == "genomenet"
+Provides-Extra: rinalmo
+Requires-Dist: rinalmo; extra == "rinalmo"
+Provides-Extra: splicebert
+Requires-Dist: transformers>=4.30; extra == "splicebert"
+Provides-Extra: hyenadna
+Requires-Dist: transformers>=4.30; extra == "hyenadna"
+Provides-Extra: evo2
+Requires-Dist: evo2; extra == "evo2"
+Provides-Extra: borzoi
+Requires-Dist: borzoi-pytorch>=0.4; extra == "borzoi"
+Provides-Extra: alphagenome
+Requires-Dist: jax[cuda12]; extra == "alphagenome"
+Requires-Dist: dm-haiku; extra == "alphagenome"
+Requires-Dist: jmp; extra == "alphagenome"
+Requires-Dist: orbax-checkpoint; extra == "alphagenome"
+Requires-Dist: alphagenome-research; extra == "alphagenome"
+Provides-Extra: spliceai
+Requires-Dist: spliceai-pytorch; extra == "spliceai"
+Provides-Extra: gpn-msa
+Requires-Dist: gpn; extra == "gpn-msa"
+Provides-Extra: mutbert
+Requires-Dist: transformers>=4.30; extra == "mutbert"
+Provides-Extra: conformer
+Requires-Dist: transformers>=4.30; extra == "conformer"
+Provides-Extra: convnova
+Requires-Dist: transformers>=4.30; extra == "convnova"
+Provides-Extra: all
+Requires-Dist: transformers>=4.30; extra == "all"
+Requires-Dist: borzoi-pytorch>=0.4; extra == "all"
+Requires-Dist: rinalmo; extra == "all"
+Requires-Dist: spliceai-pytorch; extra == "all"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: isort; extra == "dev"
+
+# genebeddings
+
+Unified interface for extracting embeddings from genomic foundation models.
+
+## Overview
+
+genebeddings provides:
+
+- **Standardized wrappers** for 16 genomic foundation models (transformers, CNNs, state-space models, track predictors)
+- **Geometric analysis** tools for single-variant and epistasis embeddings
+- **Embedding storage** via SQLite key-value store
+- **Benchmarking** utilities for pathogenicity prediction
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+Install with model-specific dependencies:
+
+```bash
+pip install -e ".[nt]"          # Nucleotide Transformer
+pip install -e ".[borzoi]"      # Borzoi
+pip install -e ".[alphagenome]" # AlphaGenome (requires JAX + GPU)
+pip install -e ".[all]"         # Common models
+```
+
+## Quick Start
+
+### Embeddings
+
+```python
+from genebeddings.wrappers import NTWrapper
+
+model = NTWrapper()
+embedding = model.embed("ACGTACGT" * 100, pool="mean")  # (hidden_dim,) numpy array
+```
+
+### Nucleotide Predictions
+
+```python
+probs = model.predict_nucleotides("ACGTNACGT", positions=[4])
+# [{'A': 0.1, 'C': 0.2, 'G': 0.3, 'T': 0.4}]
+```
+
+### Track Predictions
+
+```python
+from genebeddings.wrappers import BorzoiWrapper
+
+borzoi = BorzoiWrapper()
+tracks = borzoi.predict_tracks("ACGT" * 131_072)  # (num_tracks, length) numpy array
+```
+
+### Variant Geometry
+
+```python
+from genebeddings import SingleVariantGeometry
+
+geom = SingleVariantGeometry(wt_embedding, mut_embedding)
+print(geom.cosine_distance, geom.euclidean_distance)
+```
+
+## Supported Models
+
+| Wrapper | Architecture | Max Input | Capabilities |
+|---------|-------------|-----------|-------------|
+| AlphaGenomeWrapper | Encoder-Transformer-Decoder (JAX) | 1M bp | embed, tracks, variants |
+| BorzoiWrapper | CNN (PyTorch) | 524K bp | embed, tracks |
+| CaduceusWrapper | Bidirectional SSM | ~131K tokens | embed, nucleotides |
+| DNABERTWrapper | Transformer (BPE) | Model-dep. | embed, nucleotides |
+| Evo2Wrapper | SSM | Very long | embed, nucleotides, generate |
+| GPNMSAWrapper | Transformer + MSA | Model-dep. | embed (MSA), nucleotides |
+| HyenaDNAWrapper | Hyena SSM | Up to 1M bp | embed |
+| NTWrapper | Transformer (k-mer) | Long | embed, nucleotides |
+| RiNALMoWrapper | Transformer (RNA) | Model-dep. | embed, nucleotides |
+| SpliceAIWrapper | CNN | Model-dep. | embed, splice sites |
+| SpliceBertWrapper | Transformer | Model-dep. | embed, nucleotides |
+
+See [wrappers/summary.md](genebeddings/wrappers/summary.md) for full details.
+
+## Testing
+
+```bash
+python quick_test.py
+```

@@ -71,6 +71,9 @@ class AlphaGenomeWrapper(BaseWrapper):
         source: AlphaGenomeSource = "huggingface",
         organism_settings=None,
         device=None,
+        fixed_length: int | None = None,
+        pad_to_multiple: int | None = None,
+        pad_char: str = "N",
     ):
         super().__init__()
 
@@ -82,6 +85,9 @@ class AlphaGenomeWrapper(BaseWrapper):
         from alphagenome_research.model import one_hot_encoder
 
         self.model_version = model_version
+        self.fixed_length = fixed_length
+        self.pad_to_multiple = pad_to_multiple
+        self.pad_char = pad_char
         self._one_hot_encoder = one_hot_encoder.DNAOneHotEncoder()
         self._dna_model = dna_model
 
@@ -141,9 +147,42 @@ class AlphaGenomeWrapper(BaseWrapper):
         """Clean sequence to valid DNA characters (uppercase ACGT, others become N)."""
         return re.sub(r"[^ACGTacgt]", "N", seq or "").upper()
 
+    def _pad_or_crop(self, seq: str, *, fixed_length: int | None, pad_to_multiple: int | None) -> str:
+        """Pad/crop sequence to a fixed length or to a multiple."""
+        if fixed_length is not None:
+            L = len(seq)
+            if L == fixed_length:
+                return seq
+            if L > fixed_length:
+                # Center-crop to preserve variant-centered windows
+                start = max(0, (L - fixed_length) // 2)
+                return seq[start:start + fixed_length]
+            # Center-pad
+            pad_total = fixed_length - L
+            pad_left = pad_total // 2
+            pad_right = pad_total - pad_left
+            return (self.pad_char * pad_left) + seq + (self.pad_char * pad_right)
+
+        if pad_to_multiple:
+            L = len(seq)
+            remainder = L % pad_to_multiple
+            if remainder == 0:
+                return seq
+            pad_total = pad_to_multiple - remainder
+            pad_left = pad_total // 2
+            pad_right = pad_total - pad_left
+            return (self.pad_char * pad_left) + seq + (self.pad_char * pad_right)
+
+        return seq
+
     def _encode_sequence(self, seq: str) -> np.ndarray:
         """One-hot encode a DNA sequence to shape (S, 4) float32."""
         seq = self._normalize_seq(seq)
+        seq = self._pad_or_crop(
+            seq,
+            fixed_length=self.fixed_length,
+            pad_to_multiple=self.pad_to_multiple,
+        )
         return np.asarray(self._one_hot_encoder.encode(seq), dtype=np.float32)
 
     def embed(
@@ -154,6 +193,8 @@ class AlphaGenomeWrapper(BaseWrapper):
         return_numpy: bool = True,
         resolution: int = 1,
         organism: str = "HOMO_SAPIENS",
+        fixed_length: int | None = None,
+        pad_to_multiple: int | None = None,
     ) -> Union[np.ndarray, "jax.Array"]:
         """
         Generate embeddings for a DNA sequence.
@@ -180,6 +221,12 @@ class AlphaGenomeWrapper(BaseWrapper):
         organism : str, default='HOMO_SAPIENS'
             Organism for organism-specific embeddings.
             One of 'HOMO_SAPIENS', 'MUS_MUSCULUS'.
+        fixed_length : int, optional
+            If provided, pad/crop sequence to this length before embedding.
+            Overrides the wrapper default.
+        pad_to_multiple : int, optional
+            If provided, pad sequence length up to a multiple of this value.
+            Overrides the wrapper default.
 
         Returns
         -------
@@ -198,7 +245,12 @@ class AlphaGenomeWrapper(BaseWrapper):
         organism_enum = self._dna_model.Organism[organism]
         organism_idx = self._dna_model.convert_to_organism_index(organism_enum)
 
-        encoded = self._encode_sequence(seq)
+        if fixed_length is not None or pad_to_multiple is not None:
+            seq = self._normalize_seq(seq)
+            seq = self._pad_or_crop(seq, fixed_length=fixed_length, pad_to_multiple=pad_to_multiple)
+            encoded = np.asarray(self._one_hot_encoder.encode(seq), dtype=np.float32)
+        else:
+            encoded = self._encode_sequence(seq)
 
         with self._device_context as device, jax.transfer_guard("disallow"):
             sequence = jax.device_put(encoded[np.newaxis], device)

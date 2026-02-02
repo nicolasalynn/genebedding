@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import copy, math, sys, os
+import warnings
 from collections import namedtuple
 from typing import Dict, List, Optional, Tuple, Union
 from omegaconf import OmegaConf
@@ -294,9 +295,28 @@ class ConvNovaWrapper(BaseWrapper):
         if checkpoint_path is None:
             checkpoint_path = _DEFAULT_CHECKPOINT_PATH
 
-        # Load config from YAML
-        cfg = OmegaConf.load(config_yaml)
-        model_kwargs = dict(cfg.model)
+        # Load config from YAML when available; otherwise use provided defaults
+        if config_yaml and os.path.exists(config_yaml):
+            cfg = OmegaConf.load(config_yaml)
+            model_kwargs = dict(cfg.model)
+        else:
+            if config_yaml and not os.path.exists(config_yaml):
+                warnings.warn(
+                    f"ConvNova config not found at {config_yaml!r}; "
+                    "using default architecture parameters."
+                )
+            model_kwargs = {
+                "hidden_dim": hidden_dim,
+                "num_cnn_stacks": num_cnn_stacks,
+                "dropout": dropout,
+                "kernel_size": kernel_size,
+                "dilation": dilation,
+                "num_conv1d": num_conv1d,
+                "d_inner": d_inner,
+                "final_conv": final_conv,
+                "ffn": ffn,
+                "alphabet_size": 5,
+            }
 
         # We want inference path that outputs per-token logits; set flags explicitly.
         model_kwargs.setdefault("alphabet_size", 5)       # A,C,G,T,N
@@ -321,8 +341,13 @@ class ConvNovaWrapper(BaseWrapper):
                          ).to(self.device).eval()
 
         # optional checkpoint
-        if checkpoint_path:
+        if checkpoint_path and os.path.exists(checkpoint_path):
             missing, unexpected = load_backbone_weights(core, checkpoint_path, strict=False)
+        elif checkpoint_path:
+            warnings.warn(
+                f"ConvNova checkpoint not found at {checkpoint_path!r}; "
+                "using randomly initialized weights."
+            )
 
         # probe embedding dim & ensure base head matches vocab size
         with torch.no_grad():
