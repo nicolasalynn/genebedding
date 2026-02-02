@@ -129,7 +129,7 @@ class AlphaGenomeWrapper(BaseWrapper):
             return embeddings
 
         def _embed_apply_fn(params, state, dna_sequence, organism_index):
-            (embeddings, _), _ = _forward_embed.apply(
+            embeddings, _ = _forward_embed.apply(
                 params, state, None, dna_sequence, organism_index
             )
             return embeddings
