@@ -429,13 +429,8 @@ def compute_cov_inv_from_paths_combined(
             db_files.append(p)
 
     all_residuals: List[np.ndarray] = []
-    db_iter = _maybe_tqdm(
-        db_files,
-        total=len(db_files),
-        desc="Databases",
-    ) if show_progress else db_files
-
-    for db_path in db_iter:
+    # Avoid nested progress bars: show per-DB residual progress only.
+    for db_path in db_files:
         db = VariantEmbeddingDB(db_path)
         epi_ids = _list_epistasis_ids_from_db(db)
         if sample_frac is not None:
