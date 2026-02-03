@@ -2935,6 +2935,7 @@ def add_epistasis_metrics(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     pool: str = "mean",
     force: bool = False,
+    cov_inv: Optional[np.ndarray] = None,
 ) -> "pd.DataFrame":
     """
     Add epistasis geometry metrics to a DataFrame.
@@ -2955,6 +2956,7 @@ def add_epistasis_metrics(
     - cos_exp_to_obs: Direction indicator (-1=toward WT, +1=away from WT)
     - magnitude_ratio: Ratio of observed to expected effect
     - log_magnitude_ratio: Log ratio of observed to expected effect
+    - epi_mahal: Mahalanobis distance of residual (if cov_inv provided)
 
     Parameters
     ----------
@@ -2998,6 +3000,9 @@ def add_epistasis_metrics(
     force : bool, optional
         If True, recompute embeddings even if they exist in the database.
         Default: False.
+    cov_inv : np.ndarray, optional
+        Precomputed inverse covariance for residuals. If provided, adds
+        covariance-aware epistasis metric (epi_mahal).
 
     Returns
     -------
@@ -3039,6 +3044,8 @@ def add_epistasis_metrics(
         "magnitude_ratio",     # Ratio of observed to expected effect
         "log_magnitude_ratio", # Log ratio of observed to expected effect
     ]
+    if cov_inv is not None:
+        metric_cols.append("epi_mahal")
 
     # Initialize columns with user prefix (all at once to avoid fragmentation)
     col_names = [f"{prefix}{name}" for name in metric_cols]
@@ -3150,7 +3157,17 @@ def add_epistasis_metrics(
         # Assign all metrics
         metrics = geom.metrics()
         for name in metric_cols:
-            df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
+            if name == "epi_mahal":
+                residual = geom.v12_obs - geom.v12_exp
+                r = residual.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != r.shape[0] or cov_inv.shape[1] != r.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {r.shape[0]}"
+                    )
+                epi_mahal = float(math.sqrt(r.T @ cov_inv @ r))
+                df.at[idx, f"{prefix}{name}"] = epi_mahal
+            else:
+                df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
 
         n_processed += 1
 
