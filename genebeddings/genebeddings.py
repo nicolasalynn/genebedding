@@ -416,6 +416,10 @@ class EpistasisMetrics:
         Ratio of observed to expected magnitude: ||v12_obs|| / ||v12_exp||.
         <1 = closer to WT than expected (sub-additive)
         >1 = further from WT than expected (super-additive)
+    log_magnitude_ratio : float
+        Log ratio of observed to expected magnitude:
+        log((||v12_obs|| + eps) / (||v12_exp|| + eps)).
+        0 = additive, negative = sub-additive, positive = super-additive.
     """
 
     len_WT_M1: float
@@ -427,6 +431,7 @@ class EpistasisMetrics:
     cos_v1_v2: float
     cos_exp_to_obs: float
     magnitude_ratio: float
+    log_magnitude_ratio: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -440,6 +445,7 @@ class EpistasisMetrics:
             "cos_v1_v2": self.cos_v1_v2,
             "cos_exp_to_obs": self.cos_exp_to_obs,
             "magnitude_ratio": self.magnitude_ratio,
+            "log_magnitude_ratio": self.log_magnitude_ratio,
         }
 
 
@@ -1078,6 +1084,7 @@ class EpistasisGeometry(_GeometryBase):
 
         # Magnitude ratio: how much closer/further from WT than expected
         magnitude_ratio = a12 / (a12_exp + self.eps)
+        log_magnitude_ratio = math.log((a12 + self.eps) / (a12_exp + self.eps))
 
         self._cached_metrics = EpistasisMetrics(
             len_WT_M1=a1,
@@ -1089,6 +1096,7 @@ class EpistasisGeometry(_GeometryBase):
             cos_v1_v2=cos_v1_v2,
             cos_exp_to_obs=cos_exp_to_obs,
             magnitude_ratio=magnitude_ratio,
+            log_magnitude_ratio=log_magnitude_ratio,
         )
 
         return self._cached_metrics
@@ -2946,6 +2954,7 @@ def add_epistasis_metrics(
     - cos_v1_v2: Alignment of single mutation effects
     - cos_exp_to_obs: Direction indicator (-1=toward WT, +1=away from WT)
     - magnitude_ratio: Ratio of observed to expected effect
+    - log_magnitude_ratio: Log ratio of observed to expected effect
 
     Parameters
     ----------
@@ -3027,7 +3036,8 @@ def add_epistasis_metrics(
         "epi_R_singles",   # Normalized residual (comparable across events)
         "cos_v1_v2",       # Alignment of single mutation effects
         "cos_exp_to_obs",  # Direction indicator: -1=toward WT, +1=away from WT
-        "magnitude_ratio", # Ratio of observed to expected effect
+        "magnitude_ratio",     # Ratio of observed to expected effect
+        "log_magnitude_ratio", # Log ratio of observed to expected effect
     ]
 
     # Initialize columns with user prefix (all at once to avoid fragmentation)
