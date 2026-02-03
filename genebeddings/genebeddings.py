@@ -2957,6 +2957,10 @@ def add_epistasis_metrics(
     - magnitude_ratio: Ratio of observed to expected effect
     - log_magnitude_ratio: Log ratio of observed to expected effect
     - epi_mahal: Mahalanobis distance of residual (if cov_inv provided)
+    - mahal_obs: Mahalanobis magnitude of observed effect (if cov_inv provided)
+    - mahal_add: Mahalanobis magnitude of additive effect (if cov_inv provided)
+    - mahal_ratio: mahal_obs / mahal_add (if cov_inv provided)
+    - log_mahal_ratio: log((mahal_obs + eps) / (mahal_add + eps))
 
     Parameters
     ----------
@@ -3002,7 +3006,7 @@ def add_epistasis_metrics(
         Default: False.
     cov_inv : np.ndarray, optional
         Precomputed inverse covariance for residuals. If provided, adds
-        covariance-aware epistasis metric (epi_mahal).
+        covariance-aware epistasis metrics (epi_mahal, mahal_*).
 
     Returns
     -------
@@ -3046,6 +3050,7 @@ def add_epistasis_metrics(
     ]
     if cov_inv is not None:
         metric_cols.append("epi_mahal")
+        metric_cols.extend(["mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"])
 
     # Initialize columns with user prefix (all at once to avoid fragmentation)
     col_names = [f"{prefix}{name}" for name in metric_cols]
@@ -3166,6 +3171,23 @@ def add_epistasis_metrics(
                     )
                 epi_mahal = float(math.sqrt(r.T @ cov_inv @ r))
                 df.at[idx, f"{prefix}{name}"] = epi_mahal
+            elif name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"):
+                v_obs = geom.v12_obs.detach().cpu().numpy().astype(np.float64, copy=False)
+                v_add = geom.v12_exp.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != v_obs.shape[0] or cov_inv.shape[1] != v_obs.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {v_obs.shape[0]}"
+                    )
+                mahal_obs = float(math.sqrt(v_obs.T @ cov_inv @ v_obs))
+                mahal_add = float(math.sqrt(v_add.T @ cov_inv @ v_add))
+                if name == "mahal_obs":
+                    df.at[idx, f"{prefix}{name}"] = mahal_obs
+                elif name == "mahal_add":
+                    df.at[idx, f"{prefix}{name}"] = mahal_add
+                else:
+                    ratio = mahal_obs / (mahal_add + DEFAULT_EPS)
+                    df.at[idx, f"{prefix}mahal_ratio"] = ratio
+                    df.at[idx, f"{prefix}log_mahal_ratio"] = math.log((mahal_obs + DEFAULT_EPS) / (mahal_add + DEFAULT_EPS))
             else:
                 df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
 
