@@ -12,6 +12,8 @@ import hashlib
 import json
 import math
 import sqlite3
+import os
+import random
 
 import numpy as np
 import torch
@@ -268,6 +270,114 @@ class EpistasisCache:
             "INSERT OR REPLACE INTO epistasis_cache (key, value) VALUES (?, ?)",
             (key, payload),
         )
+
+
+def _list_epistasis_ids_from_db(db) -> List[str]:
+    """
+    Return epistasis IDs present in DB (based on |WT keys with 2+ pipes).
+    """
+    keys = db.list_keys(pattern="%|WT")
+    epi_ids = []
+    for k in keys:
+        if k.endswith("|WT") and k.count("|") >= 2:
+            epi_ids.append(k[:-3])
+    return epi_ids
+
+
+def _load_residual_from_db(db, epi_id: str) -> Optional[np.ndarray]:
+    """Return residual vector for an epistasis ID, or None if missing."""
+    try:
+        z_wt = db.load(f"{epi_id}|WT", as_torch=True)
+        z_m1 = db.load(f"{epi_id}|M1", as_torch=True)
+        z_m2 = db.load(f"{epi_id}|M2", as_torch=True)
+        z_m12 = db.load(f"{epi_id}|M12", as_torch=True)
+    except KeyError:
+        return None
+
+    z_wt = torch.as_tensor(z_wt)
+    z_m1 = torch.as_tensor(z_m1)
+    z_m2 = torch.as_tensor(z_m2)
+    z_m12 = torch.as_tensor(z_m12)
+
+    if not (z_wt.ndim == z_m1.ndim == z_m2.ndim == z_m12.ndim == 1):
+        return None
+
+    residual = (z_m12 - z_wt) - ((z_m1 - z_wt) + (z_m2 - z_wt))
+    return residual.detach().cpu().numpy()
+
+
+def compute_cov_inv_from_db(
+    db_path: str,
+    *,
+    method: str = "ledoit_wolf",
+    ridge: float = 1e-6,
+    sample_frac: Optional[float] = None,
+    max_samples: Optional[int] = None,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute covariance + inverse from all epistasis residuals in a DB.
+    """
+    from .genebeddings import VariantEmbeddingDB
+
+    rng = random.Random(random_state)
+    db = VariantEmbeddingDB(db_path)
+    epi_ids = _list_epistasis_ids_from_db(db)
+
+    if sample_frac is not None:
+        k = max(1, int(len(epi_ids) * sample_frac))
+        epi_ids = rng.sample(epi_ids, k)
+    if max_samples is not None and len(epi_ids) > max_samples:
+        epi_ids = rng.sample(epi_ids, max_samples)
+
+    residuals = []
+    for epi_id in epi_ids:
+        r = _load_residual_from_db(db, epi_id)
+        if r is not None:
+            residuals.append(r)
+
+    db.close()
+    if not residuals:
+        raise ValueError(f"No epistasis residuals found in {db_path}")
+
+    return fit_covariance(residuals, method=method, ridge=ridge)
+
+
+def compute_cov_inv_from_paths(
+    paths: Sequence[str],
+    *,
+    method: str = "ledoit_wolf",
+    ridge: float = 1e-6,
+    sample_frac: Optional[float] = None,
+    max_samples: Optional[int] = None,
+    random_state: int = 42,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Compute cov_inv for every .db found in provided paths or directories.
+
+    Returns {db_path: (cov, cov_inv)}.
+    """
+    db_files: List[str] = []
+    for p in paths:
+        if os.path.isdir(p):
+            for name in os.listdir(p):
+                if name.endswith(".db"):
+                    db_files.append(os.path.join(p, name))
+        else:
+            db_files.append(p)
+
+    results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for db_path in db_files:
+        cov, cov_inv = compute_cov_inv_from_db(
+            db_path,
+            method=method,
+            ridge=ridge,
+            sample_frac=sample_frac,
+            max_samples=max_samples,
+            random_state=random_state,
+        )
+        results[db_path] = (cov, cov_inv)
+    return results
 
 
 class EpistasisFeatureExtractor:
