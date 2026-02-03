@@ -272,6 +272,14 @@ class EpistasisCache:
         )
 
 
+def _maybe_tqdm(iterable, *, total: Optional[int] = None, desc: str = ""):
+    try:
+        from tqdm import tqdm
+        return tqdm(iterable, total=total, desc=desc)
+    except Exception:
+        return iterable
+
+
 def _list_epistasis_ids_from_db(db) -> List[str]:
     """
     Return epistasis IDs present in DB (based on |WT keys with 2+ pipes).
@@ -314,6 +322,7 @@ def compute_cov_inv_from_db(
     sample_frac: Optional[float] = None,
     max_samples: Optional[int] = None,
     random_state: int = 42,
+    show_progress: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute covariance + inverse from all epistasis residuals in a DB.
@@ -331,7 +340,13 @@ def compute_cov_inv_from_db(
         epi_ids = rng.sample(epi_ids, max_samples)
 
     residuals = []
-    for epi_id in epi_ids:
+    iterator = _maybe_tqdm(
+        epi_ids,
+        total=len(epi_ids),
+        desc=f"Epistasis residuals ({os.path.basename(db_path)})",
+    ) if show_progress else epi_ids
+
+    for epi_id in iterator:
         r = _load_residual_from_db(db, epi_id)
         if r is not None:
             residuals.append(r)
@@ -351,6 +366,7 @@ def compute_cov_inv_from_paths(
     sample_frac: Optional[float] = None,
     max_samples: Optional[int] = None,
     random_state: int = 42,
+    show_progress: bool = True,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     Compute cov_inv for every .db found in provided paths or directories.
@@ -367,7 +383,13 @@ def compute_cov_inv_from_paths(
             db_files.append(p)
 
     results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-    for db_path in db_files:
+    db_iter = _maybe_tqdm(
+        db_files,
+        total=len(db_files),
+        desc="Databases",
+    ) if show_progress else db_files
+
+    for db_path in db_iter:
         cov, cov_inv = compute_cov_inv_from_db(
             db_path,
             method=method,
@@ -375,9 +397,70 @@ def compute_cov_inv_from_paths(
             sample_frac=sample_frac,
             max_samples=max_samples,
             random_state=random_state,
+            show_progress=show_progress,
         )
         results[db_path] = (cov, cov_inv)
     return results
+
+
+def compute_cov_inv_from_paths_combined(
+    paths: Sequence[str],
+    *,
+    method: str = "ledoit_wolf",
+    ridge: float = 1e-6,
+    sample_frac: Optional[float] = None,
+    max_samples: Optional[int] = None,
+    random_state: int = 42,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute a single cov/cov_inv from all epistasis residuals across all DBs.
+    """
+    from .genebeddings import VariantEmbeddingDB
+
+    rng = random.Random(random_state)
+    db_files: List[str] = []
+    for p in paths:
+        if os.path.isdir(p):
+            for name in os.listdir(p):
+                if name.endswith(".db"):
+                    db_files.append(os.path.join(p, name))
+        else:
+            db_files.append(p)
+
+    all_residuals: List[np.ndarray] = []
+    db_iter = _maybe_tqdm(
+        db_files,
+        total=len(db_files),
+        desc="Databases",
+    ) if show_progress else db_files
+
+    for db_path in db_iter:
+        db = VariantEmbeddingDB(db_path)
+        epi_ids = _list_epistasis_ids_from_db(db)
+        if sample_frac is not None:
+            k = max(1, int(len(epi_ids) * sample_frac))
+            epi_ids = rng.sample(epi_ids, k)
+
+        iterator = _maybe_tqdm(
+            epi_ids,
+            total=len(epi_ids),
+            desc=f"Residuals ({os.path.basename(db_path)})",
+        ) if show_progress else epi_ids
+
+        for epi_id in iterator:
+            r = _load_residual_from_db(db, epi_id)
+            if r is not None:
+                all_residuals.append(r)
+        db.close()
+
+    if not all_residuals:
+        raise ValueError("No epistasis residuals found across provided paths")
+
+    if max_samples is not None and len(all_residuals) > max_samples:
+        all_residuals = rng.sample(all_residuals, max_samples)
+
+    return fit_covariance(all_residuals, method=method, ridge=ridge)
 
 
 class EpistasisFeatureExtractor:
