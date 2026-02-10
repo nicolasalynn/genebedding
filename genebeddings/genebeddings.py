@@ -114,6 +114,7 @@ __all__ = [
     "compute_pairwise_epistasis",
     "compute_dependency_map",
     "compute_logodds_dependency_map",
+    "compute_embedding_perturbation_map",
 ]
 
 __version__ = "0.1.0"
@@ -4118,6 +4119,264 @@ def compute_logodds_dependency_map(
         matrix=matrix,
         aggregation="max" if symmetrize else "max_asymmetric",
         metric="logodds",
+        sequence=sequence,
+        details=details,
+    )
+
+
+def _detect_base_token_offset(model, sequence: str) -> int:
+    """
+    Detect the token index of the first base in ``pool='tokens'`` output.
+
+    Mutates the first base and finds the earliest token whose embedding
+    changes, which must be the first base token (e.g. after a BOS token).
+    """
+    alt = "C" if sequence[0] != "C" else "A"
+    seq_probe = alt + sequence[1:]
+
+    tokens_orig = model.embed(sequence, pool="tokens", return_numpy=False)
+    tokens_probe = model.embed(seq_probe, pool="tokens", return_numpy=False)
+
+    tokens_orig = torch.as_tensor(tokens_orig).float()
+    tokens_probe = torch.as_tensor(tokens_probe).float()
+
+    diffs = torch.norm(tokens_orig - tokens_probe, dim=-1)  # (T,)
+    offset = int(torch.argmax((diffs > 0).float()).item())
+    return offset
+
+
+def compute_embedding_perturbation_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    diff: Union[str, DiffFn] = "cosine",
+    aggregation: str = "max",
+    symmetrize: bool = True,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map by measuring embedding perturbation at each token.
+
+    This is the **embedding-space analog** of
+    :func:`compute_logodds_dependency_map`. Instead of asking *"how do the
+    predicted probabilities at j change when I mutate i?"*, it asks *"how
+    does the model's internal representation at j change when I mutate i?"*
+
+    For each ordered pair (i, j):
+
+    1. Embed the original sequence with ``pool='tokens'`` to get per-token
+       representations.
+    2. For each of the 3 alternative nucleotides at position i, mutate i,
+       re-embed with ``pool='tokens'``, and measure the distance between
+       the baseline and mutated embeddings **at token j**.
+    3. Keep the maximum distance across the 3 mutations.
+
+    By default the map is symmetrised:
+    ``D(i, j) = max(D_raw(i, j), D_raw(j, i))``.
+
+    Complexity
+    ----------
+    ``3 + 3·N`` forward passes (3 for offset detection + baseline, then
+    one per mutation), each returning the full token-level embedding.
+    This is the same ``O(N)`` scaling as the log-odds map and dramatically
+    cheaper than the ``O(N²)`` embedding-epistasis map.
+
+    Comparison with other dependency maps
+    --------------------------------------
+    - **Epistasis map** (``compute_dependency_map``): measures deviation
+      from additive expectation — requires the double mutant (M12), so is
+      ``O(N²)``. Captures true *epistasis*.
+    - **Log-odds map** (``compute_logodds_dependency_map``): measures
+      shifts in nucleotide probabilities. Requires an MLM head.
+    - **Embedding perturbation map** (this function): measures shifts in
+      hidden representations. Works with *any* model that supports
+      ``pool='tokens'``, no MLM head required.
+
+    Parameters
+    ----------
+    model : object
+        Model wrapper with ``embed(seq, pool='tokens')`` support.
+    sequence : str
+        Reference DNA/RNA sequence.
+    positions : list[int], optional
+        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
+    start : int, optional
+        Start position (inclusive). Default: 0.
+    end : int, optional
+        End position (exclusive). Default: ``len(sequence)``.
+    step : int, optional
+        Step size between positions. Default: 1.
+    diff : str or callable, optional
+        Distance metric for comparing token embeddings: ``"cosine"``
+        (default) or ``"l2"``, or a callable ``(x, y) -> float``.
+    aggregation : str, optional
+        How to aggregate across the 3 mutations at a query position:
+        ``"max"`` (default) or ``"mean"``.
+    symmetrize : bool, optional
+        If True (default), return ``max(D(i,j), D(j,i))``.
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: False.
+    progress_callback : callable, optional
+        Called with ``(current_step, total_steps, description)``.
+
+    Returns
+    -------
+    DependencyMapResult
+        Object containing the dependency matrix and metadata.
+        ``result.details["D_asymmetric"]`` holds the raw asymmetric matrix.
+
+    Examples
+    --------
+    >>> result = compute_embedding_perturbation_map(
+    ...     model, sequence,
+    ...     positions=[2900, 2950, 3000, 3050, 3100],
+    ...     diff="cosine",
+    ...     show_progress=True,
+    ... )
+    >>> result.plot(title="Embedding perturbation map")
+    >>> result.top_pairs(5)
+    """
+    # ---- Resolve distance function ----
+    if isinstance(diff, str):
+        diff_lower = diff.lower()
+        if diff_lower == "cosine":
+            dist_fn = cosine_distance
+        elif diff_lower == "l2":
+            dist_fn = l2_distance
+        else:
+            raise ValueError(f"Unknown diff metric: {diff!r}")
+        diff_name = diff_lower
+    elif callable(diff):
+        dist_fn = diff
+        diff_name = getattr(diff, "__name__", "custom")
+    else:
+        raise TypeError(f"diff must be str or callable, got {type(diff)}")
+
+    # ---- Determine positions ----
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for a dependency map")
+
+    pos_list = pos_array.tolist()
+
+    for p in pos_list:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(
+                f"Position {p} out of bounds for sequence length "
+                f"{len(sequence)}"
+            )
+
+    nucs = ["A", "C", "G", "T"]
+    k = getattr(model, "k", 1)
+
+    logger.info(
+        "Computing embedding perturbation map: %d positions, diff=%s",
+        n, diff_name,
+    )
+
+    # ---- Detect base-token offset and get baseline embeddings ----
+    offset = _detect_base_token_offset(model, sequence)
+    tokens_wt = model.embed(sequence, pool="tokens", return_numpy=False)
+    tokens_wt = torch.as_tensor(tokens_wt).float()  # (T, H)
+
+    # Map sequence positions to token indices
+    tok_indices = [offset + p // k for p in pos_list]
+
+    T = tokens_wt.shape[0]
+    for p, ti in zip(pos_list, tok_indices):
+        if ti >= T:
+            raise ValueError(
+                f"Position {p} maps to token index {ti} but model "
+                f"only returns {T} tokens"
+            )
+
+    # Extract baseline token embeddings at target positions: (N, H)
+    baseline_tokens = tokens_wt[tok_indices]  # (N, H)
+
+    # ---- Perturb each query position ----
+    D_raw = np.full((n, n), np.nan)
+
+    total_steps = 3 * n
+    step_count = 0
+
+    iterator = range(n)
+    if show_progress:
+        iterator = tqdm(iterator, total=n, desc="Embedding perturbation map")
+
+    for i_idx in iterator:
+        pos_i = int(pos_array[i_idx])
+        ref_i = sequence[pos_i]
+        alts_i = [nt for nt in nucs if nt != ref_i]
+
+        # Accumulate distances across mutations: (n_mutations, N)
+        all_dists = []
+
+        for alt in alts_i:
+            if progress_callback:
+                progress_callback(
+                    step_count, total_steps,
+                    f"pos {pos_i}: {ref_i}>{alt}",
+                )
+            step_count += 1
+
+            mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
+            tokens_mut = model.embed(mutated_seq, pool="tokens", return_numpy=False)
+            tokens_mut = torch.as_tensor(tokens_mut).float()  # (T, H)
+
+            # Extract mutated token embeddings at target positions
+            mut_tokens = tokens_mut[tok_indices]  # (N, H)
+
+            # Compute distance for each target position j
+            dists_j = np.array([
+                dist_fn(baseline_tokens[j], mut_tokens[j])
+                for j in range(n)
+            ])
+            all_dists.append(dists_j)
+
+        all_dists = np.stack(all_dists, axis=0)  # (3, N)
+
+        # Aggregate across mutations
+        if aggregation == "max":
+            D_raw[i_idx, :] = np.max(all_dists, axis=0)
+        elif aggregation == "mean":
+            D_raw[i_idx, :] = np.mean(all_dists, axis=0)
+        else:
+            raise ValueError(f"Unknown aggregation: {aggregation!r}")
+
+        D_raw[i_idx, i_idx] = np.nan
+
+    # ---- Symmetrise ----
+    if symmetrize:
+        matrix = np.fmax(D_raw, D_raw.T)
+    else:
+        matrix = D_raw
+
+    details: dict = {"D_asymmetric": D_raw.copy()}
+
+    logger.info(
+        "Embedding perturbation map complete: %d positions, %d forward passes, "
+        "diff=%s",
+        n, 3 + 3 * n, diff_name,
+    )
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation=aggregation,
+        metric=f"perturbation_{diff_name}",
         sequence=sequence,
         details=details,
     )
