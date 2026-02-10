@@ -1313,3 +1313,384 @@ class MechanismClassifier:
             f"{l}(n={len(self.group_vectors[l])})" for l in self._labels
         )
         return f"MechanismClassifier([{groups}])"
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Mechanism Classifier
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HierarchicalClassificationResult:
+    """Result of a two-level hierarchical classification."""
+
+    mechanism: str
+    pathogenicity: str
+    label: str
+    mechanism_confidence: float
+    pathogenicity_confidence: float
+    mechanism_scores: Dict[str, Dict[str, float]]
+    pathogenicity_scores: Dict[str, Dict[str, float]]
+    delta: Optional[np.ndarray] = field(default=None, repr=False)
+
+    def __repr__(self) -> str:
+        lines = [
+            f"HierarchicalClassificationResult(",
+            f"  mechanism     = {self.mechanism!r} "
+            f"(confidence={self.mechanism_confidence:.3f})",
+            f"  pathogenicity = {self.pathogenicity!r} "
+            f"(confidence={self.pathogenicity_confidence:.3f})",
+            f"  label         = {self.label!r}",
+            f")",
+        ]
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        flat: Dict[str, Any] = {
+            "mechanism": self.mechanism,
+            "pathogenicity": self.pathogenicity,
+            "label": self.label,
+            "mechanism_confidence": self.mechanism_confidence,
+            "pathogenicity_confidence": self.pathogenicity_confidence,
+        }
+        for name, s in self.mechanism_scores.items():
+            for metric, val in s.items():
+                if metric != "name":
+                    flat[f"mech_{name}_{metric}"] = val
+        for name, s in self.pathogenicity_scores.items():
+            for metric, val in s.items():
+                if metric != "name":
+                    flat[f"path_{name}_{metric}"] = val
+        return flat
+
+
+@dataclass
+class HierarchicalValidationResult:
+    """Validation results for each level of the hierarchy."""
+
+    mechanism: ValidationResult
+    pathogenicity: Dict[str, ValidationResult]
+
+    def __repr__(self) -> str:
+        lines = [
+            "HierarchicalValidationResult(",
+            "",
+            "  === Level 1: Mechanism ===",
+            f"  {self.mechanism}",
+        ]
+        for mech, val in self.pathogenicity.items():
+            lines.append("")
+            lines.append(f"  === Level 2: {mech} pathogenicity ===")
+            lines.append(f"  {val}")
+        lines.append(")")
+        return "\n".join(lines)
+
+
+class HierarchicalMechanismClassifier:
+    """
+    Two-level classifier: mechanism type first, then pathogenicity.
+
+    Level 1 separates mutations by mechanism (e.g. splicing vs missense).
+    Level 2 separates benign from pathogenic *within* each mechanism.
+
+    This avoids forcing a single classifier to learn both the mechanism
+    distinction (large signal) and the pathogenicity distinction (subtle
+    signal) simultaneously.
+
+    Parameters
+    ----------
+    groups : dict
+        ``{label: [mut_ids]}``. Labels **must** follow the convention
+        ``"mechanism_pathogenicity"`` (e.g. ``"splicing_benign"``,
+        ``"missense_pathogenic"``). The part before the *last* underscore
+        is the mechanism, the part after is the pathogenicity class.
+    separator : str
+        Character separating mechanism from pathogenicity in the label.
+        Default: ``"_"``.
+
+    Examples
+    --------
+    >>> hclf = HierarchicalMechanismClassifier.from_mutation_groups(
+    ...     {
+    ...         "splicing_benign": splice_b,
+    ...         "splicing_pathogenic": splice_p,
+    ...         "missense_benign": miss_b,
+    ...         "missense_pathogenic": miss_p,
+    ...     },
+    ...     db=db,
+    ...     classifier="lda",
+    ...     show_progress=True,
+    ... )
+    >>> val = hclf.validate(cv=5)
+    >>> print(val)
+    >>> result = hclf.classify_variant("KRAS:12:25227343:G:T:N", db=db)
+    >>> print(result)
+    """
+
+    def __init__(
+        self,
+        mechanism_clf: MechanismClassifier,
+        pathogenicity_clfs: Dict[str, MechanismClassifier],
+        separator: str = "_",
+    ):
+        self.mechanism_clf = mechanism_clf
+        self.pathogenicity_clfs = pathogenicity_clfs
+        self.separator = separator
+        self._mechanisms = list(pathogenicity_clfs.keys())
+
+    @classmethod
+    def from_mutation_groups(
+        cls,
+        groups: Dict[str, List[str]],
+        db=None,
+        model=None,
+        *,
+        separator: str = "_",
+        classifier: str = "lda",
+        normalize: bool = True,
+        variance_ratio: float = 0.9,
+        context: int = _DEFAULT_CONTEXT,
+        genome: str = _DEFAULT_GENOME,
+        pool: str = "mean",
+        save_to_db: bool = True,
+        show_progress: bool = False,
+        **clf_kwargs: Any,
+    ) -> "HierarchicalMechanismClassifier":
+        """
+        Build a hierarchical classifier from labelled groups.
+
+        Parameters
+        ----------
+        groups : dict
+            ``{label: [mut_ids]}`` where each label has the form
+            ``"mechanism_pathogenicity"`` (e.g. ``"splicing_benign"``).
+        db, model, context, genome, pool, save_to_db
+            Passed to :meth:`MechanismClassifier.from_mutation_groups`.
+        separator : str
+            Splits label into (mechanism, pathogenicity). Default ``"_"``.
+        classifier : str
+            Sklearn classifier method for both levels. Default ``"lda"``.
+        normalize : bool
+            Normalize delta vectors. Default True.
+        **clf_kwargs
+            Extra kwargs passed to ``fit_classifier``.
+        """
+        # Parse labels into (mechanism, pathogenicity)
+        parsed: Dict[str, Dict[str, List[str]]] = {}
+        for label, mut_ids in groups.items():
+            idx = label.rfind(separator)
+            if idx == -1:
+                raise ValueError(
+                    f"Label {label!r} does not contain separator "
+                    f"{separator!r}. Expected format: mechanism{separator}pathogenicity"
+                )
+            mechanism = label[:idx]
+            pathogenicity = label[idx + len(separator):]
+
+            if mechanism not in parsed:
+                parsed[mechanism] = {}
+            parsed[mechanism][pathogenicity] = mut_ids
+
+        build_kwargs = dict(
+            db=db, model=model, normalize=normalize,
+            variance_ratio=variance_ratio, context=context,
+            genome=genome, pool=pool, save_to_db=save_to_db,
+            show_progress=show_progress,
+        )
+
+        # Level 1: mechanism classifier (merge pathogenicity classes)
+        mechanism_groups: Dict[str, List[str]] = {}
+        for mechanism, path_dict in parsed.items():
+            all_ids: List[str] = []
+            for ids in path_dict.values():
+                all_ids.extend(ids)
+            mechanism_groups[mechanism] = all_ids
+
+        logger.info("Fitting level 1 (mechanism): %s", list(mechanism_groups.keys()))
+        mechanism_clf = MechanismClassifier.from_mutation_groups(
+            mechanism_groups, **build_kwargs,
+        )
+        mechanism_clf.fit_classifier(classifier, **clf_kwargs)
+
+        # Level 2: per-mechanism pathogenicity classifiers
+        pathogenicity_clfs: Dict[str, MechanismClassifier] = {}
+        for mechanism, path_dict in parsed.items():
+            if len(path_dict) < 2:
+                logger.warning(
+                    "Mechanism %r has only 1 pathogenicity class — "
+                    "skipping level-2 classifier",
+                    mechanism,
+                )
+                continue
+
+            logger.info(
+                "Fitting level 2 (%s pathogenicity): %s",
+                mechanism, list(path_dict.keys()),
+            )
+            path_clf = MechanismClassifier.from_mutation_groups(
+                path_dict, **build_kwargs,
+            )
+            path_clf.fit_classifier(classifier, **clf_kwargs)
+            pathogenicity_clfs[mechanism] = path_clf
+
+        return cls(mechanism_clf, pathogenicity_clfs, separator=separator)
+
+    # ------------------------------------------------------------------ #
+    #  Classification
+    # ------------------------------------------------------------------ #
+
+    def classify(self, delta: np.ndarray) -> HierarchicalClassificationResult:
+        """Classify a delta vector through both hierarchy levels."""
+        # Level 1
+        mech_result = self.mechanism_clf.classify(delta)
+        mechanism = mech_result.best_group
+
+        # Level 2
+        path_clf = self.pathogenicity_clfs.get(mechanism)
+        if path_clf is not None:
+            path_result = path_clf.classify(delta)
+            pathogenicity = path_result.best_group
+            path_confidence = path_result.confidence
+            path_scores = path_result.scores
+        else:
+            pathogenicity = "unknown"
+            path_confidence = float("nan")
+            path_scores = {}
+
+        label = f"{mechanism}{self.separator}{pathogenicity}"
+
+        return HierarchicalClassificationResult(
+            mechanism=mechanism,
+            pathogenicity=pathogenicity,
+            label=label,
+            mechanism_confidence=mech_result.confidence,
+            pathogenicity_confidence=path_confidence,
+            mechanism_scores=mech_result.scores,
+            pathogenicity_scores=path_scores,
+            delta=delta,
+        )
+
+    def classify_variant(
+        self, mut_id: str, db=None, model=None,
+    ) -> HierarchicalClassificationResult:
+        """Load delta and classify through the hierarchy."""
+        delta = _get_delta(
+            mut_id, db=db, model=model,
+            context=self.mechanism_clf.context,
+            genome=self.mechanism_clf.genome,
+            pool=self.mechanism_clf.pool,
+        )
+        if delta is None:
+            raise ValueError(
+                f"Could not load or compute delta for {mut_id!r}"
+            )
+        return self.classify(delta)
+
+    def classify_epistasis(
+        self, epi_id: str, db=None, model=None, which: str = "M1",
+    ) -> HierarchicalClassificationResult:
+        """Load epistasis-leg delta and classify through the hierarchy."""
+        delta = _get_epistasis_delta(
+            epi_id, which=which, db=db, model=model,
+            context=self.mechanism_clf.context,
+            genome=self.mechanism_clf.genome,
+            pool=self.mechanism_clf.pool,
+        )
+        if delta is None:
+            raise ValueError(
+                f"Could not load or compute delta for {epi_id!r}|{which}"
+            )
+        return self.classify(delta)
+
+    def classify_variants(
+        self,
+        mut_ids: List[str],
+        db=None,
+        model=None,
+        *,
+        show_progress: bool = False,
+    ) -> "pd.DataFrame":
+        """Batch-classify variants. Returns a DataFrame."""
+        import pandas as pd
+
+        rows: List[Dict[str, Any]] = []
+        iterator: Iterable = mut_ids
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(mut_ids, desc="Classifying")
+            except ImportError:
+                pass
+
+        for mid in iterator:
+            delta = _get_delta(
+                mid, db=db, model=model,
+                context=self.mechanism_clf.context,
+                genome=self.mechanism_clf.genome,
+                pool=self.mechanism_clf.pool,
+            )
+            if delta is None:
+                logger.warning("Skipping %s", mid)
+                continue
+            result = self.classify(delta)
+            row = {"mut_id": mid, **result.to_dict()}
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------ #
+    #  Validation
+    # ------------------------------------------------------------------ #
+
+    def validate(self, cv: int = 0) -> HierarchicalValidationResult:
+        """
+        Validate both levels of the hierarchy.
+
+        Parameters
+        ----------
+        cv : int
+            Cross-validation folds. 0 = resubstitution only.
+
+        Returns
+        -------
+        HierarchicalValidationResult
+            Contains validation for level 1 (mechanism) and level 2
+            (pathogenicity within each mechanism).
+        """
+        mech_val = self.mechanism_clf.validate(cv=cv)
+
+        path_vals: Dict[str, ValidationResult] = {}
+        for mechanism, path_clf in self.pathogenicity_clfs.items():
+            path_vals[mechanism] = path_clf.validate(cv=cv)
+
+        return HierarchicalValidationResult(
+            mechanism=mech_val,
+            pathogenicity=path_vals,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Plotting
+    # ------------------------------------------------------------------ #
+
+    def plot(self, **kwargs: Any):
+        """Plot all levels. Returns dict of figures."""
+        figs = {}
+        figs["mechanism"] = self.mechanism_clf.plot(
+            title="Level 1: Mechanism", **kwargs,
+        )
+        for mechanism, path_clf in self.pathogenicity_clfs.items():
+            figs[f"{mechanism}_pathogenicity"] = path_clf.plot(
+                title=f"Level 2: {mechanism} pathogenicity", **kwargs,
+            )
+        return figs
+
+    def __repr__(self) -> str:
+        mechs = ", ".join(self._mechanisms)
+        paths = {
+            m: list(c._labels)
+            for m, c in self.pathogenicity_clfs.items()
+        }
+        return (
+            f"HierarchicalMechanismClassifier("
+            f"mechanisms=[{mechs}], pathogenicity={paths})"
+        )
