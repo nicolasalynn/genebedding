@@ -542,6 +542,7 @@ class ValidationResult:
     confusion: Optional[Dict[Tuple[str, str], int]] = field(
         default=None, repr=False
     )
+    cv_accuracy: float = float("nan")
 
     def __repr__(self) -> str:
         lines = [
@@ -549,6 +550,10 @@ class ValidationResult:
             f"  silhouette       = {self.silhouette:.3f},",
             f"  resubstitution   = {self.resubstitution_accuracy:.1%},",
         ]
+        if not math.isnan(self.cv_accuracy):
+            lines.append(
+                f"  cv_accuracy      = {self.cv_accuracy:.1%},"
+            )
         for name, acc in self.per_group_accuracy.items():
             lines.append(
                 f"  {name:20s}: n={self.n_per_group[name]:>4d}, "
@@ -626,6 +631,10 @@ class MechanismClassifier:
         self.genome = genome
         self.pool = pool
         self._labels = [s.name for s in sigset.signatures]
+
+        # Sklearn classifier (populated by fit_classifier)
+        self._clf = None
+        self._clf_method: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     #  Construction
@@ -757,26 +766,154 @@ class MechanismClassifier:
     #  Classification
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    #  Classifier fitting
+    # ------------------------------------------------------------------ #
+
+    def _build_training_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Stack all group vectors into X, y arrays."""
+        all_vecs: List[np.ndarray] = []
+        all_labels: List[int] = []
+        for i, label in enumerate(self._labels):
+            for v in self.group_vectors[label]:
+                all_vecs.append(v)
+                all_labels.append(i)
+        X = np.stack(all_vecs)
+        y = np.array(all_labels)
+        if self.normalize:
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            X = X / (norms + 1e-20)
+        return X, y
+
+    def fit_classifier(
+        self,
+        method: str = "lda",
+        **kwargs: Any,
+    ) -> "MechanismClassifier":
+        """
+        Fit a proper sklearn classifier on the stored group vectors.
+
+        Once fitted, :meth:`classify` automatically uses this classifier
+        instead of the raw signature log-likelihoods (which can be
+        unreliable when groups have different PCA dimensionalities).
+
+        Parameters
+        ----------
+        method : str
+            One of:
+
+            - ``"lda"`` — Linear Discriminant Analysis (shared covariance,
+              works well even with many features). **Recommended default.**
+            - ``"qda"`` — Quadratic Discriminant Analysis (per-class
+              covariance, needs enough samples per class).
+            - ``"logistic"`` — Logistic Regression (L2-regularised).
+            - ``"knn"`` — k-Nearest Neighbours (cosine metric).
+            - ``"nearest_centroid"`` — Nearest centroid (cosine metric,
+              simplest possible).
+        **kwargs
+            Extra keyword arguments passed to the sklearn constructor
+            (e.g. ``n_neighbors=10`` for knn).
+
+        Returns
+        -------
+        self
+            For chaining: ``clf.fit_classifier("lda").validate()``.
+        """
+        X, y = self._build_training_data()
+
+        if method == "lda":
+            from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+            clf = LinearDiscriminantAnalysis(**kwargs)
+        elif method == "qda":
+            from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+            kwargs.setdefault("reg_param", 1e-4)
+            clf = QuadraticDiscriminantAnalysis(**kwargs)
+        elif method == "logistic":
+            from sklearn.linear_model import LogisticRegression
+            kwargs.setdefault("max_iter", 2000)
+            kwargs.setdefault("C", 1.0)
+            clf = LogisticRegression(**kwargs)
+        elif method == "knn":
+            from sklearn.neighbors import KNeighborsClassifier
+            kwargs.setdefault("n_neighbors", 5)
+            kwargs.setdefault("metric", "cosine")
+            clf = KNeighborsClassifier(**kwargs)
+        elif method == "nearest_centroid":
+            from sklearn.neighbors import NearestCentroid
+            kwargs.setdefault("metric", "cosine")
+            clf = NearestCentroid(**kwargs)
+        else:
+            raise ValueError(
+                f"Unknown method {method!r}. Choose from: "
+                "lda, qda, logistic, knn, nearest_centroid"
+            )
+
+        clf.fit(X, y)
+        self._clf = clf
+        self._clf_method = method
+
+        logger.info(
+            "Fitted %s classifier on %d vectors (%d groups)",
+            method, X.shape[0], len(self._labels),
+        )
+        return self
+
+    # ------------------------------------------------------------------ #
+    #  Classification
+    # ------------------------------------------------------------------ #
+
+    def _prep_vector(self, delta: np.ndarray) -> np.ndarray:
+        """Normalise a query vector (if signatures were built normalised)."""
+        v = np.asarray(delta, dtype=np.float64).flatten()
+        if self.normalize:
+            v = v / (np.linalg.norm(v) + 1e-20)
+        return v
+
     def classify(self, delta: np.ndarray) -> ClassificationResult:
         """
         Classify a delta vector against all mechanism signatures.
 
-        Returns the best group by log-likelihood, with per-group scores.
+        If :meth:`fit_classifier` has been called, uses the sklearn
+        classifier for the ``best_group`` decision. Otherwise falls back
+        to raw signature log-likelihoods (which can be unreliable when
+        groups have different PCA dimensions — see :meth:`fit_classifier`).
+
+        Per-group signature scores (alignment, Mahalanobis, log-likelihood,
+        p-value) are always included regardless of classification method.
         """
+        # Always compute per-group signature scores for interpretability
         scores_list = self.sigset.score(delta)
         scores = {s["name"]: s for s in scores_list}
 
-        sorted_by_ll = sorted(
-            scores_list, key=lambda s: s["log_likelihood"], reverse=True
-        )
-        best = sorted_by_ll[0]["name"]
-        if len(sorted_by_ll) > 1:
-            confidence = (
-                sorted_by_ll[0]["log_likelihood"]
-                - sorted_by_ll[1]["log_likelihood"]
-            )
+        # Determine best group
+        if self._clf is not None:
+            # Use the fitted sklearn classifier
+            v = self._prep_vector(delta).reshape(1, -1)
+            pred_idx = int(self._clf.predict(v)[0])
+            best = self._labels[pred_idx]
+
+            # Confidence from predict_proba if available
+            if hasattr(self._clf, "predict_proba"):
+                proba = self._clf.predict_proba(v)[0]
+                sorted_proba = sorted(proba, reverse=True)
+                confidence = float(sorted_proba[0] - sorted_proba[1])
+            else:
+                confidence = float("nan")
         else:
-            confidence = float("inf")
+            # Fallback: raw log-likelihood (warn on first use)
+            sorted_by_ll = sorted(
+                scores_list,
+                key=lambda s: s["log_likelihood"],
+                reverse=True,
+            )
+            best = sorted_by_ll[0]["name"]
+            if len(sorted_by_ll) > 1:
+                confidence = (
+                    sorted_by_ll[0]["log_likelihood"]
+                    - sorted_by_ll[1]["log_likelihood"]
+                )
+            else:
+                confidence = float("inf")
 
         return ClassificationResult(
             best_group=best,
@@ -866,7 +1003,7 @@ class MechanismClassifier:
     #  Validation
     # ------------------------------------------------------------------ #
 
-    def validate(self) -> ValidationResult:
+    def validate(self, cv: int = 0) -> ValidationResult:
         """
         Assess how well-separated the mechanism groups are.
 
@@ -875,22 +1012,23 @@ class MechanismClassifier:
         - **Pairwise centroid cosine distances**: how far apart group
           centroids are.
         - **Resubstitution accuracy**: fraction of training vectors
-          correctly classified by their own fitted signatures.
+          correctly classified (uses fitted sklearn classifier if
+          available, else signature log-likelihoods).
+        - **Cross-validated accuracy** (if ``cv > 0``): stratified k-fold
+          CV using the same classifier method. Much more honest than
+          resubstitution.
         - **Per-group accuracy**: breakdown by group.
         - **Confusion counts**: (true_label, predicted_label) → count.
+
+        Parameters
+        ----------
+        cv : int, optional
+            Number of cross-validation folds. If 0 (default), only
+            resubstitution accuracy is computed. If > 0, adds
+            cross-validated accuracy (requires a fitted classifier via
+            :meth:`fit_classifier`).
         """
-        # Collect all vectors and labels
-        all_vectors: List[np.ndarray] = []
-        all_labels: List[int] = []
-        label_to_idx = {name: i for i, name in enumerate(self._labels)}
-
-        for label in self._labels:
-            for v in self.group_vectors[label]:
-                all_vectors.append(v)
-                all_labels.append(label_to_idx[label])
-
-        X = np.stack(all_vectors)
-        y = np.array(all_labels)
+        X, y = self._build_training_data()
 
         # 1. Silhouette score
         try:
@@ -907,8 +1045,12 @@ class MechanismClassifier:
         # 2. Pairwise centroid cosine distances
         centroids: Dict[str, np.ndarray] = {}
         for label in self._labels:
-            vecs = np.stack(self.group_vectors[label])
-            centroids[label] = vecs.mean(axis=0)
+            vecs = self.group_vectors[label]
+            vecs_arr = np.stack(vecs)
+            if self.normalize:
+                norms = np.linalg.norm(vecs_arr, axis=1, keepdims=True)
+                vecs_arr = vecs_arr / (norms + 1e-20)
+            centroids[label] = vecs_arr.mean(axis=0)
 
         centroid_dists: Dict[Tuple[str, str], float] = {}
         for i, a in enumerate(self._labels):
@@ -950,6 +1092,27 @@ class MechanismClassifier:
             l: len(self.group_vectors[l]) for l in self._labels
         }
 
+        # 4. Cross-validated accuracy (optional)
+        cv_accuracy = float("nan")
+        if cv > 0 and self._clf is not None:
+            try:
+                from sklearn.model_selection import StratifiedKFold, cross_val_score
+                skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+                # Build a fresh classifier of the same type
+                clf_clone = self._clf.__class__(
+                    **self._clf.get_params()
+                )
+                cv_scores = cross_val_score(
+                    clf_clone, X, y, cv=skf, scoring="accuracy",
+                )
+                cv_accuracy = float(cv_scores.mean())
+                logger.info(
+                    "CV accuracy (%d-fold): %.1f%% (+/- %.1f%%)",
+                    cv, cv_accuracy * 100, cv_scores.std() * 100,
+                )
+            except Exception as e:
+                logger.warning("Cross-validation failed: %s", e)
+
         return ValidationResult(
             silhouette=sil,
             centroid_distances=centroid_dists,
@@ -957,6 +1120,7 @@ class MechanismClassifier:
             per_group_accuracy=per_group_acc,
             n_per_group=n_per_group,
             confusion=confusion,
+            cv_accuracy=cv_accuracy,
         )
 
     # ------------------------------------------------------------------ #
