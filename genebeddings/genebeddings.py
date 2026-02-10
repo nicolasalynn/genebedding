@@ -115,7 +115,6 @@ __all__ = [
     "compute_dependency_map",
     "compute_logodds_dependency_map",
     "compute_embedding_perturbation_map",
-    "compute_effect_geometry_map",
 ]
 
 __version__ = "0.1.0"
@@ -4129,8 +4128,11 @@ def _detect_base_token_offset(model, sequence: str) -> int:
     """
     Detect the token index of the first base in ``pool='tokens'`` output.
 
-    Mutates the first base and finds the earliest token whose embedding
-    changes, which must be the first base token (e.g. after a BOS token).
+    Mutates the first base and finds the token whose embedding changes
+    **the most**, which must be the first base token (e.g. after a BOS
+    token).  In attention-based models every token representation shifts
+    when any input changes, so we cannot simply look for the first
+    non-zero difference — we need the *largest* difference.
     """
     alt = "C" if sequence[0] != "C" else "A"
     seq_probe = alt + sequence[1:]
@@ -4142,7 +4144,7 @@ def _detect_base_token_offset(model, sequence: str) -> int:
     tokens_probe = torch.as_tensor(tokens_probe).float()
 
     diffs = torch.norm(tokens_orig - tokens_probe, dim=-1)  # (T,)
-    offset = int(torch.argmax((diffs > 0).float()).item())
+    offset = int(torch.argmax(diffs).item())
     return offset
 
 
@@ -4378,292 +4380,6 @@ def compute_embedding_perturbation_map(
         matrix=matrix,
         aggregation=aggregation,
         metric=f"perturbation_{diff_name}",
-        sequence=sequence,
-        details=details,
-    )
-
-
-def compute_effect_geometry_map(
-    model,
-    sequence: str,
-    positions: Optional[list[int]] = None,
-    start: Optional[int] = None,
-    end: Optional[int] = None,
-    step: int = 1,
-    metric: str = "cos_v1_v2",
-    aggregation: str = "max",
-    symmetrize: bool = True,
-    diff: Union[str, DiffFn] = "cosine",
-    eps: float = DEFAULT_EPS,
-    pool: str = "mean",
-    show_progress: bool = False,
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
-) -> DependencyMapResult:
-    """
-    Compute a dependency map from single-mutant effect vector geometry.
-
-    This uses the **same geometric framework** as
-    :class:`EpistasisGeometry` but only requires single-mutant embeddings
-    (no double mutants). For each pair (i, j) it computes properties of
-    the effect vectors ``v_i = h_mut_i − h_wt`` and ``v_j = h_mut_j − h_wt``
-    that are informative about potential epistasis.
-
-    Available metrics (all computable without the double mutant):
-
-    - ``"cos_v1_v2"``: Absolute cosine similarity of effect vectors,
-      ``|cos(v_i, v_j)|``. This is the same ``cos_v1_v2`` reported by
-      :meth:`EpistasisGeometry.metrics`. Values near 1 mean the two
-      mutations push the embedding in the same (or opposite) direction.
-    - ``"interaction_potential"``: ``||v_i|| · ||v_j|| · |cos(v_i, v_j)|``.
-      Large when both mutations have strong, aligned effects — a
-      prerequisite for detectable epistasis.
-    - ``"additive_magnitude"``: ``||v_i + v_j||``, the expected combined
-      effect under additivity. Tells you how big the double-mutant effect
-      would be if there were *no* epistasis.
-    - ``"effect_product"``: ``||v_i|| · ||v_j||``, pure magnitude product.
-      Large when both positions are individually consequential.
-
-    Complexity
-    ----------
-    ``1 + 3·N`` forward passes to compute all single-mutant embeddings.
-    Pairwise scores are then computed from cached vectors in pure numpy
-    (essentially free). This makes it dramatically faster than
-    :func:`compute_dependency_map` which requires ``O(N²)`` double-mutant
-    embeddings.
-
-    Relationship to epistasis
-    -------------------------
-    The full epistasis residual ``||h_m12 − (h_wt + v_i + v_j)||``
-    requires the double-mutant embedding ``h_m12`` and cannot be
-    approximated without it. This function instead computes geometric
-    properties of the single-mutant effect vectors that are **necessary
-    conditions** for epistasis (e.g., aligned effects) but are not
-    sufficient on their own.
-
-    Parameters
-    ----------
-    model : object
-        Model with ``embed(seq, pool=...) -> array`` method.
-    sequence : str
-        Reference DNA/RNA sequence.
-    positions : list[int], optional
-        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
-    start : int, optional
-        Start position (inclusive). Default: 0.
-    end : int, optional
-        End position (exclusive). Default: ``len(sequence)``.
-    step : int, optional
-        Step size between positions. Default: 1.
-    metric : str, optional
-        Scoring metric (see above). Default: ``"cos_v1_v2"``.
-    aggregation : str, optional
-        How to aggregate across the 3 × 3 mutation combinations per pair:
-        ``"max"`` (default) or ``"mean"``.
-    symmetrize : bool, optional
-        If True (default), return ``max(D(i,j), D(j,i))``. In practice
-        these metrics are already symmetric, so this mainly affects
-        ``"additive_magnitude"`` where alt choices differ.
-    diff : str or callable, optional
-        Distance function used for effect-vector norms when ``metric``
-        is ``"effect_product"`` or ``"interaction_potential"``. Default:
-        ``"cosine"`` (uses cosine distance from WT). ``"l2"`` uses
-        Euclidean distance.
-    eps : float, optional
-        Numerical stability constant. Default: 1e-20.
-    pool : str, optional
-        Pooling strategy for embeddings. Default: ``"mean"``.
-    show_progress : bool, optional
-        Show tqdm progress bar. Default: False.
-    progress_callback : callable, optional
-        Called with ``(current_step, total_steps, description)``.
-
-    Returns
-    -------
-    DependencyMapResult
-        Object containing the dependency matrix and metadata.
-        ``result.details["effect_vectors"]`` maps ``(pos, alt) → v``
-        so you can inspect or reuse the cached single-mutant effects.
-
-    Examples
-    --------
-    >>> result = compute_effect_geometry_map(
-    ...     model, sequence,
-    ...     positions=[2900, 2950, 3000, 3050, 3100],
-    ...     metric="cos_v1_v2",
-    ...     show_progress=True,
-    ... )
-    >>> result.plot(title="Effect vector alignment map")
-    >>> result.top_pairs(5)
-
-    >>> # Compare multiple metrics
-    >>> for m in ["cos_v1_v2", "interaction_potential", "additive_magnitude"]:
-    ...     r = compute_effect_geometry_map(model, seq, positions=pos, metric=m)
-    ...     r.plot(title=m)
-    """
-    VALID_METRICS = {
-        "cos_v1_v2", "interaction_potential",
-        "additive_magnitude", "effect_product",
-    }
-    if metric not in VALID_METRICS:
-        raise ValueError(
-            f"Unknown metric {metric!r}. Choose from: {sorted(VALID_METRICS)}"
-        )
-
-    # ---- Resolve distance function (for magnitude metrics) ----
-    if isinstance(diff, str):
-        diff_lower = diff.lower()
-        if diff_lower == "cosine":
-            dist_fn = lambda x, y: cosine_distance(x, y, eps)
-        elif diff_lower == "l2":
-            dist_fn = lambda x, y: l2_distance(x, y, eps)
-        else:
-            raise ValueError(f"Unknown diff metric: {diff!r}")
-        diff_name = diff_lower
-    elif callable(diff):
-        dist_fn = diff
-        diff_name = getattr(diff, "__name__", "custom")
-    else:
-        raise TypeError(f"diff must be str or callable, got {type(diff)}")
-
-    # ---- Determine positions ----
-    if positions is not None:
-        pos_array = np.array(sorted(positions))
-    else:
-        if start is None:
-            start = 0
-        if end is None:
-            end = len(sequence)
-        pos_array = np.arange(start, end, step)
-
-    n = len(pos_array)
-    if n < 2:
-        raise ValueError("Need at least 2 positions for a dependency map")
-
-    pos_list = pos_array.tolist()
-    for p in pos_list:
-        if p < 0 or p >= len(sequence):
-            raise ValueError(
-                f"Position {p} out of bounds for sequence length "
-                f"{len(sequence)}"
-            )
-
-    nucs = ["A", "C", "G", "T"]
-
-    logger.info(
-        "Computing effect geometry map: %d positions, metric=%s, "
-        "1 + %d embeddings",
-        n, metric, 3 * n,
-    )
-
-    # ---- Step 1: compute WT and all single-mutant embeddings ----
-    h_wt_raw = model.embed(sequence, pool=pool)
-    h_wt = torch.as_tensor(h_wt_raw).float().flatten()
-
-    # Cache: (pos, alt) -> effect vector v = h_mut - h_wt
-    effect_vectors: dict[tuple[int, str], torch.Tensor] = {}
-
-    total_embeds = 3 * n
-    embed_count = 0
-
-    iterator = range(n)
-    if show_progress:
-        iterator = tqdm(
-            iterator, total=n,
-            desc="Effect geometry: computing single mutants",
-        )
-
-    for i_idx in iterator:
-        pos_i = int(pos_array[i_idx])
-        ref_i = sequence[pos_i]
-        alts_i = [nt for nt in nucs if nt != ref_i]
-
-        for alt in alts_i:
-            if progress_callback:
-                progress_callback(
-                    embed_count, total_embeds,
-                    f"pos {pos_i}: {ref_i}>{alt}",
-                )
-            embed_count += 1
-
-            seq_mut = sequence[:pos_i] + alt + sequence[pos_i + 1:]
-            h_mut_raw = model.embed(seq_mut, pool=pool)
-            h_mut = torch.as_tensor(h_mut_raw).float().flatten()
-
-            effect_vectors[(pos_i, alt)] = h_mut - h_wt
-
-    # ---- Step 2: compute pairwise scores from cached vectors ----
-    matrix = np.full((n, n), np.nan)
-
-    for i_idx in range(n):
-        pos_i = int(pos_array[i_idx])
-        ref_i = sequence[pos_i]
-        alts_i = [nt for nt in nucs if nt != ref_i]
-
-        for j_idx in range(n):
-            if i_idx == j_idx:
-                continue
-
-            pos_j = int(pos_array[j_idx])
-            ref_j = sequence[pos_j]
-            alts_j = [nt for nt in nucs if nt != ref_j]
-
-            scores = []
-            for alt_i in alts_i:
-                v_i = effect_vectors[(pos_i, alt_i)]
-                norm_i = torch.norm(v_i).item()
-
-                for alt_j in alts_j:
-                    v_j = effect_vectors[(pos_j, alt_j)]
-                    norm_j = torch.norm(v_j).item()
-
-                    # Cosine similarity
-                    denom = norm_i * norm_j + eps
-                    cos_sim = float(torch.dot(v_i, v_j) / denom)
-                    cos_sim = max(min(cos_sim, 1.0), -1.0)
-
-                    if metric == "cos_v1_v2":
-                        scores.append(abs(cos_sim))
-
-                    elif metric == "interaction_potential":
-                        scores.append(norm_i * norm_j * abs(cos_sim))
-
-                    elif metric == "additive_magnitude":
-                        scores.append(float(torch.norm(v_i + v_j)))
-
-                    elif metric == "effect_product":
-                        scores.append(norm_i * norm_j)
-
-            # Aggregate across mutation combinations
-            if aggregation == "max":
-                matrix[i_idx, j_idx] = max(scores)
-            elif aggregation == "mean":
-                matrix[i_idx, j_idx] = sum(scores) / len(scores)
-            else:
-                raise ValueError(f"Unknown aggregation: {aggregation!r}")
-
-    # ---- Step 3: symmetrise ----
-    D_raw = matrix.copy()
-    if symmetrize:
-        matrix = np.fmax(matrix, matrix.T)
-
-    details: dict = {
-        "D_asymmetric": D_raw,
-        "effect_vectors": {
-            k: v.detach().cpu().numpy() for k, v in effect_vectors.items()
-        },
-    }
-
-    logger.info(
-        "Effect geometry map complete: %d positions, %d embeddings, "
-        "metric=%s",
-        n, 1 + 3 * n, metric,
-    )
-
-    return DependencyMapResult(
-        positions=pos_array,
-        matrix=matrix,
-        aggregation=aggregation,
-        metric=metric,
         sequence=sequence,
         details=details,
     )
