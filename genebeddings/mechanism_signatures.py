@@ -261,6 +261,9 @@ def score_cases(
 # Delta loading helpers
 # ---------------------------------------------------------------------------
 
+_DEFAULT_CONTEXT = 3000
+_DEFAULT_GENOME = "hg38"
+
 
 def _load_delta_from_db(db, mut_id: str) -> Optional[np.ndarray]:
     """
@@ -269,6 +272,8 @@ def _load_delta_from_db(db, mut_id: str) -> Optional[np.ndarray]:
     Tries ``{mut_id}|WT`` / ``{mut_id}|MUT`` first, then falls back to
     loading ``mut_id`` directly (in case the delta was stored as-is).
     """
+    if db is None:
+        return None
     wt_key = f"{mut_id}|WT"
     mut_key = f"{mut_id}|MUT"
     try:
@@ -295,6 +300,8 @@ def _load_epistasis_delta_from_db(
     Returns ``embed(which) − embed(WT)`` where *which* is ``"M1"``,
     ``"M2"``, or ``"M12"``.
     """
+    if db is None:
+        return None
     wt_key = f"{epi_id}|WT"
     mut_key = f"{epi_id}|{which}"
     try:
@@ -302,6 +309,178 @@ def _load_epistasis_delta_from_db(
         z_mut = np.asarray(db.load(mut_key, as_torch=False), dtype=np.float64)
         return z_mut - z_wt
     except Exception:
+        return None
+
+
+def _compute_single_variant_delta(
+    model,
+    mut_id: str,
+    *,
+    context: int = _DEFAULT_CONTEXT,
+    genome: str = _DEFAULT_GENOME,
+    pool: str = "mean",
+) -> Optional[np.ndarray]:
+    """
+    Compute delta on the fly from genomic coordinates using a model.
+
+    Parses *mut_id* (``GENE:CHROM:POS:REF:ALT[:STRAND]``), fetches the
+    reference sequence, applies the mutation, and returns
+    ``embed(mutant) − embed(wildtype)`` as a numpy array.
+    """
+    try:
+        from .genebeddings import parse_single_mut_id, _embed_single_variant_direct
+        chrom, pos, ref, alt, rev = parse_single_mut_id(mut_id)
+        _h_wt, _h_mut, delta = _embed_single_variant_direct(
+            model, chrom, pos, ref, alt,
+            reverse_complement=rev,
+            context=context,
+            genome=genome,
+            pool=pool,
+        )
+        return np.asarray(delta, dtype=np.float64).flatten()
+    except Exception as e:
+        logger.warning("Failed to compute delta for %s: %s", mut_id, e)
+        return None
+
+
+def _compute_epistasis_delta(
+    model,
+    epi_id: str,
+    which: str = "M1",
+    *,
+    context: int = _DEFAULT_CONTEXT,
+    genome: str = _DEFAULT_GENOME,
+    pool: str = "mean",
+) -> Optional[np.ndarray]:
+    """
+    Compute epistasis-leg delta on the fly using a model.
+
+    Parses *epi_id*, embeds WT and the four genotypes, and returns
+    ``embed(which) − embed(WT)`` as a numpy array.
+    """
+    try:
+        from .genebeddings import parse_epistasis_id, _embed_epistasis_direct
+        (chrom, pos1, ref1, alt1, rev), (_, pos2, ref2, alt2, _) = (
+            parse_epistasis_id(epi_id)
+        )
+        h_wt, h_m1, h_m2, h_m12 = _embed_epistasis_direct(
+            model, chrom, pos1, ref1, alt1, pos2, ref2, alt2,
+            reverse_complement=rev,
+            context=context,
+            genome=genome,
+            pool=pool,
+        )
+        which_map = {"WT": h_wt, "M1": h_m1, "M2": h_m2, "M12": h_m12}
+        h = which_map.get(which)
+        if h is None:
+            raise ValueError(f"Unknown which={which!r}")
+        delta = np.asarray(h, dtype=np.float64).flatten() - np.asarray(h_wt, dtype=np.float64).flatten()
+        return delta
+    except Exception as e:
+        logger.warning("Failed to compute epistasis delta for %s|%s: %s", epi_id, which, e)
+        return None
+
+
+def _get_delta(
+    mut_id: str,
+    db=None,
+    model=None,
+    *,
+    context: int = _DEFAULT_CONTEXT,
+    genome: str = _DEFAULT_GENOME,
+    pool: str = "mean",
+    save_to_db: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    Get single-variant delta: try DB first, fall back to model.
+
+    If *model* computes the delta and *save_to_db* is True, the WT and
+    MUT embeddings are stored in the DB for next time.
+    """
+    # Try DB first
+    delta = _load_delta_from_db(db, mut_id)
+    if delta is not None:
+        return delta
+
+    # Compute with model
+    if model is None:
+        return None
+
+    delta = _compute_single_variant_delta(
+        model, mut_id, context=context, genome=genome, pool=pool,
+    )
+    if delta is None:
+        return None
+
+    # Optionally cache in DB
+    if save_to_db and db is not None:
+        try:
+            from .genebeddings import parse_single_mut_id, _embed_single_variant_direct
+            chrom, pos, ref, alt, rev = parse_single_mut_id(mut_id)
+            h_wt, h_mut, _ = _embed_single_variant_direct(
+                model, chrom, pos, ref, alt,
+                reverse_complement=rev,
+                context=context,
+                genome=genome,
+                pool=pool,
+            )
+            db.store(f"{mut_id}|WT", h_wt)
+            db.store(f"{mut_id}|MUT", h_mut)
+        except Exception:
+            pass  # caching is best-effort
+
+    return delta
+
+
+def _get_epistasis_delta(
+    epi_id: str,
+    which: str = "M1",
+    db=None,
+    model=None,
+    *,
+    context: int = _DEFAULT_CONTEXT,
+    genome: str = _DEFAULT_GENOME,
+    pool: str = "mean",
+    save_to_db: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    Get epistasis-leg delta: try DB first, fall back to model.
+
+    If *model* computes the embeddings and *save_to_db* is True, all
+    four embeddings (WT, M1, M2, M12) are stored in the DB.
+    """
+    delta = _load_epistasis_delta_from_db(db, epi_id, which=which)
+    if delta is not None:
+        return delta
+
+    if model is None:
+        return None
+
+    # Compute all four and cache
+    try:
+        from .genebeddings import parse_epistasis_id, _embed_epistasis_direct
+        (chrom, pos1, ref1, alt1, rev), (_, pos2, ref2, alt2, _) = (
+            parse_epistasis_id(epi_id)
+        )
+        h_wt, h_m1, h_m2, h_m12 = _embed_epistasis_direct(
+            model, chrom, pos1, ref1, alt1, pos2, ref2, alt2,
+            reverse_complement=rev,
+            context=context,
+            genome=genome,
+            pool=pool,
+        )
+        if save_to_db and db is not None:
+            db.store(f"{epi_id}|WT", h_wt)
+            db.store(f"{epi_id}|M1", h_m1)
+            db.store(f"{epi_id}|M2", h_m2)
+            db.store(f"{epi_id}|M12", h_m12)
+
+        which_map = {"WT": h_wt, "M1": h_m1, "M2": h_m2, "M12": h_m12}
+        h = which_map[which]
+        delta = np.asarray(h, dtype=np.float64).flatten() - np.asarray(h_wt, dtype=np.float64).flatten()
+        return delta
+    except Exception as e:
+        logger.warning("Failed to compute epistasis delta for %s|%s: %s", epi_id, which, e)
         return None
 
 
@@ -434,12 +613,18 @@ class MechanismClassifier:
         group_ids: Dict[str, List[str]],
         normalize: bool = True,
         variance_ratio: float = 0.9,
+        context: int = _DEFAULT_CONTEXT,
+        genome: str = _DEFAULT_GENOME,
+        pool: str = "mean",
     ):
         self.sigset = sigset
         self.group_vectors = group_vectors
         self.group_ids = group_ids
         self.normalize = normalize
         self.variance_ratio = variance_ratio
+        self.context = context
+        self.genome = genome
+        self.pool = pool
         self._labels = [s.name for s in sigset.signatures]
 
     # ------------------------------------------------------------------ #
@@ -450,10 +635,15 @@ class MechanismClassifier:
     def from_mutation_groups(
         cls,
         groups: Dict[str, List[str]],
-        db,
+        db=None,
+        model=None,
         *,
         normalize: bool = True,
         variance_ratio: float = 0.9,
+        context: int = _DEFAULT_CONTEXT,
+        genome: str = _DEFAULT_GENOME,
+        pool: str = "mean",
+        save_to_db: bool = True,
         show_progress: bool = False,
         eps: float = 1e-20,
     ) -> "MechanismClassifier":
@@ -465,12 +655,26 @@ class MechanismClassifier:
         groups : dict
             ``{label: [mut_ids]}``, e.g.
             ``{"splicing": [...], "expression": [...]}``.
-        db : VariantEmbeddingDB
-            Database containing precomputed embeddings.
+        db : VariantEmbeddingDB, optional
+            Database containing precomputed embeddings. If a variant is
+            found here, the model is not called.
+        model : object, optional
+            Model with ``.embed(seq, pool=...)`` method. Used as fallback
+            when a variant is not in *db*. If both *db* and *model* are
+            None, raises on any missing variant.
         normalize : bool
             Normalize delta vectors before fitting. Default: True.
         variance_ratio : float
             PCA variance ratio for each signature. Default: 0.9.
+        context : int
+            Context window for on-the-fly embedding. Default: 3000.
+        genome : str
+            Genome assembly. Default: ``"hg38"``.
+        pool : str
+            Pooling strategy. Default: ``"mean"``.
+        save_to_db : bool
+            If True and *model* computes a new embedding, store it in
+            *db* for next time. Default: True.
         show_progress : bool
             Show tqdm progress bar. Default: False.
         """
@@ -491,8 +695,23 @@ class MechanismClassifier:
                     pass
 
             n_skipped = 0
+            n_computed = 0
+            n_from_db = 0
             for mid in iterator:
+                # Try DB first
                 delta = _load_delta_from_db(db, mid)
+                if delta is not None:
+                    n_from_db += 1
+                else:
+                    # Compute with model
+                    delta = _get_delta(
+                        mid, db=db, model=model,
+                        context=context, genome=genome, pool=pool,
+                        save_to_db=save_to_db,
+                    )
+                    if delta is not None:
+                        n_computed += 1
+
                 if delta is not None:
                     vectors.append(delta)
                     valid_ids.append(mid)
@@ -507,8 +726,14 @@ class MechanismClassifier:
 
             if n_skipped:
                 logger.warning(
-                    "Group %r: %d/%d variants skipped (missing in DB)",
+                    "Group %r: %d/%d variants skipped (not in DB and "
+                    "could not be computed)",
                     label, n_skipped, len(mut_ids),
+                )
+            if n_computed:
+                logger.info(
+                    "Group %r: %d variants computed on the fly",
+                    label, n_computed,
                 )
 
             group_vectors[label] = vectors
@@ -523,7 +748,10 @@ class MechanismClassifier:
             signatures.append(sig)
 
         sigset = MechanismSignatureSet(signatures)
-        return cls(sigset, group_vectors, group_ids, normalize, variance_ratio)
+        return cls(
+            sigset, group_vectors, group_ids, normalize, variance_ratio,
+            context=context, genome=genome, pool=pool,
+        )
 
     # ------------------------------------------------------------------ #
     #  Classification
@@ -557,31 +785,52 @@ class MechanismClassifier:
             delta=delta,
         )
 
-    def classify_variant(self, mut_id: str, db) -> ClassificationResult:
-        """Load a single-variant delta from DB and classify."""
-        delta = _load_delta_from_db(db, mut_id)
+    def classify_variant(
+        self,
+        mut_id: str,
+        db=None,
+        model=None,
+    ) -> ClassificationResult:
+        """
+        Load a single-variant delta from DB (or compute with model)
+        and classify.
+        """
+        delta = _get_delta(
+            mut_id, db=db, model=model,
+            context=self.context, genome=self.genome, pool=self.pool,
+        )
         if delta is None:
-            raise ValueError(f"Could not load delta for {mut_id!r}")
+            raise ValueError(
+                f"Could not load or compute delta for {mut_id!r}"
+            )
         return self.classify(delta)
 
     def classify_epistasis(
         self,
         epi_id: str,
-        db,
+        db=None,
+        model=None,
         which: str = "M1",
     ) -> ClassificationResult:
-        """Load an epistasis-leg delta from DB and classify."""
-        delta = _load_epistasis_delta_from_db(db, epi_id, which=which)
+        """
+        Load an epistasis-leg delta from DB (or compute with model)
+        and classify.
+        """
+        delta = _get_epistasis_delta(
+            epi_id, which=which, db=db, model=model,
+            context=self.context, genome=self.genome, pool=self.pool,
+        )
         if delta is None:
             raise ValueError(
-                f"Could not load delta for {epi_id!r}|{which}"
+                f"Could not load or compute delta for {epi_id!r}|{which}"
             )
         return self.classify(delta)
 
     def classify_variants(
         self,
         mut_ids: List[str],
-        db,
+        db=None,
+        model=None,
         *,
         show_progress: bool = False,
     ) -> "pd.DataFrame":
@@ -600,9 +849,12 @@ class MechanismClassifier:
                 pass
 
         for mid in iterator:
-            delta = _load_delta_from_db(db, mid)
+            delta = _get_delta(
+                mid, db=db, model=model,
+                context=self.context, genome=self.genome, pool=self.pool,
+            )
             if delta is None:
-                logger.warning("Skipping %s (not in DB)", mid)
+                logger.warning("Skipping %s (not in DB/model)", mid)
                 continue
             result = self.classify(delta)
             row = {"mut_id": mid, **result.to_dict()}
