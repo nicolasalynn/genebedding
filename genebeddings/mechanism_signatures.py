@@ -6,13 +6,16 @@ curated sets of effect vectors, and scores new vectors against them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import logging
 import math
 
 import numpy as np
 
 from .epistasis_features import EpistasisCase, compute_core_vectors
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_rows(x: np.ndarray, eps: float) -> np.ndarray:
@@ -252,3 +255,645 @@ def score_cases(
     except ImportError as e:
         raise ImportError("pandas is required for score_cases") from e
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Delta loading helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_delta_from_db(db, mut_id: str) -> Optional[np.ndarray]:
+    """
+    Load delta (MUT − WT) from database for a single variant.
+
+    Tries ``{mut_id}|WT`` / ``{mut_id}|MUT`` first, then falls back to
+    loading ``mut_id`` directly (in case the delta was stored as-is).
+    """
+    wt_key = f"{mut_id}|WT"
+    mut_key = f"{mut_id}|MUT"
+    try:
+        z_wt = np.asarray(db.load(wt_key, as_torch=False), dtype=np.float64)
+        z_mut = np.asarray(db.load(mut_key, as_torch=False), dtype=np.float64)
+        return z_mut - z_wt
+    except Exception:
+        pass
+    # Fallback: delta stored directly under the mut_id
+    try:
+        return np.asarray(db.load(mut_id, as_torch=False), dtype=np.float64)
+    except Exception:
+        return None
+
+
+def _load_epistasis_delta_from_db(
+    db,
+    epi_id: str,
+    which: str = "M1",
+) -> Optional[np.ndarray]:
+    """
+    Load delta for one leg of an epistasis pair.
+
+    Returns ``embed(which) − embed(WT)`` where *which* is ``"M1"``,
+    ``"M2"``, or ``"M12"``.
+    """
+    wt_key = f"{epi_id}|WT"
+    mut_key = f"{epi_id}|{which}"
+    try:
+        z_wt = np.asarray(db.load(wt_key, as_torch=False), dtype=np.float64)
+        z_mut = np.asarray(db.load(mut_key, as_torch=False), dtype=np.float64)
+        return z_mut - z_wt
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Classification result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClassificationResult:
+    """Result of classifying a variant against mechanism signatures."""
+
+    best_group: str
+    scores: Dict[str, Dict[str, float]]
+    confidence: float
+    delta: Optional[np.ndarray] = field(default=None, repr=False)
+
+    def __repr__(self) -> str:
+        lines = [
+            f"ClassificationResult(best={self.best_group!r}, "
+            f"confidence={self.confidence:.3f})",
+        ]
+        for name, s in self.scores.items():
+            lines.append(
+                f"  {name}: LL={s['log_likelihood']:.2f}, "
+                f"mahal={s['mahalanobis']:.2f}, "
+                f"align={s['alignment']:.3f}, "
+                f"p={s['p_value']:.4f}"
+            )
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Flatten to a single dict (useful for DataFrame rows)."""
+        flat: Dict[str, Any] = {
+            "best_group": self.best_group,
+            "confidence": self.confidence,
+        }
+        for name, s in self.scores.items():
+            for metric, val in s.items():
+                if metric != "name":
+                    flat[f"{name}_{metric}"] = val
+        return flat
+
+
+# ---------------------------------------------------------------------------
+# Validation result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationResult:
+    """Summary of how well-separated the mechanism groups are."""
+
+    silhouette: float
+    centroid_distances: Dict[Tuple[str, str], float]
+    resubstitution_accuracy: float
+    per_group_accuracy: Dict[str, float]
+    n_per_group: Dict[str, int]
+    confusion: Optional[Dict[Tuple[str, str], int]] = field(
+        default=None, repr=False
+    )
+
+    def __repr__(self) -> str:
+        lines = [
+            f"ValidationResult(",
+            f"  silhouette       = {self.silhouette:.3f},",
+            f"  resubstitution   = {self.resubstitution_accuracy:.1%},",
+        ]
+        for name, acc in self.per_group_accuracy.items():
+            lines.append(
+                f"  {name:20s}: n={self.n_per_group[name]:>4d}, "
+                f"acc={acc:.1%}"
+            )
+        for (a, b), d in self.centroid_distances.items():
+            lines.append(f"  centroid_cos_dist({a}, {b}) = {d:.4f}")
+        lines.append(")")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MechanismClassifier
+# ---------------------------------------------------------------------------
+
+
+class MechanismClassifier:
+    """
+    Fit mechanism signatures from labelled mutation groups, validate
+    separation, and classify new variants.
+
+    Workflow
+    --------
+    1. Build from a dict of ``{label: [mut_ids]}``:
+
+       >>> clf = MechanismClassifier.from_mutation_groups(
+       ...     {"splicing": splice_ids, "expression": expr_ids},
+       ...     db=my_db,
+       ...     show_progress=True,
+       ... )
+
+    2. Validate separation:
+
+       >>> val = clf.validate()
+       >>> print(val)
+
+    3. Visualise:
+
+       >>> clf.plot()
+
+    4. Classify a new variant:
+
+       >>> result = clf.classify_variant("KRAS:12:25227343:G:T:N", db)
+       >>> print(result)
+
+    5. Classify an epistasis leg:
+
+       >>> result = clf.classify_epistasis(
+       ...     "KRAS:12:25227343:G:T:N|KRAS:12:25227344:A:C:N",
+       ...     db, which="M1",
+       ... )
+
+    6. Batch classify:
+
+       >>> df = clf.classify_variants(mut_ids, db)
+    """
+
+    def __init__(
+        self,
+        sigset: MechanismSignatureSet,
+        group_vectors: Dict[str, List[np.ndarray]],
+        group_ids: Dict[str, List[str]],
+        normalize: bool = True,
+        variance_ratio: float = 0.9,
+    ):
+        self.sigset = sigset
+        self.group_vectors = group_vectors
+        self.group_ids = group_ids
+        self.normalize = normalize
+        self.variance_ratio = variance_ratio
+        self._labels = [s.name for s in sigset.signatures]
+
+    # ------------------------------------------------------------------ #
+    #  Construction
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def from_mutation_groups(
+        cls,
+        groups: Dict[str, List[str]],
+        db,
+        *,
+        normalize: bool = True,
+        variance_ratio: float = 0.9,
+        show_progress: bool = False,
+        eps: float = 1e-20,
+    ) -> "MechanismClassifier":
+        """
+        Build a classifier from labelled mutation groups.
+
+        Parameters
+        ----------
+        groups : dict
+            ``{label: [mut_ids]}``, e.g.
+            ``{"splicing": [...], "expression": [...]}``.
+        db : VariantEmbeddingDB
+            Database containing precomputed embeddings.
+        normalize : bool
+            Normalize delta vectors before fitting. Default: True.
+        variance_ratio : float
+            PCA variance ratio for each signature. Default: 0.9.
+        show_progress : bool
+            Show tqdm progress bar. Default: False.
+        """
+        group_vectors: Dict[str, List[np.ndarray]] = {}
+        group_ids: Dict[str, List[str]] = {}
+        signatures: List[MechanismSignature] = []
+
+        for label, mut_ids in groups.items():
+            vectors: List[np.ndarray] = []
+            valid_ids: List[str] = []
+
+            iterator: Iterable = mut_ids
+            if show_progress:
+                try:
+                    from tqdm import tqdm
+                    iterator = tqdm(mut_ids, desc=f"Loading {label}")
+                except ImportError:
+                    pass
+
+            n_skipped = 0
+            for mid in iterator:
+                delta = _load_delta_from_db(db, mid)
+                if delta is not None:
+                    vectors.append(delta)
+                    valid_ids.append(mid)
+                else:
+                    n_skipped += 1
+
+            if not vectors:
+                raise ValueError(
+                    f"No valid deltas found for group {label!r} "
+                    f"({len(mut_ids)} ids provided)"
+                )
+
+            if n_skipped:
+                logger.warning(
+                    "Group %r: %d/%d variants skipped (missing in DB)",
+                    label, n_skipped, len(mut_ids),
+                )
+
+            group_vectors[label] = vectors
+            group_ids[label] = valid_ids
+
+            sig = fit_signature(
+                vectors,
+                name=label,
+                normalize=normalize,
+                variance_ratio=variance_ratio,
+            )
+            signatures.append(sig)
+
+        sigset = MechanismSignatureSet(signatures)
+        return cls(sigset, group_vectors, group_ids, normalize, variance_ratio)
+
+    # ------------------------------------------------------------------ #
+    #  Classification
+    # ------------------------------------------------------------------ #
+
+    def classify(self, delta: np.ndarray) -> ClassificationResult:
+        """
+        Classify a delta vector against all mechanism signatures.
+
+        Returns the best group by log-likelihood, with per-group scores.
+        """
+        scores_list = self.sigset.score(delta)
+        scores = {s["name"]: s for s in scores_list}
+
+        sorted_by_ll = sorted(
+            scores_list, key=lambda s: s["log_likelihood"], reverse=True
+        )
+        best = sorted_by_ll[0]["name"]
+        if len(sorted_by_ll) > 1:
+            confidence = (
+                sorted_by_ll[0]["log_likelihood"]
+                - sorted_by_ll[1]["log_likelihood"]
+            )
+        else:
+            confidence = float("inf")
+
+        return ClassificationResult(
+            best_group=best,
+            scores=scores,
+            confidence=confidence,
+            delta=delta,
+        )
+
+    def classify_variant(self, mut_id: str, db) -> ClassificationResult:
+        """Load a single-variant delta from DB and classify."""
+        delta = _load_delta_from_db(db, mut_id)
+        if delta is None:
+            raise ValueError(f"Could not load delta for {mut_id!r}")
+        return self.classify(delta)
+
+    def classify_epistasis(
+        self,
+        epi_id: str,
+        db,
+        which: str = "M1",
+    ) -> ClassificationResult:
+        """Load an epistasis-leg delta from DB and classify."""
+        delta = _load_epistasis_delta_from_db(db, epi_id, which=which)
+        if delta is None:
+            raise ValueError(
+                f"Could not load delta for {epi_id!r}|{which}"
+            )
+        return self.classify(delta)
+
+    def classify_variants(
+        self,
+        mut_ids: List[str],
+        db,
+        *,
+        show_progress: bool = False,
+    ) -> "pd.DataFrame":
+        """
+        Batch-classify a list of single variants. Returns a DataFrame.
+        """
+        import pandas as pd
+
+        rows: List[Dict[str, Any]] = []
+        iterator: Iterable = mut_ids
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(mut_ids, desc="Classifying")
+            except ImportError:
+                pass
+
+        for mid in iterator:
+            delta = _load_delta_from_db(db, mid)
+            if delta is None:
+                logger.warning("Skipping %s (not in DB)", mid)
+                continue
+            result = self.classify(delta)
+            row = {"mut_id": mid, **result.to_dict()}
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------ #
+    #  Validation
+    # ------------------------------------------------------------------ #
+
+    def validate(self) -> ValidationResult:
+        """
+        Assess how well-separated the mechanism groups are.
+
+        Computes:
+        - **Silhouette score** (cosine): global cluster quality [-1, 1].
+        - **Pairwise centroid cosine distances**: how far apart group
+          centroids are.
+        - **Resubstitution accuracy**: fraction of training vectors
+          correctly classified by their own fitted signatures.
+        - **Per-group accuracy**: breakdown by group.
+        - **Confusion counts**: (true_label, predicted_label) → count.
+        """
+        # Collect all vectors and labels
+        all_vectors: List[np.ndarray] = []
+        all_labels: List[int] = []
+        label_to_idx = {name: i for i, name in enumerate(self._labels)}
+
+        for label in self._labels:
+            for v in self.group_vectors[label]:
+                all_vectors.append(v)
+                all_labels.append(label_to_idx[label])
+
+        X = np.stack(all_vectors)
+        y = np.array(all_labels)
+
+        # 1. Silhouette score
+        try:
+            from sklearn.metrics import silhouette_score
+
+            if len(set(y)) > 1 and len(y) > len(set(y)):
+                sil = float(silhouette_score(X, y, metric="cosine"))
+            else:
+                sil = float("nan")
+        except ImportError:
+            logger.warning("sklearn not available; skipping silhouette")
+            sil = float("nan")
+
+        # 2. Pairwise centroid cosine distances
+        centroids: Dict[str, np.ndarray] = {}
+        for label in self._labels:
+            vecs = np.stack(self.group_vectors[label])
+            centroids[label] = vecs.mean(axis=0)
+
+        centroid_dists: Dict[Tuple[str, str], float] = {}
+        for i, a in enumerate(self._labels):
+            for b in self._labels[i + 1 :]:
+                ca, cb = centroids[a], centroids[b]
+                cos_sim = float(
+                    np.dot(ca, cb)
+                    / (np.linalg.norm(ca) * np.linalg.norm(cb) + 1e-20)
+                )
+                centroid_dists[(a, b)] = 1.0 - cos_sim
+
+        # 3. Resubstitution accuracy + confusion
+        correct = 0
+        total = 0
+        per_group_correct: Dict[str, int] = {l: 0 for l in self._labels}
+        per_group_total: Dict[str, int] = {l: 0 for l in self._labels}
+        confusion: Dict[Tuple[str, str], int] = {}
+        for a in self._labels:
+            for b in self._labels:
+                confusion[(a, b)] = 0
+
+        for label in self._labels:
+            for v in self.group_vectors[label]:
+                result = self.classify(v)
+                predicted = result.best_group
+                confusion[(label, predicted)] += 1
+                if predicted == label:
+                    correct += 1
+                    per_group_correct[label] += 1
+                total += 1
+                per_group_total[label] += 1
+
+        resub_acc = correct / max(total, 1)
+        per_group_acc = {
+            l: per_group_correct[l] / max(per_group_total[l], 1)
+            for l in self._labels
+        }
+        n_per_group = {
+            l: len(self.group_vectors[l]) for l in self._labels
+        }
+
+        return ValidationResult(
+            silhouette=sil,
+            centroid_distances=centroid_dists,
+            resubstitution_accuracy=resub_acc,
+            per_group_accuracy=per_group_acc,
+            n_per_group=n_per_group,
+            confusion=confusion,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Plotting
+    # ------------------------------------------------------------------ #
+
+    def plot(
+        self,
+        *,
+        method: str = "pca",
+        query_deltas: Optional[Dict[str, np.ndarray]] = None,
+        figsize: Tuple[float, float] = (10, 8),
+        title: str = "",
+        show: bool = True,
+    ):
+        """
+        Visualise groups in 2-D (PCA or UMAP).
+
+        Parameters
+        ----------
+        method : str
+            ``"pca"`` (default) or ``"umap"``.
+        query_deltas : dict, optional
+            ``{label: delta_vector}`` — additional query points to overlay
+            on the plot (shown as stars).
+        figsize : tuple
+            Figure size.
+        title : str
+            Plot title.
+        show : bool
+            Call ``plt.show()``.
+        """
+        import matplotlib.pyplot as plt
+
+        # Collect data
+        all_vectors: List[np.ndarray] = []
+        all_labels: List[str] = []
+        for label in self._labels:
+            for v in self.group_vectors[label]:
+                all_vectors.append(v)
+                all_labels.append(label)
+
+        X = np.stack(all_vectors)
+
+        # Normalize if the signatures were fitted normalized
+        if self.normalize:
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            X = X / (norms + 1e-20)
+
+        # Reduce to 2-D
+        if method == "umap":
+            try:
+                from umap import UMAP
+                reducer = UMAP(n_components=2, metric="cosine", random_state=42)
+                coords = reducer.fit_transform(X)
+            except ImportError:
+                logger.warning("umap not installed, falling back to PCA")
+                method = "pca"
+
+        if method == "pca":
+            from sklearn.decomposition import PCA
+            reducer = PCA(n_components=2)
+            coords = reducer.fit_transform(X)
+
+        # Prepare query points
+        query_coords = {}
+        if query_deltas:
+            for qname, qvec in query_deltas.items():
+                qv = np.asarray(qvec, dtype=np.float64).reshape(1, -1)
+                if self.normalize:
+                    qv = qv / (np.linalg.norm(qv) + 1e-20)
+                if method == "pca":
+                    query_coords[qname] = reducer.transform(qv)[0]
+                else:
+                    # For UMAP, use transform if available
+                    try:
+                        query_coords[qname] = reducer.transform(qv)[0]
+                    except Exception:
+                        query_coords[qname] = None
+
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+
+        colors = plt.cm.Set1(np.linspace(0, 1, max(len(self._labels), 3)))
+        label_to_color = {l: colors[i] for i, l in enumerate(self._labels)}
+
+        for label in self._labels:
+            mask = [l == label for l in all_labels]
+            pts = coords[mask]
+            ax.scatter(
+                pts[:, 0], pts[:, 1],
+                c=[label_to_color[label]],
+                label=f"{label} (n={len(pts)})",
+                alpha=0.6,
+                s=30,
+                edgecolors="white",
+                linewidths=0.3,
+            )
+
+        # Overlay queries
+        if query_coords:
+            for qname, qc in query_coords.items():
+                if qc is not None:
+                    ax.scatter(
+                        [qc[0]], [qc[1]],
+                        marker="*",
+                        s=300,
+                        c="black",
+                        edgecolors="gold",
+                        linewidths=1.5,
+                        zorder=10,
+                        label=f"query: {qname}",
+                    )
+
+        ax.legend(framealpha=0.9)
+        ax.set_xlabel(f"{method.upper()} 1")
+        ax.set_ylabel(f"{method.upper()} 2")
+        ax.set_title(title or f"Mechanism groups ({method.upper()})")
+        plt.tight_layout()
+
+        if show:
+            plt.show()
+
+        return fig
+
+    def plot_confusion(
+        self,
+        validation: Optional[ValidationResult] = None,
+        *,
+        figsize: Tuple[float, float] = (8, 6),
+        title: str = "",
+        show: bool = True,
+    ):
+        """
+        Plot the confusion matrix from validation.
+
+        Parameters
+        ----------
+        validation : ValidationResult, optional
+            If None, runs ``self.validate()`` first.
+        """
+        import matplotlib.pyplot as plt
+
+        if validation is None:
+            validation = self.validate()
+
+        n = len(self._labels)
+        matrix = np.zeros((n, n), dtype=int)
+        for i, true_l in enumerate(self._labels):
+            for j, pred_l in enumerate(self._labels):
+                matrix[i, j] = validation.confusion.get(
+                    (true_l, pred_l), 0
+                )
+
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(matrix, cmap="Blues", aspect="equal")
+        plt.colorbar(im, ax=ax, label="Count")
+
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(self._labels, rotation=45, ha="right")
+        ax.set_yticklabels(self._labels)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+
+        # Annotate cells
+        for i in range(n):
+            for j in range(n):
+                ax.text(
+                    j, i, str(matrix[i, j]),
+                    ha="center", va="center",
+                    color="white" if matrix[i, j] > matrix.max() / 2 else "black",
+                    fontsize=12,
+                )
+
+        ax.set_title(title or "Resubstitution confusion matrix")
+        plt.tight_layout()
+
+        if show:
+            plt.show()
+
+        return fig
+
+    # ------------------------------------------------------------------ #
+    #  Repr
+    # ------------------------------------------------------------------ #
+
+    def __repr__(self) -> str:
+        groups = ", ".join(
+            f"{l}(n={len(self.group_vectors[l])})" for l in self._labels
+        )
+        return f"MechanismClassifier([{groups}])"
