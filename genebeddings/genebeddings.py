@@ -102,6 +102,7 @@ __all__ = [
     # DataFrame integration
     "add_single_variant_metrics",
     "add_epistasis_metrics",
+    "add_conditional_nucleotide_probs",
     # Parsing utilities
     "parse_single_mut_id",
     "parse_epistasis_id",
@@ -3196,6 +3197,244 @@ def add_epistasis_metrics(
     logger.info(
         "Epistasis metrics: %d processed (%d computed, %d loaded), %d skipped",
         n_processed, n_computed, n_loaded, n_skipped
+    )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Conditional Nucleotide Probability Analysis (RiNALMo / MLM)
+# ---------------------------------------------------------------------------
+
+
+def add_conditional_nucleotide_probs(
+    df: "pd.DataFrame",
+    model,
+    id_col: str = "epistasis_id",
+    chrom_col: Optional[str] = None,
+    pos1_col: Optional[str] = None,
+    ref1_col: Optional[str] = None,
+    alt1_col: Optional[str] = None,
+    pos2_col: Optional[str] = None,
+    ref2_col: Optional[str] = None,
+    alt2_col: Optional[str] = None,
+    strand_col: Optional[str] = None,
+    reverse_complement: bool = False,
+    context: int = DEFAULT_CONTEXT,
+    genome: str = DEFAULT_GENOME,
+    prefix: str = "",
+    inplace: bool = False,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> "pd.DataFrame":
+    """
+    Probe conditional nucleotide dependencies between epistatic positions.
+
+    For each epistasis pair (pos1, pos2), this function:
+    1. Fetches the reference sequence around both positions
+    2. For each nucleotide N1 in {A, C, G, T}, sets pos1 = N1
+    3. Masks pos2 and queries the model for P(pos2 | pos1 = N1)
+    4. Records the full 4-nucleotide probability distribution at pos2
+
+    This reveals how the identity at site 1 influences the model's belief
+    about site 2 — a direct probe of learned pairwise dependencies.
+
+    Adds columns
+    -------------
+    - ``{prefix}ref1_nuc``: Reference nucleotide at pos1 (in sequence orientation)
+    - ``{prefix}ref2_nuc``: Reference nucleotide at pos2 (in sequence orientation)
+    - ``{prefix}{N1}_{N2}`` for N1, N2 in {A, C, G, T}:
+        P(pos2 = N2 | pos1 = N1). 16 columns total forming a 4×4
+        conditional probability matrix.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing epistasis data.
+    model : object
+        Model wrapper with a ``predict_nucleotides(seq, positions)`` method
+        (e.g. ``RiNALMoWrapper``).
+    id_col : str, optional
+        Column with epistasis IDs (format: mut1|mut2). Default: ``"epistasis_id"``.
+    chrom_col : str, optional
+        Column with chromosome. If None, parsed from *id_col*.
+    pos1_col, pos2_col : str, optional
+        Columns with genomic positions. If None, parsed from *id_col*.
+    ref1_col, ref2_col : str, optional
+        Columns with reference alleles. If None, parsed from *id_col*.
+    alt1_col, alt2_col : str, optional
+        Columns with alternate alleles. If None, parsed from *id_col*.
+    strand_col : str, optional
+        Column with strand info (``"+"/"-"``). Overrides *reverse_complement*.
+    reverse_complement : bool, optional
+        Default strand orientation. ``True`` = negative strand. Default: ``False``.
+    context : int, optional
+        Context window size (bp flanking each position). Default: 3000.
+    genome : str, optional
+        Genome assembly. Default: ``"hg38"``.
+    prefix : str, optional
+        Prefix for new column names. Default: ``""``.
+    inplace : bool, optional
+        Modify DataFrame in place. Default: ``False``.
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: ``False``.
+    progress_callback : callable, optional
+        Called with ``(current_index, total, epistasis_id)`` for progress.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with added conditional probability columns.
+
+    Examples
+    --------
+    >>> from genebeddings.wrappers.rinalmo_wrapper import RiNALMoWrapper
+    >>> model = RiNALMoWrapper("giga-v1")
+    >>> df = add_conditional_nucleotide_probs(df, model, show_progress=True)
+    >>> # Each row now has 16 probability columns, e.g.:
+    >>> df[["A_A", "A_C", "A_G", "A_T"]].head()  # P(pos2 | pos1=A)
+    """
+    _require_pandas()
+    import pandas as pd
+    from seqmat import SeqMat
+
+    if id_col not in df.columns:
+        raise ValueError(f"Column {id_col!r} not found in DataFrame")
+
+    if not hasattr(model, "predict_nucleotides"):
+        raise TypeError(
+            f"Model {type(model).__name__} does not have a predict_nucleotides method. "
+            "This function requires a masked-language model wrapper (e.g. RiNALMoWrapper)."
+        )
+
+    if not inplace:
+        df = df.copy()
+
+    nucs = ["A", "C", "G", "T"]
+
+    # Build column names: 16 probability cols + 2 ref nucleotide cols
+    prob_col_names = [f"{prefix}{n1}_{n2}" for n1 in nucs for n2 in nucs]
+    meta_col_names = [f"{prefix}ref1_nuc", f"{prefix}ref2_nuc"]
+    all_new_cols = meta_col_names + prob_col_names
+
+    new_cols_df = pd.DataFrame(
+        {c: (np.nan if c in prob_col_names else "") for c in all_new_cols},
+        index=df.index,
+    )
+    df = pd.concat([df, new_cols_df], axis=1)
+
+    n_processed = 0
+    n_skipped = 0
+    total = len(df)
+
+    iterator = df.iterrows()
+    if show_progress:
+        iterator = tqdm(iterator, total=total, desc="Conditional nucleotide probs")
+
+    for i, (idx, row) in enumerate(iterator):
+        epi_id = row[id_col]
+
+        if progress_callback:
+            progress_callback(i, total, str(epi_id))
+
+        # ---- Parse coordinates (same logic as add_epistasis_metrics) ----
+        use_columns = (
+            chrom_col and pos1_col and ref1_col and alt1_col
+            and pos2_col and ref2_col and alt2_col
+        )
+
+        if use_columns:
+            chrom = str(row[chrom_col])
+            pos1 = int(row[pos1_col])
+            ref1 = str(row[ref1_col])
+            alt1 = str(row[alt1_col])
+            pos2 = int(row[pos2_col])
+            ref2 = str(row[ref2_col])
+            alt2 = str(row[alt2_col])
+            rev_from_id = None
+        else:
+            try:
+                (chrom, pos1, ref1, alt1, rev1), (_, pos2, ref2, alt2, rev2) = (
+                    parse_epistasis_id(epi_id)
+                )
+                rev_from_id = rev1
+            except ValueError as e:
+                logger.warning("Cannot parse %s: %s", epi_id, e)
+                n_skipped += 1
+                continue
+
+        # Determine strand
+        if strand_col and strand_col in df.columns:
+            rev = _parse_strand(row[strand_col])
+        elif rev_from_id is not None:
+            rev = rev_from_id
+        else:
+            rev = reverse_complement
+
+        # ---- Fetch reference sequence ----
+        try:
+            p_min = min(pos1, pos2)
+            p_max = max(pos1, pos2)
+            start = p_min - context
+            end = p_max + context - 1
+
+            s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
+            if rev:
+                s.reverse_complement()
+
+            ref_seq = s.seq
+        except Exception as e:
+            logger.warning("Failed to fetch sequence for %s: %s", epi_id, e)
+            n_skipped += 1
+            continue
+
+        # ---- Compute 0-based offsets into the sequence string ----
+        if rev:
+            idx1 = end - pos1
+            idx2 = end - pos2
+        else:
+            idx1 = pos1 - start
+            idx2 = pos2 - start
+
+        if not (0 <= idx1 < len(ref_seq)) or not (0 <= idx2 < len(ref_seq)):
+            logger.warning(
+                "Position out of bounds for %s: idx1=%d, idx2=%d, seq_len=%d",
+                epi_id, idx1, idx2, len(ref_seq),
+            )
+            n_skipped += 1
+            continue
+
+        # Record reference nucleotides (in sequence orientation)
+        df.at[idx, f"{prefix}ref1_nuc"] = ref_seq[idx1]
+        df.at[idx, f"{prefix}ref2_nuc"] = ref_seq[idx2]
+
+        # ---- For each nucleotide at pos1, get distribution at masked pos2 ----
+        try:
+            for n1 in nucs:
+                # Build sequence with n1 at pos1
+                seq_list = list(ref_seq)
+                seq_list[idx1] = n1
+                mutated_seq = "".join(seq_list)
+
+                # Query model: mask pos2 and get nucleotide probabilities
+                probs = model.predict_nucleotides(
+                    mutated_seq, positions=[idx2], return_dict=True
+                )
+                # probs is a list of 1 dict: [{'A': p, 'C': p, 'G': p, 'T': p}]
+                prob_dict = probs[0]
+
+                for n2 in nucs:
+                    df.at[idx, f"{prefix}{n1}_{n2}"] = prob_dict.get(n2, float("nan"))
+        except Exception as e:
+            logger.warning("Failed predict_nucleotides for %s: %s", epi_id, e)
+            n_skipped += 1
+            continue
+
+        n_processed += 1
+
+    logger.info(
+        "Conditional nucleotide probs: %d processed, %d skipped (of %d total)",
+        n_processed, n_skipped, total,
     )
 
     return df
