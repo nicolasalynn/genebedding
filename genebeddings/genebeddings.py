@@ -113,6 +113,7 @@ __all__ = [
     "DependencyMapResult",
     "compute_pairwise_epistasis",
     "compute_dependency_map",
+    "compute_logodds_dependency_map",
 ]
 
 __version__ = "0.1.0"
@@ -3877,6 +3878,246 @@ def compute_dependency_map(
         matrix=matrix,
         aggregation=aggregation,
         metric=metric,
+        sequence=sequence,
+        details=details,
+    )
+
+
+def compute_logodds_dependency_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    symmetrize: bool = True,
+    eps: float = 1e-10,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    store_details: bool = False,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map using masked-language-model log-odds.
+
+    For each ordered pair (i, j) the score D(i, j) is computed as follows:
+
+    1. **Baseline**: mask position j in the original sequence and obtain the
+       model's predicted nucleotide distribution P_base(j).
+    2. **Perturbation**: for each of the 3 alternative nucleotides at
+       position i, mutate i, mask j, and obtain the new distribution
+       P_mut(j).
+    3. **Log-odds**: for every nucleotide n at j, compute
+       ``log(P_mut(j, n) / P_base(j, n))``.
+    4. **Aggregate**: keep the largest absolute log-odds across the 4
+       nucleotides at j, then take the maximum across the 3 mutations at i.
+
+    By default the map is symmetrised: ``D_sym(i, j) = max(D(i, j), D(j, i))``.
+
+    Complexity
+    ----------
+    The function makes ``1 + 3·N`` calls to ``predict_nucleotides``, each
+    batching up to N masked positions internally (one forward pass per call).
+    This is much cheaper than the ``O(N²)`` approach of calling per-pair.
+
+    Parameters
+    ----------
+    model : object
+        Model wrapper with a ``predict_nucleotides(seq, positions,
+        return_dict=True)`` method (e.g. ``RiNALMoWrapper``).
+    sequence : str
+        Reference DNA/RNA sequence.
+    positions : list[int], optional
+        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
+    start : int, optional
+        Start position (inclusive). Default: 0.
+    end : int, optional
+        End position (exclusive). Default: ``len(sequence)``.
+    step : int, optional
+        Step size between positions. Default: 1.
+    symmetrize : bool, optional
+        If True (default), return ``max(D(i,j), D(j,i))``. If False,
+        return the raw asymmetric matrix.
+    eps : float, optional
+        Small constant added to probabilities before taking the log to
+        avoid ``log(0)``. Default: 1e-10.
+    show_progress : bool, optional
+        Show a tqdm progress bar. Default: False.
+    progress_callback : callable, optional
+        Called with ``(current_step, total_steps, description)``.
+    store_details : bool, optional
+        If True, store per-pair baseline and mutant distributions in
+        ``result.details``. Useful for inspection but memory-intensive
+        for large position sets. Default: False.
+
+    Returns
+    -------
+    DependencyMapResult
+        Object containing the dependency matrix and metadata.
+        ``result.details["D_asymmetric"]`` always contains the raw
+        asymmetric matrix before symmetrisation.
+
+    Examples
+    --------
+    >>> from genebeddings.wrappers.rinalmo_wrapper import RiNALMoWrapper
+    >>> model = RiNALMoWrapper("giga-v1")
+    >>> result = compute_logodds_dependency_map(
+    ...     model, sequence,
+    ...     positions=[2900, 2950, 3000, 3050, 3100],
+    ...     show_progress=True,
+    ... )
+    >>> result.plot(title="Log-odds dependency map")
+    >>> result.top_pairs(5)
+    """
+    if not hasattr(model, "predict_nucleotides"):
+        raise TypeError(
+            f"Model {type(model).__name__} does not have a predict_nucleotides "
+            "method. This function requires a masked-language model wrapper "
+            "(e.g. RiNALMoWrapper)."
+        )
+
+    # ---- Determine positions ----
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for a dependency map")
+
+    pos_list = pos_array.tolist()
+
+    for p in pos_list:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(
+                f"Position {p} out of bounds for sequence length {len(sequence)}"
+            )
+
+    nucs = ["A", "C", "G", "T"]
+
+    logger.info(
+        "Computing log-odds dependency map: %d positions (%d baseline + "
+        "%d mutation calls)",
+        n, 1, 3 * n,
+    )
+
+    # ---- Step 1: baseline distributions (one batched call) ----
+    baseline_dicts = model.predict_nucleotides(
+        sequence, positions=pos_list, return_dict=True
+    )
+    # baseline_dicts: list of N dicts  [{'A': p, 'C': p, 'G': p, 'T': p}, ...]
+    baseline_matrix = np.array(
+        [[d[nt] for nt in nucs] for d in baseline_dicts]
+    )  # (N, 4)
+
+    # ---- Step 2: perturb each query position, read all targets ----
+    D_raw = np.full((n, n), np.nan)  # asymmetric D(i, j)
+
+    details: dict = {}
+
+    total_steps = 3 * n  # 3 mutations per query position
+    step_count = 0
+
+    iterator = range(n)
+    if show_progress:
+        iterator = tqdm(iterator, total=n, desc="Log-odds dependency map")
+
+    for i_idx in iterator:
+        pos_i = int(pos_array[i_idx])
+        ref_i = sequence[pos_i]
+        alts_i = [nt for nt in nucs if nt != ref_i]
+
+        # Accumulate max |log-odds| across the 3 mutations at i,
+        # separately for each target j.
+        max_logodds_per_j = np.zeros(n)
+
+        for alt in alts_i:
+            if progress_callback:
+                progress_callback(
+                    step_count, total_steps,
+                    f"pos {pos_i}: {ref_i}>{alt}",
+                )
+            step_count += 1
+
+            # Build mutated sequence (only pos_i changes)
+            mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
+
+            # Get distributions at ALL target positions in one call
+            mut_dicts = model.predict_nucleotides(
+                mutated_seq, positions=pos_list, return_dict=True
+            )
+            mut_matrix = np.array(
+                [[d[nt] for nt in nucs] for d in mut_dicts]
+            )  # (N, 4)
+
+            # Log-odds per (target, nucleotide)
+            log_odds = np.log(
+                (mut_matrix + eps) / (baseline_matrix + eps)
+            )  # (N, 4)
+
+            # Max absolute log-odds across the 4 nucleotides at each target
+            max_abs = np.max(np.abs(log_odds), axis=1)  # (N,)
+
+            # Keep running max across the 3 mutations at i
+            max_logodds_per_j = np.maximum(max_logodds_per_j, max_abs)
+
+            # Optional: store per-mutation detail
+            if store_details:
+                for j_idx in range(n):
+                    if j_idx == i_idx:
+                        continue
+                    pos_j = int(pos_array[j_idx])
+                    key = (pos_i, pos_j)
+                    if key not in details:
+                        details[key] = {
+                            "ref_i": ref_i,
+                            "ref_j": sequence[pos_j],
+                            "baseline_probs": {
+                                nt: float(baseline_matrix[j_idx, k])
+                                for k, nt in enumerate(nucs)
+                            },
+                            "mutations": [],
+                        }
+                    details[key]["mutations"].append({
+                        "alt_i": alt,
+                        "mutant_probs": {
+                            nt: float(mut_matrix[j_idx, k])
+                            for k, nt in enumerate(nucs)
+                        },
+                        "log_odds": {
+                            nt: float(log_odds[j_idx, k])
+                            for k, nt in enumerate(nucs)
+                        },
+                        "max_abs_logodds": float(max_abs[j_idx]),
+                    })
+
+        # Write row i of asymmetric matrix
+        D_raw[i_idx, :] = max_logodds_per_j
+        D_raw[i_idx, i_idx] = np.nan  # no self-dependency
+
+    # ---- Step 3: symmetrise ----
+    if symmetrize:
+        matrix = np.fmax(D_raw, D_raw.T)  # element-wise max, NaN-safe
+    else:
+        matrix = D_raw
+
+    # Always store the asymmetric matrix so users can inspect directionality
+    details["D_asymmetric"] = D_raw.copy()
+
+    logger.info(
+        "Log-odds dependency map complete: %d positions, %d model calls",
+        n, 1 + 3 * n,
+    )
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation="max" if symmetrize else "max_asymmetric",
+        metric="logodds",
         sequence=sequence,
         details=details,
     )
