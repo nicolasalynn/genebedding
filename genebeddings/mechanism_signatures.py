@@ -381,6 +381,43 @@ def _compute_epistasis_delta(
         return None
 
 
+def _is_epistasis_id(mut_id: str) -> bool:
+    """Return True if *mut_id* looks like an epistasis pair (``mut1|mut2``)."""
+    parts = mut_id.split("|")
+    return len(parts) == 2 and ":" in parts[0] and ":" in parts[1]
+
+
+def _get_delta_auto(
+    mut_id: str,
+    db=None,
+    model=None,
+    which: str = "M1",
+    *,
+    context: int = _DEFAULT_CONTEXT,
+    genome: str = _DEFAULT_GENOME,
+    pool: str = "mean",
+    save_to_db: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    Auto-detect single variant vs epistasis ID and load/compute delta.
+
+    If *mut_id* contains ``|`` separating two mutations, it is treated
+    as an epistasis pair and the *which* leg (``"M1"``, ``"M2"``, or
+    ``"M12"``) is used.  Otherwise treated as a single variant.
+    """
+    if _is_epistasis_id(mut_id):
+        return _get_epistasis_delta(
+            mut_id, which=which, db=db, model=model,
+            context=context, genome=genome, pool=pool,
+            save_to_db=save_to_db,
+        )
+    return _get_delta(
+        mut_id, db=db, model=model,
+        context=context, genome=genome, pool=pool,
+        save_to_db=save_to_db,
+    )
+
+
 def _get_delta(
     mut_id: str,
     db=None,
@@ -927,13 +964,16 @@ class MechanismClassifier:
         mut_id: str,
         db=None,
         model=None,
+        which: str = "M1",
     ) -> ClassificationResult:
         """
-        Load a single-variant delta from DB (or compute with model)
-        and classify.
+        Load a variant delta from DB (or compute with model) and classify.
+
+        Auto-detects epistasis IDs (containing ``|``). For epistasis,
+        *which* selects the leg (``"M1"``, ``"M2"``, or ``"M12"``).
         """
-        delta = _get_delta(
-            mut_id, db=db, model=model,
+        delta = _get_delta_auto(
+            mut_id, db=db, model=model, which=which,
             context=self.context, genome=self.genome, pool=self.pool,
         )
         if delta is None:
@@ -968,11 +1008,14 @@ class MechanismClassifier:
         mut_ids: List[str],
         db=None,
         model=None,
+        which: str = "M1",
         *,
         show_progress: bool = False,
     ) -> "pd.DataFrame":
         """
-        Batch-classify a list of single variants. Returns a DataFrame.
+        Batch-classify a list of variants. Returns a DataFrame.
+
+        Handles both single-variant and epistasis IDs automatically.
         """
         import pandas as pd
 
@@ -986,8 +1029,8 @@ class MechanismClassifier:
                 pass
 
         for mid in iterator:
-            delta = _get_delta(
-                mid, db=db, model=model,
+            delta = _get_delta_auto(
+                mid, db=db, model=model, which=which,
                 context=self.context, genome=self.genome, pool=self.pool,
             )
             if delta is None:
@@ -1571,11 +1614,15 @@ class HierarchicalMechanismClassifier:
         )
 
     def classify_variant(
-        self, mut_id: str, db=None, model=None,
+        self, mut_id: str, db=None, model=None, which: str = "M1",
     ) -> HierarchicalClassificationResult:
-        """Load delta and classify through the hierarchy."""
-        delta = _get_delta(
-            mut_id, db=db, model=model,
+        """Load delta and classify through the hierarchy.
+
+        Auto-detects epistasis IDs (containing ``|``). For epistasis,
+        *which* selects the leg (``"M1"``, ``"M2"``, or ``"M12"``).
+        """
+        delta = _get_delta_auto(
+            mut_id, db=db, model=model, which=which,
             context=self.mechanism_clf.context,
             genome=self.mechanism_clf.genome,
             pool=self.mechanism_clf.pool,
@@ -1607,10 +1654,14 @@ class HierarchicalMechanismClassifier:
         mut_ids: List[str],
         db=None,
         model=None,
+        which: str = "M1",
         *,
         show_progress: bool = False,
     ) -> "pd.DataFrame":
-        """Batch-classify variants. Returns a DataFrame."""
+        """Batch-classify variants. Returns a DataFrame.
+
+        Handles both single-variant and epistasis IDs automatically.
+        """
         import pandas as pd
 
         rows: List[Dict[str, Any]] = []
@@ -1623,8 +1674,8 @@ class HierarchicalMechanismClassifier:
                 pass
 
         for mid in iterator:
-            delta = _get_delta(
-                mid, db=db, model=model,
+            delta = _get_delta_auto(
+                mid, db=db, model=model, which=which,
                 context=self.mechanism_clf.context,
                 genome=self.mechanism_clf.genome,
                 pool=self.mechanism_clf.pool,
