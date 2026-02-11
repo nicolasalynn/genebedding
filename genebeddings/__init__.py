@@ -15,9 +15,12 @@ from .genebeddings import (
     VariantEmbeddingDB,
 )
 
+from .delta_classifier import DeltaClassifier
+
 __all__ = [
     "__version__",
     "DBMetadata",
+    "DeltaClassifier",
     "DependencyMapResult",
     "EpistasisGeometry",
     "EpistasisMetrics",
