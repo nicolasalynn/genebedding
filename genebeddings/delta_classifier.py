@@ -612,6 +612,9 @@ class DeltaClassifier:
         patience: int = 20,
         class_weight: Union[str, None, Dict[str, float]] = "balanced",
         scheduler: str = "cosine",
+        noise_std: float = 0.0,
+        label_smoothing: float = 0.0,
+        mixup_alpha: float = 0.0,
         seed: int = 42,
         verbose: bool = True,
     ) -> TrainResult:
@@ -638,6 +641,21 @@ class DeltaClassifier:
             A dict maps label -> weight.  ``None`` uses uniform weights.
         scheduler : str
             ``"cosine"`` or ``"none"``.
+        noise_std : float
+            Standard deviation of Gaussian noise added to input deltas
+            during training. Acts as a regulariser — forces the network
+            to be robust to small perturbations. Try 0.1–0.5 in the
+            whitened space. Default 0 (off).
+        label_smoothing : float
+            Label smoothing factor (0–1). Replaces hard one-hot targets
+            with soft targets: ``(1 - s) * one_hot + s / C``. Prevents
+            overconfident predictions. Try 0.05–0.2. Default 0 (off).
+        mixup_alpha : float
+            Mixup interpolation parameter (Beta distribution alpha).
+            When > 0, each mini-batch is augmented by interpolating
+            random pairs: ``x' = lam*x_i + (1-lam)*x_j`` with mixed
+            labels. Very effective for embedding classifiers. Try
+            0.2–0.4. Default 0 (off).
         seed : int
             Random seed for reproducibility.
         verbose : bool
@@ -645,6 +663,7 @@ class DeltaClassifier:
         """
         import torch
         import torch.nn as nn
+        import torch.nn.functional as F
         from torch.utils.data import DataLoader, TensorDataset
 
         if self._X is None:
@@ -688,7 +707,14 @@ class DeltaClassifier:
         else:
             weight_tensor = None
 
-        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        # Loss function: cross-entropy with optional label smoothing
+        criterion = nn.CrossEntropyLoss(
+            weight=weight_tensor,
+            label_smoothing=label_smoothing,
+        )
+        # For validation, always use unsmoothed loss
+        val_criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
         optimizer = torch.optim.AdamW(
             self.net.parameters(), lr=lr, weight_decay=weight_decay,
         )
@@ -707,6 +733,9 @@ class DeltaClassifier:
         # Move to device
         self.net = self.net.to(self.device)
 
+        use_mixup = mixup_alpha > 0
+        use_noise = noise_std > 0
+
         best_val_loss = float("inf")
         best_epoch = 0
         best_state = copy.deepcopy(self.net.state_dict())
@@ -721,14 +750,40 @@ class DeltaClassifier:
             total = 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
-                optimizer.zero_grad()
-                logits = self.net(xb)
-                loss = criterion(logits, yb)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * len(xb)
-                correct += (logits.argmax(1) == yb).sum().item()
-                total += len(xb)
+
+                # Gaussian noise injection
+                if use_noise:
+                    xb = xb + torch.randn_like(xb) * noise_std
+
+                # Mixup augmentation
+                if use_mixup and len(xb) > 1:
+                    lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+                    perm = torch.randperm(len(xb), device=self.device)
+                    xb_mixed = lam * xb + (1 - lam) * xb[perm]
+                    yb_a, yb_b = yb, yb[perm]
+
+                    optimizer.zero_grad()
+                    logits = self.net(xb_mixed)
+                    loss = lam * criterion(logits, yb_a) + (1 - lam) * criterion(logits, yb_b)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item() * len(xb)
+                    # For accuracy tracking, use the dominant label
+                    preds = logits.argmax(1)
+                    correct += (lam * (preds == yb_a).float() + (1 - lam) * (preds == yb_b).float()).sum().item()
+                    total += len(xb)
+                else:
+                    optimizer.zero_grad()
+                    logits = self.net(xb)
+                    loss = criterion(logits, yb)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item() * len(xb)
+                    correct += (logits.argmax(1) == yb).sum().item()
+                    total += len(xb)
+
             train_loss = running_loss / max(total, 1)
             train_acc = correct / max(total, 1)
             train_losses.append(train_loss)
@@ -737,14 +792,14 @@ class DeltaClassifier:
             if sched is not None:
                 sched.step()
 
-            # --- val ---
+            # --- val (no noise, no mixup, no label smoothing) ---
             if n_val > 0:
                 self.net.eval()
                 with torch.no_grad():
                     xv = X_val.to(self.device)
                     yv = y_val.to(self.device)
                     logits_v = self.net(xv)
-                    vloss = criterion(logits_v, yv).item()
+                    vloss = val_criterion(logits_v, yv).item()
                     vacc = (logits_v.argmax(1) == yv).float().mean().item()
                 val_losses.append(vloss)
                 val_accs.append(vacc)
