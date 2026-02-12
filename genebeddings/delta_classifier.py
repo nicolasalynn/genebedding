@@ -166,6 +166,7 @@ class _Preprocessor:
         self.scale_: Optional[np.ndarray] = None       # (k,) = 1/sqrt(eigenvalue)
         self.output_dim_: Optional[int] = None
         self._fitted = False
+        self._external = False  # True if fitted from external cov/data
 
     def fit(self, X: np.ndarray) -> "_Preprocessor":
         """Fit preprocessing parameters from training data (N x D)."""
@@ -182,40 +183,104 @@ class _Preprocessor:
             self.output_dim_ = d
 
         elif self.mode == "whiten":
-            self.mean_ = X.mean(axis=0)
-            Xc = X - self.mean_
-
-            # SVD (more stable than eigh on covariance)
-            # Xc = U @ S @ Vt, cov = Vt.T @ diag(S^2/(n-1)) @ Vt
-            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-            eigenvalues = (S ** 2) / max(n - 1, 1)
-
-            # Determine number of components to keep
-            total_var = eigenvalues.sum()
-            if self.whiten_k is not None:
-                k = min(self.whiten_k, len(eigenvalues))
-            elif self.whiten_variance is not None:
-                cumvar = np.cumsum(eigenvalues) / (total_var + self.eps)
-                k = int(np.searchsorted(cumvar, self.whiten_variance) + 1)
-                k = min(k, len(eigenvalues))
-            else:
-                k = len(eigenvalues)
-
-            # Truncate noisy components with tiny eigenvalues
-            good = eigenvalues[:k] > self.eps
-            k = int(good.sum()) if good.sum() > 0 else 1
-
-            self.components_ = Vt[:k]               # (k, D)
-            self.scale_ = 1.0 / np.sqrt(eigenvalues[:k] + self.eps)  # (k,)
-            self.output_dim_ = k
-
-            logger.info(
-                "Whitening: %d -> %d dims (%.1f%% variance retained)",
-                d, k, 100 * eigenvalues[:k].sum() / (total_var + self.eps),
-            )
+            self._fit_whiten_from_data(X)
 
         self._fitted = True
         return self
+
+    def fit_from_covariance(
+        self,
+        cov: np.ndarray,
+        mean: Optional[np.ndarray] = None,
+    ) -> "_Preprocessor":
+        """
+        Fit whitening from a pre-computed covariance matrix.
+
+        Use this when you have a covariance matrix estimated from a
+        null / background dataset rather than from the training data.
+
+        Parameters
+        ----------
+        cov : (D, D) array
+            Covariance matrix (e.g. from neutral/synonymous variants).
+        mean : (D,) array or None
+            Mean vector.  If None, zero-centering is skipped (only the
+            covariance structure is used for whitening).
+        """
+        if self.mode != "whiten":
+            self.mode = "whiten"  # auto-switch
+
+        cov = np.asarray(cov, dtype=np.float64)
+        d = cov.shape[0]
+        self.mean_ = np.asarray(mean, dtype=np.float64) if mean is not None else np.zeros(d, dtype=np.float64)
+
+        # Eigendecompose: cov = V @ diag(λ) @ V.T
+        eigenvalues, V = np.linalg.eigh(cov)
+        # eigh returns ascending order; flip to descending
+        eigenvalues = eigenvalues[::-1].copy()
+        V = V[:, ::-1].copy()
+
+        # Determine k
+        total_var = eigenvalues.sum()
+        if self.whiten_k is not None:
+            k = min(self.whiten_k, len(eigenvalues))
+        elif self.whiten_variance is not None:
+            cumvar = np.cumsum(eigenvalues) / (total_var + self.eps)
+            k = int(np.searchsorted(cumvar, self.whiten_variance) + 1)
+            k = min(k, len(eigenvalues))
+        else:
+            k = len(eigenvalues)
+
+        good = eigenvalues[:k] > self.eps
+        k = int(good.sum()) if good.sum() > 0 else 1
+
+        self.components_ = V[:, :k].T               # (k, D)
+        self.scale_ = 1.0 / np.sqrt(eigenvalues[:k] + self.eps)  # (k,)
+        self.output_dim_ = k
+        self._fitted = True
+        self._external = True
+
+        logger.info(
+            "Whitening (from covariance): %d -> %d dims (%.1f%% variance retained)",
+            d, k, 100 * eigenvalues[:k].sum() / (total_var + self.eps),
+        )
+        return self
+
+    def _fit_whiten_from_data(self, X: np.ndarray) -> None:
+        """Internal: fit whitening parameters from a data matrix."""
+        X = np.asarray(X, dtype=np.float64)
+        n, d = X.shape
+        self.mean_ = X.mean(axis=0)
+        Xc = X - self.mean_
+
+        # SVD (more stable than eigh on covariance)
+        # Xc = U @ S @ Vt, cov = Vt.T @ diag(S^2/(n-1)) @ Vt
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        eigenvalues = (S ** 2) / max(n - 1, 1)
+
+        # Determine number of components to keep
+        total_var = eigenvalues.sum()
+        if self.whiten_k is not None:
+            k = min(self.whiten_k, len(eigenvalues))
+        elif self.whiten_variance is not None:
+            cumvar = np.cumsum(eigenvalues) / (total_var + self.eps)
+            k = int(np.searchsorted(cumvar, self.whiten_variance) + 1)
+            k = min(k, len(eigenvalues))
+        else:
+            k = len(eigenvalues)
+
+        # Truncate noisy components with tiny eigenvalues
+        good = eigenvalues[:k] > self.eps
+        k = int(good.sum()) if good.sum() > 0 else 1
+
+        self.components_ = Vt[:k]               # (k, D)
+        self.scale_ = 1.0 / np.sqrt(eigenvalues[:k] + self.eps)  # (k,)
+        self.output_dim_ = k
+
+        logger.info(
+            "Whitening: %d -> %d dims (%.1f%% variance retained)",
+            d, k, 100 * eigenvalues[:k].sum() / (total_var + self.eps),
+        )
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         """Apply the fitted preprocessing to data (N x D) or (D,)."""
@@ -243,7 +308,7 @@ class _Preprocessor:
             X = X[0]
         return X
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> Dict[str, Any]:  # noqa: C901
         return {
             "mode": self.mode,
             "whiten_k": self.whiten_k,
@@ -255,6 +320,7 @@ class _Preprocessor:
             "scale_": self.scale_,
             "output_dim_": self.output_dim_,
             "fitted": self._fitted,
+            "external": self._external,
         }
 
     @classmethod
@@ -271,6 +337,7 @@ class _Preprocessor:
         obj.scale_ = d.get("scale_")
         obj.output_dim_ = d.get("output_dim_")
         obj._fitted = d.get("fitted", False)
+        obj._external = d.get("external", False)
         return obj
 
 
@@ -421,6 +488,9 @@ class DeltaClassifier:
         preprocessing: str = "none",
         whiten_k: Optional[int] = None,
         whiten_variance: Optional[float] = 0.99,
+        whiten_cov: Optional[np.ndarray] = None,
+        whiten_mean: Optional[np.ndarray] = None,
+        whiten_data: Optional[np.ndarray] = None,
         context: int = _DEFAULT_CONTEXT,
         genome: str = _DEFAULT_GENOME,
         pool: str = "mean",
@@ -433,6 +503,19 @@ class DeltaClassifier:
         Loads (or computes) delta vectors for every mutation ID,
         instantiates the MLP, and stores the training data so that
         :meth:`fit` can be called afterwards.
+
+        Parameters
+        ----------
+        whiten_cov : (D, D) array, optional
+            External covariance matrix (e.g. from a null / background
+            dataset) used for whitening instead of the training data.
+            Automatically sets ``preprocessing="whiten"``.
+        whiten_mean : (D,) array, optional
+            Mean vector to pair with *whiten_cov*. If None, uses zeros.
+        whiten_data : (N, D) array, optional
+            External dataset of delta vectors (e.g. null / synonymous
+            variants) to fit whitening from. The covariance is computed
+            from this array. Automatically sets ``preprocessing="whiten"``.
         """
         all_deltas: List[np.ndarray] = []
         all_labels: List[int] = []
@@ -475,6 +558,10 @@ class DeltaClassifier:
             {l: int((y == i).sum()) for i, l in enumerate(label_order)},
         )
 
+        # Auto-switch to whiten if external cov or data is given
+        if whiten_cov is not None or whiten_data is not None:
+            preprocessing = "whiten"
+
         obj = cls(
             input_dim=X.shape[1],
             labels=label_order,
@@ -491,6 +578,17 @@ class DeltaClassifier:
         obj._X = X
         obj._y = y
         obj._group_ids = group_ids
+
+        # Pre-fit preprocessing from external source if provided
+        if whiten_cov is not None:
+            obj.preprocessor.fit_from_covariance(whiten_cov, mean=whiten_mean)
+            obj._rebuild_net(obj.preprocessor.output_dim_)
+        elif whiten_data is not None:
+            obj.preprocessor._fit_whiten_from_data(np.asarray(whiten_data))
+            obj.preprocessor._fitted = True
+            obj.preprocessor._external = True
+            obj._rebuild_net(obj.preprocessor.output_dim_)
+
         return obj
 
     # ------------------------------------------------------------------ #
@@ -561,9 +659,11 @@ class DeltaClassifier:
         n_val = max(1, int(n * val_fraction)) if val_fraction > 0 else 0
         val_idx, train_idx = idx[:n_val], idx[n_val:]
 
-        # Fit preprocessing on training split only
-        self.preprocessor.fit(X_raw[train_idx])
-        self._rebuild_net(self.preprocessor.output_dim_)
+        # Fit preprocessing on training split only —
+        # UNLESS it was already fitted externally (e.g. from a null covariance)
+        if not self.preprocessor._fitted:
+            self.preprocessor.fit(X_raw[train_idx])
+            self._rebuild_net(self.preprocessor.output_dim_)
 
         # Apply preprocessing
         X = self.preprocessor.transform(X_raw)
@@ -878,14 +978,23 @@ class DeltaClassifier:
             skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
             fold_accs = []
 
+            # If preprocessing was fitted from an external source (null cov),
+            # reuse it for all folds.  Otherwise re-fit per fold.
+            external_pp = (
+                self.preprocessor if self.preprocessor._external else None
+            )
+
             for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_raw, y)):
-                # Fit preprocessing on THIS fold's training data
-                fold_pp = _Preprocessor(
-                    mode=self.preprocessor.mode,
-                    whiten_k=self.preprocessor.whiten_k,
-                    whiten_variance=self.preprocessor.whiten_variance,
-                )
-                fold_pp.fit(X_raw[train_idx])
+                if external_pp is not None:
+                    fold_pp = external_pp
+                else:
+                    # Fit preprocessing on THIS fold's training data
+                    fold_pp = _Preprocessor(
+                        mode=self.preprocessor.mode,
+                        whiten_k=self.preprocessor.whiten_k,
+                        whiten_variance=self.preprocessor.whiten_variance,
+                    )
+                    fold_pp.fit(X_raw[train_idx])
 
                 fold_X_train = fold_pp.transform(X_raw[train_idx])
                 fold_X_test = fold_pp.transform(X_raw[test_idx])
