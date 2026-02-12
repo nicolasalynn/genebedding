@@ -5,6 +5,7 @@ Provides :class:`DeltaClassifier`, a PyTorch MLP that learns to classify
 mutations by their effect in embedding space.  Supports:
 
 * Loading deltas from :class:`VariantEmbeddingDB` or computing on-the-fly
+* Preprocessing: standardization, PCA whitening, or L2 normalization
 * Automatic class-weight balancing for imbalanced groups
 * Early stopping with validation split
 * k-fold cross-validation evaluation
@@ -82,7 +83,7 @@ class DeltaValidationResult:
         if self.cv_accuracy is not None:
             lines[0] = (
                 f"DeltaValidationResult(accuracy={self.accuracy:.4f}, "
-                f"cv={self.cv_accuracy:.4f}±{self.cv_std:.4f})"
+                f"cv={self.cv_accuracy:.4f}\u00b1{self.cv_std:.4f})"
             )
         for k, v in self.per_class_accuracy.items():
             lines.append(f"  {k}: {v:.1%}")
@@ -115,6 +116,162 @@ def _build_mlp(
         prev = h
     layers.append(nn.Linear(prev, num_classes))
     return nn.Sequential(*layers)
+
+
+# ------------------------------------------------------------------ #
+#  Preprocessing helpers
+# ------------------------------------------------------------------ #
+
+class _Preprocessor:
+    """
+    Fit-once, apply-many preprocessing for delta vectors.
+
+    Modes
+    -----
+    ``"none"``
+        No transformation.
+    ``"l2"``
+        L2-normalize each vector (unit length). Discards magnitude.
+    ``"standardize"``
+        Per-dimension z-score (subtract mean, divide by std).
+    ``"whiten"``
+        PCA whitening: project onto PCA axes, scale by 1/sqrt(eigenvalue).
+        Optionally truncates to *whiten_k* components (or keeps components
+        explaining *whiten_variance* fraction of variance).  This is
+        equivalent to multiplying by ``cov^{-1/2}`` in the retained
+        subspace, making Euclidean distances = Mahalanobis distances.
+    """
+
+    def __init__(
+        self,
+        mode: str = "none",
+        whiten_k: Optional[int] = None,
+        whiten_variance: Optional[float] = 0.99,
+        eps: float = 1e-8,
+    ):
+        if mode not in ("none", "l2", "standardize", "whiten"):
+            raise ValueError(
+                f"Unknown preprocessing mode {mode!r}. "
+                f"Choose from 'none', 'l2', 'standardize', 'whiten'."
+            )
+        self.mode = mode
+        self.whiten_k = whiten_k
+        self.whiten_variance = whiten_variance
+        self.eps = eps
+
+        # Fitted parameters
+        self.mean_: Optional[np.ndarray] = None   # (D,)
+        self.std_: Optional[np.ndarray] = None     # (D,) for standardize
+        self.components_: Optional[np.ndarray] = None  # (k, D) for whiten
+        self.scale_: Optional[np.ndarray] = None       # (k,) = 1/sqrt(eigenvalue)
+        self.output_dim_: Optional[int] = None
+        self._fitted = False
+
+    def fit(self, X: np.ndarray) -> "_Preprocessor":
+        """Fit preprocessing parameters from training data (N x D)."""
+        X = np.asarray(X, dtype=np.float64)
+        n, d = X.shape
+
+        if self.mode == "none" or self.mode == "l2":
+            self.output_dim_ = d
+
+        elif self.mode == "standardize":
+            self.mean_ = X.mean(axis=0)
+            self.std_ = X.std(axis=0)
+            self.std_[self.std_ < self.eps] = 1.0  # avoid div-by-zero
+            self.output_dim_ = d
+
+        elif self.mode == "whiten":
+            self.mean_ = X.mean(axis=0)
+            Xc = X - self.mean_
+
+            # SVD (more stable than eigh on covariance)
+            # Xc = U @ S @ Vt, cov = Vt.T @ diag(S^2/(n-1)) @ Vt
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            eigenvalues = (S ** 2) / max(n - 1, 1)
+
+            # Determine number of components to keep
+            total_var = eigenvalues.sum()
+            if self.whiten_k is not None:
+                k = min(self.whiten_k, len(eigenvalues))
+            elif self.whiten_variance is not None:
+                cumvar = np.cumsum(eigenvalues) / (total_var + self.eps)
+                k = int(np.searchsorted(cumvar, self.whiten_variance) + 1)
+                k = min(k, len(eigenvalues))
+            else:
+                k = len(eigenvalues)
+
+            # Truncate noisy components with tiny eigenvalues
+            good = eigenvalues[:k] > self.eps
+            k = int(good.sum()) if good.sum() > 0 else 1
+
+            self.components_ = Vt[:k]               # (k, D)
+            self.scale_ = 1.0 / np.sqrt(eigenvalues[:k] + self.eps)  # (k,)
+            self.output_dim_ = k
+
+            logger.info(
+                "Whitening: %d -> %d dims (%.1f%% variance retained)",
+                d, k, 100 * eigenvalues[:k].sum() / (total_var + self.eps),
+            )
+
+        self._fitted = True
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """Apply the fitted preprocessing to data (N x D) or (D,)."""
+        squeeze = X.ndim == 1
+        if squeeze:
+            X = X[np.newaxis, :]
+        X = np.asarray(X, dtype=np.float32)
+
+        if self.mode == "none":
+            pass
+
+        elif self.mode == "l2":
+            norms = np.linalg.norm(X, axis=1, keepdims=True) + self.eps
+            X = X / norms
+
+        elif self.mode == "standardize":
+            X = (X - self.mean_.astype(np.float32)) / self.std_.astype(np.float32)
+
+        elif self.mode == "whiten":
+            Xc = X - self.mean_.astype(np.float32)
+            # Project and scale: X_white = (Xc @ V.T) * scale
+            X = (Xc @ self.components_.T.astype(np.float32)) * self.scale_.astype(np.float32)
+
+        if squeeze:
+            X = X[0]
+        return X
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "whiten_k": self.whiten_k,
+            "whiten_variance": self.whiten_variance,
+            "eps": self.eps,
+            "mean_": self.mean_,
+            "std_": self.std_,
+            "components_": self.components_,
+            "scale_": self.scale_,
+            "output_dim_": self.output_dim_,
+            "fitted": self._fitted,
+        }
+
+    @classmethod
+    def from_state_dict(cls, d: Dict[str, Any]) -> "_Preprocessor":
+        obj = cls(
+            mode=d["mode"],
+            whiten_k=d.get("whiten_k"),
+            whiten_variance=d.get("whiten_variance"),
+            eps=d.get("eps", 1e-8),
+        )
+        obj.mean_ = d.get("mean_")
+        obj.std_ = d.get("std_")
+        obj.components_ = d.get("components_")
+        obj.scale_ = d.get("scale_")
+        obj.output_dim_ = d.get("output_dim_")
+        obj._fitted = d.get("fitted", False)
+        return obj
 
 
 # ------------------------------------------------------------------ #
@@ -155,6 +312,7 @@ class DeltaClassifier:
             {"splicing": [...], "missense": [...]},
             db=db,
             model=model,
+            preprocessing="whiten",
         )
         result = clf.fit(epochs=100)
         val = clf.validate(cv=5)
@@ -163,7 +321,7 @@ class DeltaClassifier:
     Parameters
     ----------
     input_dim : int
-        Dimensionality of the delta vectors.
+        Dimensionality of the delta vectors (before preprocessing).
     labels : list of str
         Ordered class labels.
     hidden_dims : tuple of int
@@ -172,8 +330,13 @@ class DeltaClassifier:
         Dropout probability.
     batch_norm : bool
         Whether to use batch normalisation.
-    normalize : bool
-        If True, L2-normalise deltas before feeding to the MLP.
+    preprocessing : str
+        ``"none"``, ``"l2"``, ``"standardize"``, or ``"whiten"``.
+    whiten_k : int or None
+        If preprocessing is ``"whiten"``, fix the number of PCA components.
+    whiten_variance : float or None
+        If preprocessing is ``"whiten"`` and *whiten_k* is None, keep
+        enough components to explain this fraction of variance (default 0.99).
     context, genome, pool : str
         Defaults for on-the-fly embedding.
     """
@@ -185,17 +348,18 @@ class DeltaClassifier:
         hidden_dims: Sequence[int] = (256, 64),
         dropout: float = 0.3,
         batch_norm: bool = True,
-        normalize: bool = False,
+        preprocessing: str = "none",
+        whiten_k: Optional[int] = None,
+        whiten_variance: Optional[float] = 0.99,
         context: int = _DEFAULT_CONTEXT,
         genome: str = _DEFAULT_GENOME,
         pool: str = "mean",
     ):
         import torch
-        self.input_dim = input_dim
+        self.raw_input_dim = input_dim
         self.labels = list(labels)
         self.label2idx = {l: i for i, l in enumerate(self.labels)}
         self.num_classes = len(labels)
-        self.normalize = normalize
         self.context = context
         self.genome = genome
         self.pool = pool
@@ -204,6 +368,16 @@ class DeltaClassifier:
         self._dropout = dropout
         self._batch_norm = batch_norm
 
+        # Preprocessing
+        self.preprocessor = _Preprocessor(
+            mode=preprocessing,
+            whiten_k=whiten_k,
+            whiten_variance=whiten_variance,
+        )
+
+        # MLP will be (re-)built once preprocessing is fitted
+        # (because whiten can change the input dim)
+        self._effective_input_dim = input_dim
         self.net = _build_mlp(
             input_dim, self.num_classes,
             hidden_dims=hidden_dims,
@@ -213,10 +387,21 @@ class DeltaClassifier:
         self.device = torch.device("cpu")
 
         # Training data stored for CV / retraining
-        self._X: Optional[np.ndarray] = None
+        self._X: Optional[np.ndarray] = None   # raw (before preprocessing)
         self._y: Optional[np.ndarray] = None
         self._group_ids: Optional[Dict[str, List[str]]] = None
         self._fitted = False
+
+    def _rebuild_net(self, effective_dim: int) -> None:
+        """Rebuild the MLP if preprocessing changes the input dimension."""
+        if effective_dim != self._effective_input_dim:
+            self._effective_input_dim = effective_dim
+            self.net = _build_mlp(
+                effective_dim, self.num_classes,
+                hidden_dims=self._hidden_dims,
+                dropout=self._dropout,
+                batch_norm=self._batch_norm,
+            ).to(self.device)
 
     # ------------------------------------------------------------------ #
     #  Construction from labelled mutation groups
@@ -233,7 +418,9 @@ class DeltaClassifier:
         hidden_dims: Sequence[int] = (256, 64),
         dropout: float = 0.3,
         batch_norm: bool = True,
-        normalize: bool = False,
+        preprocessing: str = "none",
+        whiten_k: Optional[int] = None,
+        whiten_variance: Optional[float] = 0.99,
         context: int = _DEFAULT_CONTEXT,
         genome: str = _DEFAULT_GENOME,
         pool: str = "mean",
@@ -294,7 +481,9 @@ class DeltaClassifier:
             hidden_dims=hidden_dims,
             dropout=dropout,
             batch_norm=batch_norm,
-            normalize=normalize,
+            preprocessing=preprocessing,
+            whiten_k=whiten_k,
+            whiten_variance=whiten_variance,
             context=context,
             genome=genome,
             pool=pool,
@@ -364,18 +553,20 @@ class DeltaClassifier:
             raise RuntimeError("No training data. Call from_mutation_groups first.")
 
         rng = np.random.RandomState(seed)
-        X, y = self._X.copy(), self._y.copy()
+        X_raw, y = self._X.copy(), self._y.copy()
 
-        # Optional normalisation
-        if self.normalize:
-            norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-            X = X / norms
-
-        # Train / val split
-        n = len(X)
+        # Train / val split (split BEFORE fitting preprocessing to avoid data leakage)
+        n = len(X_raw)
         idx = rng.permutation(n)
         n_val = max(1, int(n * val_fraction)) if val_fraction > 0 else 0
         val_idx, train_idx = idx[:n_val], idx[n_val:]
+
+        # Fit preprocessing on training split only
+        self.preprocessor.fit(X_raw[train_idx])
+        self._rebuild_net(self.preprocessor.output_dim_)
+
+        # Apply preprocessing
+        X = self.preprocessor.transform(X_raw)
 
         X_train = torch.tensor(X[train_idx], dtype=torch.float32)
         y_train = torch.tensor(y[train_idx], dtype=torch.long)
@@ -513,8 +704,7 @@ class DeltaClassifier:
     def _prepare_delta(self, delta: np.ndarray) -> "torch.Tensor":
         import torch
         v = np.asarray(delta, dtype=np.float32).flatten()
-        if self.normalize:
-            v = v / (np.linalg.norm(v) + 1e-12)
+        v = self.preprocessor.transform(v)
         return torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(self.device)
 
     def classify(self, delta: np.ndarray) -> DeltaClassificationResult:
@@ -571,9 +761,7 @@ class DeltaClassifier:
             raise RuntimeError("Model not fitted. Call .fit() first.")
 
         X = np.asarray(deltas, dtype=np.float32)
-        if self.normalize:
-            norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-            X = X / norms
+        X = self.preprocessor.transform(X)
 
         self.net.eval()
         with torch.no_grad():
@@ -640,7 +828,8 @@ class DeltaClassifier:
         Evaluate the classifier.
 
         If ``cv > 0``, performs stratified k-fold cross-validation
-        (retraining from scratch each fold) and reports fold accuracies.
+        (retraining from scratch each fold, including re-fitting
+        preprocessing) and reports fold accuracies.
 
         Always reports training-set accuracy and confusion matrix as
         a baseline.
@@ -649,10 +838,10 @@ class DeltaClassifier:
         if self._X is None:
             raise RuntimeError("No data to validate on")
 
-        X, y = self._X.copy(), self._y.copy()
-        if self.normalize:
-            norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-            X = X / norms
+        X_raw, y = self._X.copy(), self._y.copy()
+
+        # Apply the fitted preprocessor for full-data evaluation
+        X = self.preprocessor.transform(X_raw)
 
         # Full-data accuracy (train set)
         self.net.eval()
@@ -689,19 +878,31 @@ class DeltaClassifier:
             skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
             fold_accs = []
 
-            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y)):
-                # Build a fresh copy of the network
+            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_raw, y)):
+                # Fit preprocessing on THIS fold's training data
+                fold_pp = _Preprocessor(
+                    mode=self.preprocessor.mode,
+                    whiten_k=self.preprocessor.whiten_k,
+                    whiten_variance=self.preprocessor.whiten_variance,
+                )
+                fold_pp.fit(X_raw[train_idx])
+
+                fold_X_train = fold_pp.transform(X_raw[train_idx])
+                fold_X_test = fold_pp.transform(X_raw[test_idx])
+
+                eff_dim = fold_pp.output_dim_
+
+                # Build a fresh MLP for this fold
                 fold_net = _build_mlp(
-                    self.input_dim, self.num_classes,
+                    eff_dim, self.num_classes,
                     hidden_dims=self._hidden_dims,
                     dropout=self._dropout,
                     batch_norm=self._batch_norm,
                 ).to(self.device)
 
-                fold_X_train = torch.tensor(X[train_idx], dtype=torch.float32)
-                fold_y_train = torch.tensor(y[train_idx], dtype=torch.long)
-                fold_X_test = torch.tensor(X[test_idx], dtype=torch.float32)
-                fold_y_test = torch.tensor(y[test_idx], dtype=torch.long)
+                fold_X_train_t = torch.tensor(fold_X_train, dtype=torch.float32)
+                fold_y_train_t = torch.tensor(y[train_idx], dtype=torch.long)
+                fold_X_test_t = torch.tensor(fold_X_test, dtype=torch.float32)
 
                 # Class weights
                 counts = np.bincount(y[train_idx], minlength=self.num_classes).astype(np.float64)
@@ -713,7 +914,7 @@ class DeltaClassifier:
                 optimizer = torch.optim.AdamW(fold_net.parameters(), lr=1e-3, weight_decay=1e-4)
                 sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
-                ds = torch.utils.data.TensorDataset(fold_X_train, fold_y_train)
+                ds = torch.utils.data.TensorDataset(fold_X_train_t, fold_y_train_t)
                 loader = torch.utils.data.DataLoader(
                     ds, batch_size=256, shuffle=True,
                     generator=torch.Generator().manual_seed(seed + fold_idx),
@@ -733,7 +934,7 @@ class DeltaClassifier:
                 # Evaluate fold
                 fold_net.eval()
                 with torch.no_grad():
-                    logits_test = fold_net(fold_X_test.to(self.device))
+                    logits_test = fold_net(fold_X_test_t.to(self.device))
                     fold_preds = logits_test.argmax(1).cpu().numpy()
                     fold_acc = float((fold_preds == y[test_idx]).mean())
                 fold_accs.append(fold_acc)
@@ -742,7 +943,7 @@ class DeltaClassifier:
             cv_per_fold = fold_accs
             cv_accuracy = float(np.mean(fold_accs))
             cv_std = float(np.std(fold_accs))
-            logger.info("CV accuracy: %.4f ± %.4f", cv_accuracy, cv_std)
+            logger.info("CV accuracy: %.4f \u00b1 %.4f", cv_accuracy, cv_std)
 
         return DeltaValidationResult(
             accuracy=overall_acc,
@@ -777,9 +978,8 @@ class DeltaClassifier:
 
         import matplotlib.pyplot as plt
 
-        X = self._X.copy()
-        if self.normalize:
-            X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+        # Plot in the preprocessed space
+        X = self.preprocessor.transform(self._X.copy())
 
         if method == "umap":
             try:
@@ -851,17 +1051,18 @@ class DeltaClassifier:
 
     def save(self, path: Union[str, Path]) -> None:
         """
-        Save the classifier (architecture + weights + metadata) to a file.
+        Save the classifier (architecture + weights + preprocessing + metadata).
         """
         import torch
         path = Path(path)
         state = {
-            "input_dim": self.input_dim,
+            "raw_input_dim": self.raw_input_dim,
+            "effective_input_dim": self._effective_input_dim,
             "labels": self.labels,
             "hidden_dims": self._hidden_dims,
             "dropout": self._dropout,
             "batch_norm": self._batch_norm,
-            "normalize": self.normalize,
+            "preprocessor": self.preprocessor.state_dict(),
             "context": self.context,
             "genome": self.genome,
             "pool": self.pool,
@@ -884,17 +1085,24 @@ class DeltaClassifier:
         import torch
         path = Path(path)
         state = torch.load(path, map_location=device, weights_only=False)
+
+        pp_state = state.get("preprocessor", {})
+        pp = _Preprocessor.from_state_dict(pp_state) if pp_state else _Preprocessor("none")
+
         obj = cls(
-            input_dim=state["input_dim"],
+            input_dim=state.get("raw_input_dim", state.get("input_dim", 0)),
             labels=state["labels"],
             hidden_dims=state["hidden_dims"],
             dropout=state["dropout"],
             batch_norm=state["batch_norm"],
-            normalize=state["normalize"],
+            preprocessing=pp.mode,
             context=state.get("context", _DEFAULT_CONTEXT),
             genome=state.get("genome", _DEFAULT_GENOME),
             pool=state.get("pool", "mean"),
         )
+        obj.preprocessor = pp
+        eff_dim = state.get("effective_input_dim", pp.output_dim_ or obj.raw_input_dim)
+        obj._rebuild_net(eff_dim)
         obj.net.load_state_dict(state["net_state_dict"])
         obj.net = obj.net.to(device)
         obj.device = torch.device(device)
@@ -909,7 +1117,10 @@ class DeltaClassifier:
     def __repr__(self) -> str:
         status = "fitted" if self._fitted else "unfitted"
         n = len(self._X) if self._X is not None else 0
+        pp = self.preprocessor.mode
         return (
             f"DeltaClassifier({status}, classes={self.labels}, "
-            f"n_train={n}, input_dim={self.input_dim})"
+            f"n_train={n}, raw_dim={self.raw_input_dim}, "
+            f"effective_dim={self._effective_input_dim}, "
+            f"preprocessing={pp!r})"
         )
