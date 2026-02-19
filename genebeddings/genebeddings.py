@@ -2162,8 +2162,13 @@ def embed_single_variant(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_ref = model.embed(s.seq, pool=pool)
-    h_mut = model.embed(m.seq, pool=pool)
+    # Try batched forward pass (single call, ~2x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m.seq], pool=pool)
+        h_ref, h_mut = embs[0], embs[1]
+    except (TypeError, AttributeError):
+        h_ref = model.embed(s.seq, pool=pool)
+        h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_ref
 
     return h_ref, h_mut, delta
@@ -2233,10 +2238,15 @@ def embed_epistasis(
     m2.apply_mutations([var2])
     m12.apply_mutations([var1, var2])
 
-    h_ref = model.embed(s.seq, pool=pool)
-    h_m1 = model.embed(m1.seq, pool=pool)
-    h_m2 = model.embed(m2.seq, pool=pool)
-    h_m12 = model.embed(m12.seq, pool=pool)
+    # Try batched forward pass (single call, ~4x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m1.seq, m2.seq, m12.seq], pool=pool)
+        h_ref, h_m1, h_m2, h_m12 = embs[0], embs[1], embs[2], embs[3]
+    except (TypeError, AttributeError):
+        h_ref = model.embed(s.seq, pool=pool)
+        h_m1 = model.embed(m1.seq, pool=pool)
+        h_m2 = model.embed(m2.seq, pool=pool)
+        h_m12 = model.embed(m12.seq, pool=pool)
 
     return h_ref, h_m1, h_m2, h_m12
 
@@ -2648,11 +2658,59 @@ def _embed_single_variant_direct(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_wt = model.embed(s.seq, pool=pool)
-    h_mut = model.embed(m.seq, pool=pool)
+    # Try batched forward pass (single call, ~2x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m.seq], pool=pool)
+        h_wt, h_mut = embs[0], embs[1]
+    except (TypeError, AttributeError):
+        h_wt = model.embed(s.seq, pool=pool)
+        h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_wt
 
     return h_wt, h_mut, delta
+
+
+def _prepare_epistasis_sequences(
+    chrom: str,
+    pos1: int,
+    ref1: str,
+    alt1: str,
+    pos2: int,
+    ref2: str,
+    alt2: str,
+    reverse_complement: bool = False,
+    context: int = DEFAULT_CONTEXT,
+    genome: str = DEFAULT_GENOME,
+) -> tuple[str, str, str, str]:
+    """
+    Prepare the 4 sequences (WT, M1, M2, M12) for an epistasis pair.
+
+    Returns (wt_seq, m1_seq, m2_seq, m12_seq) as raw strings ready for
+    ``model.embed()``.  All four sequences are identical length.
+    """
+    from seqmat import SeqMat
+
+    p_min = min(pos1, pos2)
+    p_max = max(pos1, pos2)
+    start = p_min - context
+    end = p_max + context - 1
+
+    s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
+    if reverse_complement:
+        s.reverse_complement()
+
+    var1 = (pos1, ref1, alt1)
+    var2 = (pos2, ref2, alt2)
+
+    m1 = s.clone()
+    m2 = s.clone()
+    m12 = s.clone()
+
+    m1.apply_mutations([var1])
+    m2.apply_mutations([var2])
+    m12.apply_mutations([var1, var2])
+
+    return s.seq, m1.seq, m2.seq, m12.seq
 
 
 def _embed_epistasis_direct(
@@ -2673,38 +2731,33 @@ def _embed_epistasis_direct(
     Compute embeddings for epistasis from genomic coordinates.
 
     Returns (h_wt, h_m1, h_m2, h_m12) embeddings with specified pooling.
+
+    Automatically batches the four sequences into a single forward pass
+    when the model supports list input, falling back to sequential
+    embedding otherwise.
     """
-    from seqmat import SeqMat
-
-    p_min = min(pos1, pos2)
-    p_max = max(pos1, pos2)
-    start = p_min - context
-    end = p_max + context - 1
-
     logger.debug(
         "Embedding epistasis chr%s:%d,%d (rev=%s)",
         chrom, pos1, pos2, reverse_complement
     )
 
-    s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
-    if reverse_complement:
-        s.reverse_complement()
+    wt_seq, m1_seq, m2_seq, m12_seq = _prepare_epistasis_sequences(
+        chrom, pos1, ref1, alt1, pos2, ref2, alt2,
+        reverse_complement=reverse_complement,
+        context=context,
+        genome=genome,
+    )
 
-    var1 = (pos1, ref1, alt1)
-    var2 = (pos2, ref2, alt2)
-
-    m1 = s.clone()
-    m2 = s.clone()
-    m12 = s.clone()
-
-    m1.apply_mutations([var1])
-    m2.apply_mutations([var2])
-    m12.apply_mutations([var1, var2])
-
-    h_wt = model.embed(s.seq, pool=pool)
-    h_m1 = model.embed(m1.seq, pool=pool)
-    h_m2 = model.embed(m2.seq, pool=pool)
-    h_m12 = model.embed(m12.seq, pool=pool)
+    # Try batched forward pass (single call, ~4x faster on GPU)
+    try:
+        embs = model.embed([wt_seq, m1_seq, m2_seq, m12_seq], pool=pool)
+        h_wt, h_m1, h_m2, h_m12 = embs[0], embs[1], embs[2], embs[3]
+    except (TypeError, AttributeError):
+        # Fallback for models that don't accept list input
+        h_wt = model.embed(wt_seq, pool=pool)
+        h_m1 = model.embed(m1_seq, pool=pool)
+        h_m2 = model.embed(m2_seq, pool=pool)
+        h_m12 = model.embed(m12_seq, pool=pool)
 
     return h_wt, h_m1, h_m2, h_m12
 
@@ -2939,6 +2992,7 @@ def add_epistasis_metrics(
     pool: str = "mean",
     force: bool = False,
     cov_inv: Optional[np.ndarray] = None,
+    batch_size: int = 1,
 ) -> "pd.DataFrame":
     """
     Add epistasis geometry metrics to a DataFrame.
@@ -3010,6 +3064,13 @@ def add_epistasis_metrics(
     cov_inv : np.ndarray, optional
         Precomputed inverse covariance for residuals. If provided, adds
         covariance-aware epistasis metrics (epi_mahal, mahal_*).
+    batch_size : int, optional
+        Number of epistasis pairs to embed in a single forward pass.
+        Each pair requires 4 sequences (WT, M1, M2, M12), so
+        ``batch_size=8`` sends 32 sequences through the model at once.
+        Requires a model whose ``.embed()`` accepts ``list[str]`` input
+        (most wrappers do). Falls back to sequential if the model does
+        not support batched input. Default: 1 (original per-pair behavior).
 
     Returns
     -------
@@ -3023,6 +3084,9 @@ def add_epistasis_metrics(
 
     >>> # Force recomputation of all embeddings
     >>> df = add_epistasis_metrics(df, db, model=borzoi, force=True)
+
+    >>> # Batched embedding - ~batch_size x faster on GPU
+    >>> df = add_epistasis_metrics(df, db, model=borzoi, batch_size=8)
 
     >>> # Per-row strand from column
     >>> df = add_epistasis_metrics(
@@ -3060,6 +3124,199 @@ def add_epistasis_metrics(
     new_cols_df = pd.DataFrame(float("nan"), index=df.index, columns=col_names)
     df = pd.concat([df, new_cols_df], axis=1)
 
+    # ------------------------------------------------------------------
+    # Helper: assign metrics for one row given its four embeddings
+    # ------------------------------------------------------------------
+    def _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12):
+        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
+        metrics = geom.metrics()
+        for name in metric_cols:
+            if name == "epi_mahal":
+                residual = geom.v12_obs - geom.v12_exp
+                r = residual.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != r.shape[0] or cov_inv.shape[1] != r.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {r.shape[0]}"
+                    )
+                df.at[idx, f"{prefix}{name}"] = float(math.sqrt(r.T @ cov_inv @ r))
+            elif name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"):
+                v_obs = geom.v12_obs.detach().cpu().numpy().astype(np.float64, copy=False)
+                v_add = geom.v12_exp.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != v_obs.shape[0] or cov_inv.shape[1] != v_obs.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {v_obs.shape[0]}"
+                    )
+                mahal_obs = float(math.sqrt(v_obs.T @ cov_inv @ v_obs))
+                mahal_add = float(math.sqrt(v_add.T @ cov_inv @ v_add))
+                if name == "mahal_obs":
+                    df.at[idx, f"{prefix}{name}"] = mahal_obs
+                elif name == "mahal_add":
+                    df.at[idx, f"{prefix}{name}"] = mahal_add
+                else:
+                    ratio = mahal_obs / (mahal_add + DEFAULT_EPS)
+                    df.at[idx, f"{prefix}mahal_ratio"] = ratio
+                    df.at[idx, f"{prefix}log_mahal_ratio"] = math.log(
+                        (mahal_obs + DEFAULT_EPS) / (mahal_add + DEFAULT_EPS)
+                    )
+            else:
+                df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
+
+    # ------------------------------------------------------------------
+    # Helper: parse one row into coordinates + strand
+    # ------------------------------------------------------------------
+    def _parse_row(row):
+        """Return (chrom, p1, r1, a1, p2, r2, a2, rev) or None on failure."""
+        epi_id = row[id_col]
+        use_columns = (
+            chrom_col and pos1_col and ref1_col and alt1_col
+            and pos2_col and ref2_col and alt2_col
+        )
+        if use_columns:
+            chrom = str(row[chrom_col])
+            p1 = int(row[pos1_col])
+            r1 = str(row[ref1_col])
+            a1 = str(row[alt1_col])
+            p2 = int(row[pos2_col])
+            r2 = str(row[ref2_col])
+            a2 = str(row[alt2_col])
+            rev_from_id = None
+        else:
+            try:
+                (chrom, p1, r1, a1, rev1), (_, p2, r2, a2, _) = parse_epistasis_id(epi_id)
+                rev_from_id = rev1
+            except ValueError as e:
+                logger.warning("Cannot parse %s: %s", epi_id, e)
+                return None
+        # Determine strand
+        if strand_col and strand_col in df.columns:
+            rev = _parse_strand(row[strand_col])
+        elif rev_from_id is not None:
+            rev = rev_from_id
+        else:
+            rev = reverse_complement
+        return chrom, p1, r1, a1, p2, r2, a2, rev
+
+    # ==================================================================
+    # BATCHED PATH — batch_size > 1
+    # ==================================================================
+    if batch_size > 1 and model is not None:
+        n_processed = 0
+        n_computed = 0
+        n_loaded = 0
+        n_skipped = 0
+        total = len(df)
+
+        # Phase 1 — parse rows, check DB, partition into loaded / to_compute
+        embeddings = {}   # idx -> (h_wt, h_m1, h_m2, h_m12)
+        to_compute = []   # (idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev)
+
+        parse_iter = df.iterrows()
+        if show_progress:
+            parse_iter = tqdm(parse_iter, total=total, desc="Parsing / DB lookup")
+
+        for idx, row in parse_iter:
+            epi_id = row[id_col]
+            parsed = _parse_row(row)
+            if parsed is None:
+                n_skipped += 1
+                continue
+            chrom, p1, r1, a1, p2, r2, a2, rev = parsed
+
+            wt_key = f"{epi_id}{KEY_WT}"
+            m1_key = f"{epi_id}{KEY_M1}"
+            m2_key = f"{epi_id}{KEY_M2}"
+            m12_key = f"{epi_id}{KEY_M12}"
+
+            if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
+                embeddings[idx] = (db.load(wt_key), db.load(m1_key), db.load(m2_key), db.load(m12_key))
+                n_loaded += 1
+            else:
+                to_compute.append((idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev))
+
+        # Phase 2 — batch compute missing embeddings
+        if to_compute:
+            chunk_starts = range(0, len(to_compute), batch_size)
+            if show_progress:
+                chunk_starts = tqdm(
+                    list(chunk_starts),
+                    desc=f"Embedding (batch_size={batch_size})",
+                )
+
+            for chunk_start in chunk_starts:
+                chunk = to_compute[chunk_start:chunk_start + batch_size]
+                all_seqs = []
+                valid_items = []
+
+                for item in chunk:
+                    (idx_i, epi_id_i, chrom_i,
+                     p1_i, r1_i, a1_i, p2_i, r2_i, a2_i, rev_i) = item
+                    try:
+                        seqs = _prepare_epistasis_sequences(
+                            chrom_i, p1_i, r1_i, a1_i, p2_i, r2_i, a2_i,
+                            reverse_complement=rev_i, context=context, genome=genome,
+                        )
+                        all_seqs.extend(seqs)
+                        valid_items.append(item)
+                    except Exception as e:
+                        logger.warning("Failed to prepare sequences for %s: %s", epi_id_i, e)
+                        n_skipped += 1
+
+                if not all_seqs:
+                    continue
+
+                # Single forward pass for the entire chunk
+                try:
+                    all_embs = model.embed(all_seqs, pool=pool)
+                except (TypeError, AttributeError):
+                    # Fallback: sequential embedding for models without batch support
+                    all_embs = np.stack([model.embed(s, pool=pool) for s in all_seqs])
+
+                for j, item in enumerate(valid_items):
+                    idx_i, epi_id_i = item[0], item[1]
+                    h_wt = all_embs[j * 4]
+                    h_m1 = all_embs[j * 4 + 1]
+                    h_m2 = all_embs[j * 4 + 2]
+                    h_m12 = all_embs[j * 4 + 3]
+
+                    # Cache in DB
+                    wt_key = f"{epi_id_i}{KEY_WT}"
+                    m1_key = f"{epi_id_i}{KEY_M1}"
+                    m2_key = f"{epi_id_i}{KEY_M2}"
+                    m12_key = f"{epi_id_i}{KEY_M12}"
+                    db.store(wt_key, h_wt)
+                    db.store(m1_key, h_m1)
+                    db.store(m2_key, h_m2)
+                    db.store(m12_key, h_m12)
+                    db.store(f"{epi_id_i}{KEY_DELTA1}", h_m1 - h_wt)
+                    db.store(f"{epi_id_i}{KEY_DELTA2}", h_m2 - h_wt)
+                    db.store(f"{epi_id_i}{KEY_DELTA12}", h_m12 - h_wt)
+
+                    embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
+                    n_computed += 1
+
+        # Phase 3 — compute metrics
+        metrics_iter = df.iterrows()
+        if show_progress:
+            metrics_iter = tqdm(metrics_iter, total=total, desc="Computing metrics")
+
+        for i, (idx, row) in enumerate(metrics_iter):
+            if progress_callback:
+                progress_callback(i, total, str(row[id_col]))
+            if idx not in embeddings:
+                continue
+            h_wt, h_m1, h_m2, h_m12 = embeddings[idx]
+            _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12)
+            n_processed += 1
+
+        logger.info(
+            "Epistasis metrics (batched, bs=%d): %d processed (%d computed, %d loaded), %d skipped",
+            batch_size, n_processed, n_computed, n_loaded, n_skipped
+        )
+        return df
+
+    # ==================================================================
+    # ORIGINAL PATH — batch_size <= 1 (unchanged behaviour)
+    # ==================================================================
     n_processed = 0
     n_computed = 0
     n_loaded = 0
@@ -3159,41 +3416,7 @@ def add_epistasis_metrics(
             n_skipped += 1
             continue
 
-        # Create geometry with additive expectation (default)
-        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
-
-        # Assign all metrics
-        metrics = geom.metrics()
-        for name in metric_cols:
-            if name == "epi_mahal":
-                residual = geom.v12_obs - geom.v12_exp
-                r = residual.detach().cpu().numpy().astype(np.float64, copy=False)
-                if cov_inv.shape[0] != r.shape[0] or cov_inv.shape[1] != r.shape[0]:
-                    raise ValueError(
-                        f"cov_inv shape {cov_inv.shape} does not match residual dim {r.shape[0]}"
-                    )
-                epi_mahal = float(math.sqrt(r.T @ cov_inv @ r))
-                df.at[idx, f"{prefix}{name}"] = epi_mahal
-            elif name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"):
-                v_obs = geom.v12_obs.detach().cpu().numpy().astype(np.float64, copy=False)
-                v_add = geom.v12_exp.detach().cpu().numpy().astype(np.float64, copy=False)
-                if cov_inv.shape[0] != v_obs.shape[0] or cov_inv.shape[1] != v_obs.shape[0]:
-                    raise ValueError(
-                        f"cov_inv shape {cov_inv.shape} does not match residual dim {v_obs.shape[0]}"
-                    )
-                mahal_obs = float(math.sqrt(v_obs.T @ cov_inv @ v_obs))
-                mahal_add = float(math.sqrt(v_add.T @ cov_inv @ v_add))
-                if name == "mahal_obs":
-                    df.at[idx, f"{prefix}{name}"] = mahal_obs
-                elif name == "mahal_add":
-                    df.at[idx, f"{prefix}{name}"] = mahal_add
-                else:
-                    ratio = mahal_obs / (mahal_add + DEFAULT_EPS)
-                    df.at[idx, f"{prefix}mahal_ratio"] = ratio
-                    df.at[idx, f"{prefix}log_mahal_ratio"] = math.log((mahal_obs + DEFAULT_EPS) / (mahal_add + DEFAULT_EPS))
-            else:
-                df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
-
+        _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12)
         n_processed += 1
 
     logger.info(

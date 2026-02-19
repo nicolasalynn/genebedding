@@ -29,7 +29,7 @@ ALPHAGENOME_VERSIONS = [
     "fold_4",
 ]
 
-AlphaGenomeSource = Literal["kaggle", "huggingface"]
+AlphaGenomeSource = Literal["kaggle", "huggingface", "local"]
 
 
 class AlphaGenomeWrapper(BaseWrapper):
@@ -69,6 +69,7 @@ class AlphaGenomeWrapper(BaseWrapper):
         model_version: str = "all_folds",
         *,
         source: AlphaGenomeSource = "huggingface",
+        checkpoint_path: str | None = None,
         organism_settings=None,
         device=None,
         fixed_length: int | None = None,
@@ -97,7 +98,11 @@ class AlphaGenomeWrapper(BaseWrapper):
         if device is not None:
             kwargs["device"] = device
 
-        if source == "kaggle":
+        if source == "local":
+            if checkpoint_path is None:
+                raise ValueError("checkpoint_path is required when source='local'")
+            self._model = dna_model.create(checkpoint_path, **kwargs)
+        elif source == "kaggle":
             self._model = dna_model.create_from_kaggle(
                 model_version, **kwargs
             )
@@ -106,7 +111,7 @@ class AlphaGenomeWrapper(BaseWrapper):
                 model_version, **kwargs
             )
         else:
-            raise ValueError(f"source must be 'kaggle' or 'huggingface', got {source!r}")
+            raise ValueError(f"source must be 'kaggle', 'huggingface', or 'local', got {source!r}")
 
         # Store references for direct JAX access
         self._params = self._model._params
