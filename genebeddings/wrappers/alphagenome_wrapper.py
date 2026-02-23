@@ -119,9 +119,20 @@ class AlphaGenomeWrapper(BaseWrapper):
         self._device_context = self._model._device_context
         self._metadata = self._model._metadata
 
-        # Build a dedicated embedding extraction function.
-        # The standard _apply_fn discards the Embeddings object returned by
-        # AlphaGenome.__call__. We build our own that returns just embeddings.
+        # Build an embedding extraction function by re-using the same
+        # hk.transform_with_state that create_model() produces.  This
+        # guarantees the parameter tree matches self._params exactly.
+        # The standard _apply_fn discards embeddings; our version keeps them.
+        from alphagenome_research.model.dna_model import create_model as _create_model
+
+        _init_fn, _apply_fn, _junctions_apply_fn = _create_model(
+            self._metadata,
+        )
+        # _apply_fn internally calls _forward.apply() which returns
+        # ((predictions, embeddings), state).  We need a variant that
+        # returns embeddings instead of predictions.  _forward is captured
+        # in the closure of _apply_fn, so we rebuild from the same module.
+
         jmp_policy = jmp.get_policy("params=float32,compute=bfloat16,output=bfloat16")
         metadata = self._metadata
 
