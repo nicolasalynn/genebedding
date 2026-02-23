@@ -3,3 +3,7 @@ genebeddings/assets/convnova/
 *.pt
 *.pth
 genebeddings/assets/benchmarks
+
+# Jupyter checkpoint dirs (do not track)
+**/.ipynb_checkpoints/
+.ipynb_checkpoints/
