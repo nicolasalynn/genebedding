@@ -1,5 +1,14 @@
 # Notebooks
 
+## Data root (single directory for all outputs)
+
+All embeddings, dataframes, and CSVs are stored under **one root directory**. By default: `/tamir2/nicolaslynn/data/epistasis_paper`. Override with the environment variable `EPISTASIS_PAPER_ROOT` (e.g. on a remote machine).
+
+- **data/** — Input and generated CSVs (subset files, `epistasis_aggregated.csv`, etc.). Use `from notebooks.paper_data_config import data_dir`.
+- **embeddings/** — Embedding DBs per source per model, null covariance packs, annotated parquets. Use `embeddings_dir()`.
+
+`run_everything.ipynb` and the data_generation notebooks use `paper_data_config`; run from the repo with this root so all outputs go to the same place.
+
 ## Layout
 
 - **DATA_GENERATION.md** – How each source dataset is created (ClinVar, eQTL, FAS, MST1R, tRNA, TopLD, OKGP, TCGA, null). Read this to reproduce or extend variant/epistasis tables.

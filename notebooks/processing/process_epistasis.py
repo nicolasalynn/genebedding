@@ -462,11 +462,17 @@ def run_covariance_and_save(
 
 
 def main() -> int:
+    try:
+        from notebooks.paper_data_config import embeddings_dir
+        _default_output = str(embeddings_dir())
+    except Exception:
+        _default_output = "embeddings"
+
     parser = argparse.ArgumentParser(
         description="Process epistasis IDs per source into per-model databases (null first); optional covariance save."
     )
     parser.add_argument("--sources", type=str, nargs="+", metavar="NAME:PATH")
-    parser.add_argument("--output", type=str, default="embeddings")
+    parser.add_argument("--output", type=str, default=_default_output, help="Output base dir for DBs (default: EPISTASIS_PAPER_ROOT/embeddings)")
     parser.add_argument(
         "--env-profile",
         type=str,
