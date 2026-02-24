@@ -3127,10 +3127,12 @@ def add_epistasis_metrics(
     # ------------------------------------------------------------------
     # Helper: assign metrics for one row given its four embeddings
     # ------------------------------------------------------------------
-    def _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12):
+    def _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12, skip_mahal_columns=False):
         geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
         metrics = geom.metrics()
         for name in metric_cols:
+            if skip_mahal_columns and (name == "epi_mahal" or name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio")):
+                continue  # already filled by batched Mahalanobis
             if name == "epi_mahal":
                 residual = geom.v12_obs - geom.v12_exp
                 r = residual.detach().cpu().numpy().astype(np.float64, copy=False)
@@ -3294,18 +3296,54 @@ def add_epistasis_metrics(
                     embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
                     n_computed += 1
 
-        # Phase 3 — compute metrics
+        # Phase 2.5 — batched Mahalanobis when cov_inv is set (avoids O(N*d^2) row-by-row loop)
+        if cov_inv is not None and embeddings:
+            _torch = None
+            try:
+                import torch
+                _torch = torch
+            except ImportError:
+                pass
+
+            def _to_np(x):
+                if _torch is not None and isinstance(x, _torch.Tensor):
+                    return x.detach().cpu().numpy().astype(np.float64, copy=False)
+                return np.asarray(x, dtype=np.float64)
+
+            inds = list(embeddings.keys())
+            h_wt = np.stack([_to_np(embeddings[i][0]) for i in inds])
+            h_m1 = np.stack([_to_np(embeddings[i][1]) for i in inds])
+            h_m2 = np.stack([_to_np(embeddings[i][2]) for i in inds])
+            h_m12 = np.stack([_to_np(embeddings[i][3]) for i in inds])
+            v12_obs = h_m12 - h_wt
+            v12_exp = (h_m1 - h_wt) + (h_m2 - h_wt)
+            residual = v12_obs - v12_exp
+            # (N, d) @ (d, d) -> (N, d); then (N, d) * (N, d) sum axis=1 -> (N,)
+            epi_mahal = np.sqrt(np.maximum(0.0, np.sum((residual @ cov_inv) * residual, axis=1)))
+            mahal_obs = np.sqrt(np.maximum(0.0, np.sum((v12_obs @ cov_inv) * v12_obs, axis=1)))
+            mahal_add = np.sqrt(np.maximum(0.0, np.sum((v12_exp @ cov_inv) * v12_exp, axis=1)))
+            eps = DEFAULT_EPS
+            mahal_ratio = mahal_obs / (mahal_add + eps)
+            log_mahal_ratio = np.log((mahal_obs + eps) / (mahal_add + eps))
+            df.loc[inds, f"{prefix}epi_mahal"] = epi_mahal
+            df.loc[inds, f"{prefix}mahal_obs"] = mahal_obs
+            df.loc[inds, f"{prefix}mahal_add"] = mahal_add
+            df.loc[inds, f"{prefix}mahal_ratio"] = mahal_ratio
+            df.loc[inds, f"{prefix}log_mahal_ratio"] = log_mahal_ratio
+
+        # Phase 3 — compute metrics (non-Mahal when batched above)
         metrics_iter = df.iterrows()
         if show_progress:
             metrics_iter = tqdm(metrics_iter, total=total, desc="Computing metrics")
 
+        skip_mahal = cov_inv is not None and bool(embeddings)
         for i, (idx, row) in enumerate(metrics_iter):
             if progress_callback:
                 progress_callback(i, total, str(row[id_col]))
             if idx not in embeddings:
                 continue
             h_wt, h_m1, h_m2, h_m12 = embeddings[idx]
-            _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12)
+            _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12, skip_mahal_columns=skip_mahal)
             n_processed += 1
 
         logger.info(
