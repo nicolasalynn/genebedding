@@ -218,6 +218,80 @@ def _sort_sources_first_null(
     return ordered
 
 
+def run_from_single_dataframe(
+    df: pd.DataFrame,
+    output_base: Union[str, Path],
+    source_col: str = "source",
+    model_keys: Optional[Sequence[str]] = None,
+    env_profile: Optional[str] = None,
+    splicing_sources: Optional[set] = None,
+    spliceai_model_dir: Optional[str] = None,
+    id_col: str = "epistasis_id",
+    genome: str = "hg38",
+    show_progress: bool = True,
+    force: bool = False,
+    batch_size: int = 8,
+    save_annotated: bool = True,
+    annotated_format: str = "parquet",
+) -> None:
+    """
+    Run the full processing pipeline from a single DataFrame that contains all
+    double variant IDs and a column indicating the source. Embedding storage
+    directories are split by the value in `source_col`: each source gets
+    `{output_base}/{source_value}/{model_key}.db`. Null is processed first if
+    present so that null covariance is available for non-null sources.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must have columns `id_col` (e.g. epistasis_id) and `source_col` (e.g. source).
+        Each unique value in `source_col` defines a source; rows are grouped by it.
+    output_base : path
+        Base directory for outputs. Each source gets a subdir: output_base/source_name/.
+    source_col : str, default "source"
+        Column name whose values define the source (and thus the storage subdirectory).
+    model_keys, env_profile, splicing_sources, spliceai_model_dir, id_col, genome,
+    show_progress, force, batch_size, save_annotated, annotated_format
+        Passed through to run_sources().
+    """
+    if id_col not in df.columns:
+        raise ValueError(f"DataFrame must have column {id_col!r}. Columns: {list(df.columns)}")
+    if source_col not in df.columns:
+        raise ValueError(f"DataFrame must have column {source_col!r}. Columns: {list(df.columns)}")
+
+    unique_sources = df[source_col].dropna().astype(str).unique().tolist()
+    # Order so null is first; rest in stable order
+    ordered_sources = [s for s in unique_sources if s == NULL_SOURCE_NAME]
+    ordered_sources += [s for s in unique_sources if s != NULL_SOURCE_NAME]
+
+    sources = [
+        (name, df.loc[df[source_col].astype(str) == name].copy())
+        for name in ordered_sources
+    ]
+    logger.info(
+        "Single dataframe: %d rows -> %d sources (col=%r): %s",
+        len(df),
+        len(sources),
+        source_col,
+        [name for name, _ in sources],
+    )
+    run_sources(
+        sources,
+        output_base=output_base,
+        model_keys=model_keys,
+        env_profile=env_profile,
+        splicing_sources=splicing_sources,
+        spliceai_model_dir=spliceai_model_dir,
+        id_col=id_col,
+        genome=genome,
+        show_progress=show_progress,
+        force=force,
+        batch_size=batch_size,
+        save_annotated=save_annotated,
+        annotated_format=annotated_format,
+    )
+
+
 def run_sources(
     sources: Sequence[Tuple[str, Union[str, Path, pd.DataFrame]]],
     output_base: Union[str, Path],
@@ -459,6 +533,79 @@ def run_covariance_and_save(
         saved.append(npz_path)
         logger.info("Saved %s", npz_path)
     return saved
+
+
+def compute_cov_inv(
+    output_base: Union[str, Path],
+    source_names: Optional[Sequence[str]] = None,
+    *,
+    source_df: Optional[pd.DataFrame] = None,
+    source_col: str = "source",
+    model_keys: Optional[Sequence[str]] = None,
+    method: str = "ledoit_wolf",
+    show_progress: bool = True,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Compute cov and cov_inv from embeddings in the given source DBs and return
+    them directly (no disk write). Use a subset of your dataframe to define
+    which sources to use.
+
+    Parameters
+    ----------
+    output_base : path
+        Base directory where source DBs live (output_base/source_name/model_key.db).
+    source_names : list of str, optional
+        Which source subdirs to use (e.g. ["null"] or ["null", "fas_analysis"]).
+        Ignored if source_df is provided.
+    source_df : pandas.DataFrame, optional
+        Subset of your dataframe. Unique values in source_df[source_col] define
+        the source names. Use this to compute cov_inv from "a part of that df".
+    source_col : str, default "source"
+        Column in source_df used to get source names.
+    model_keys : list of str, optional
+        Which models to compute for. Default: all in FULL_MODEL_CONFIG.
+    method : str, default "ledoit_wolf"
+        Covariance estimator (passed to compute_cov_inv_from_paths_combined).
+    show_progress : bool, default True
+
+    Returns
+    -------
+    dict
+        {model_key: (cov, cov_inv)}. Each cov and cov_inv is a numpy array.
+    """
+    from genebeddings.epistasis_features import compute_cov_inv_from_paths_combined
+
+    output_base = Path(output_base)
+    if source_df is not None:
+        if source_col not in source_df.columns:
+            raise ValueError(f"source_df must have column {source_col!r}")
+        source_names = source_df[source_col].dropna().astype(str).unique().tolist()
+    if not source_names:
+        raise ValueError("Provide source_names or source_df with at least one source")
+
+    model_keys = model_keys or list(FULL_MODEL_CONFIG)
+    result: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    for model_key in model_keys:
+        paths = []
+        for src in source_names:
+            p = output_base / src / f"{model_key}.db"
+            if p.exists():
+                paths.append(str(p))
+        if not paths:
+            logger.warning("No DBs found for model %r in sources %s", model_key, source_names)
+            continue
+        try:
+            cov, cov_inv = compute_cov_inv_from_paths_combined(
+                paths,
+                method=method,
+                show_progress=show_progress,
+            )
+            result[model_key] = (cov, cov_inv)
+        except Exception as e:
+            logger.warning("Covariance failed for %r: %s", model_key, e)
+
+    return result
 
 
 def main() -> int:

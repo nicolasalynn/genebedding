@@ -7,7 +7,7 @@ All embeddings, dataframes, and CSVs are stored under **one root directory**. By
 - **data/** — Input and generated CSVs (subset files, `epistasis_aggregated.csv`, etc.). Use `from notebooks.paper_data_config import data_dir`.
 - **embeddings/** — Embedding DBs per source per model, null covariance packs, annotated parquets. Use `embeddings_dir()`.
 
-`run_everything.ipynb` and the data_generation notebooks use `paper_data_config`; run from the repo with this root so all outputs go to the same place.
+`run_everything.ipynb` uses `paper_data_config`; run from the repo with this root so all outputs go to the same place. **Data generation** notebooks live in `/Users/nicolaslynn/Documents/phd/projects/genomenet/data_generation` and run only there; their outputs can be pointed at this pipeline via the same data root or custom paths.
 
 ## Layout
 
@@ -17,7 +17,10 @@ All embeddings, dataframes, and CSVs are stored under **one root directory**. By
 
 ## Processing pipeline
 
-**Input:** For each source, a table with at least an `epistasis_id` column (format: `mut1|mut2` with `GENE:CHROM:POS:REF:ALT:STRAND` per mut).
+**Input:** Either (1) a list of per-source tables, or (2) a single dataframe with all double variant IDs and a `source` column.
+
+- **Per-source list:** Each table has at least an `epistasis_id` column (format: `mut1|mut2` with `GENE:CHROM:POS:REF:ALT:STRAND` per mut). Pass `run_sources([(source_name, path_or_df), ...], output_base=...)`.
+- **Single dataframe:** One table with columns `epistasis_id` and `source` (or another name via `source_col`). Rows are grouped by `source`; embedding storage is split by that value: `{output_base}/{source}/{model_key}.db`. Use `run_from_single_dataframe(df, output_base=..., source_col="source")`. In `run_everything.ipynb`, set `USE_SINGLE_DATAFRAME = True` and `SINGLE_DATAFRAME_PATH` to your combined CSV (e.g. `epistasis_aggregated.csv`).
 
 **Output:**
 
@@ -71,8 +74,10 @@ Or from Python:
 
 ```python
 from pathlib import Path
-from notebooks.process_epistasis import run_sources
+import pandas as pd
+from notebooks.process_epistasis import run_sources, run_from_single_dataframe
 
+# Option A: per-source list
 run_sources(
     [
         ("null", Path("data/null_epistasis.csv")),
@@ -80,7 +85,17 @@ run_sources(
         ("mst1r_analysis", Path("data/mst1r_subset.csv")),
     ],
     output_base=Path("embeddings"),
-    model_keys=["nt500_multi", "convnova", "borzoi"],  # optional subset
+    model_keys=["nt500_multi", "convnova", "borzoi"],
     id_col="epistasis_id",
+)
+
+# Option B: single dataframe with 'source' column (storage split by source)
+df = pd.read_csv("data/epistasis_aggregated.csv")  # columns: epistasis_id, source, ...
+run_from_single_dataframe(
+    df,
+    output_base=Path("embeddings"),
+    source_col="source",
+    id_col="epistasis_id",
+    model_keys=["nt500_multi", "convnova", "borzoi"],
 )
 ```
