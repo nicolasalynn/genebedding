@@ -58,6 +58,8 @@ embeddings/
 
 **Recompute metrics with a custom cov_inv (after processing):** Once the new DBs are filled, (1) compute cov_inv from a chosen source and set of epistasis_ids with `compute_cov_inv(output_base, source_df=df_subset, source_col="source", id_col="epistasis_id", model_keys=...)`; (2) recompute metrics with `recompute_metrics_with_cov_inv(...)`. You get a **series of tables**: one DataFrame per model (tool). Each table has the same structure (epistasis_id, source, len_WT_M1, epi_mahal, …); only the tool differs. Save each table separately (e.g. one parquet per tool) for downstream use.
 
+**Pipeline dependency (seqmat):** When the pipeline **computes** embeddings from coordinates (epistasis_id or chrom/pos/ref/alt), it uses **seqmat** to fetch reference sequence and apply mutations (`add_epistasis_metrics` → `_prepare_epistasis_sequences` in `genebeddings`). Install with `pip install -e ".[pipeline]"` and configure a reference genome (e.g. hg38) for seqmat. If you only load pre-computed embeddings from DBs (e.g. via `embedding_lookup_bases`), seqmat is not required.
+
 **Environment profiles:** Some models require a dedicated environment. Use one profile per run so only the models for the current env execute:
 - **alphagenome** — run only AlphaGenome (use in AlphaGenome / JAX env)
 - **evo2** — run only Evo2 (use in Evo2 env)

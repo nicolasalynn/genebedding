@@ -60,6 +60,10 @@ all = [
     "spliceai-pytorch",
 ]
 
+# Pipeline: epistasis processing from coordinates (add_epistasis_metrics, embed_epistasis, etc.)
+# Requires reference genome FASTA configured for seqmat (e.g. hg38).
+pipeline = ["seqmat>=0.1"]
+
 # Development
 dev = [
     "pytest>=7.0",
