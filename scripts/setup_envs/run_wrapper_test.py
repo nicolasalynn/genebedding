@@ -25,6 +25,10 @@ def run_test(wrapper_key: str, seq: str = DEFAULT_SEQ) -> bool:
             from genebeddings.wrappers import Evo2Wrapper
             w = Evo2Wrapper(model="7b_base")
         elif wrapper_key == "spliceai":
+            import os
+            if not os.environ.get("OPENSPLICEAI_MODEL_DIR"):
+                print(f"{wrapper_key} SKIP OPENSPLICEAI_MODEL_DIR not set", file=sys.stderr)
+                return True  # skip, do not fail the run
             from genebeddings.wrappers import SpliceAIWrapper
             w = SpliceAIWrapper()
         elif wrapper_key == "convnova":

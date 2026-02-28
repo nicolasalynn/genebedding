@@ -92,7 +92,7 @@ for row in "${ENVS[@]}"; do
     status="${result%%|*}"
     detail="${result#*|}"
     echo "  $w: $status $detail"
-    if [ "$status" = "OK" ]; then
+    if [ "$status" = "OK" ] && echo "$detail" | grep -q "shape="; then
       ((PASSED++)) || true
     fi
     echo "${env_name}|${w}|${status}|${detail}" >> "$REPORT_FILE"

@@ -86,11 +86,18 @@ else
   REMOTE_REPO_PATH=$(printf '%s' "$REPO_PATH" | sed "s/'/'\\\\''/g")
 fi
 REMOTE_REPORT_PATH="${REMOTE_REPO_PATH}/scripts/setup_envs/${REPORT_NAME}"
+# For scp we need a path the remote can expand; avoid $HOME so local shell does not expand it
+if [ "$REPO_PATH" = "~/genebeddings" ]; then
+  SCP_REPORT_PATH="~/genebeddings/scripts/setup_envs/${REPORT_NAME}"
+else
+  SCP_REPORT_PATH="${REMOTE_REPORT_PATH}"
+fi
 RU=$(printf '%s' "$REPO_URL" | sed "s/'/'\\\\''/g")
 
-# Build remote commands: clone or pull, source conda from common locations, then run test script.
+# Build remote commands: clone or pull, source conda, load HF token, then run test script.
 REMOTE_SCRIPT="set -e
 REPO_PATH=$REMOTE_REPO_PATH
+if [ -f ~/.hf_token ]; then export HF_TOKEN=\$(cat ~/.hf_token); export HUGGING_FACE_HUB_TOKEN=\$HF_TOKEN; fi
 if [ ! -d \"\$REPO_PATH\" ]; then git clone '$RU' \"\$REPO_PATH\"; fi
 cd \"\$REPO_PATH\" && git fetch origin && git checkout $BRANCH && git pull origin $BRANCH
 for c in ~/miniconda3 ~/anaconda3 /opt/conda; do
@@ -112,12 +119,23 @@ fi
 # Accept Conda ToS so conda create works non-interactively (new Miniconda default)
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
-# When --skip-setup: refresh editable install (pip install -e .) in each existing env so new pyproject deps are installed
+# When --skip-setup: refresh editable install and env-specific deps in each existing env
 if [ -n \"$SKIP_SETUP\" ]; then
   for env in nt alphagenome evo2 spliceai convnova borzoi mutbert hyenadna caduceus dnabert rinalmo specieslm genebeddings_main; do
     if conda activate \"\$env\" 2>/dev/null; then
       echo \"Refreshing \$env ...\"
-      pip install -e . -q || true
+      pip install --upgrade setuptools wheel -q 2>/dev/null || true
+      pip install -e . -q 2>/dev/null || true
+      case \"\$env\" in
+        evo2) pip install evo2 -q 2>/dev/null || true ;;
+        rinalmo) pip install rinalmo -q 2>/dev/null || true ;;
+        borzoi) pip install \"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl\" -q 2>/dev/null || pip install \"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl\" -q 2>/dev/null || pip install flash-attn -q 2>/dev/null || true ;;
+        caduceus) pip install mamba_ssm -q 2>/dev/null || true ;;
+        dnabert) pip install einops -q 2>/dev/null || true ;;
+        specieslm) pip install \"torch>=2.6\" -q 2>/dev/null || true ;;
+        mutbert) pip install \"transformers>=4.30,<4.46\" -q 2>/dev/null || true ;;
+        genebeddings_main) pip install transformers omegaconf rinalmo borzoi-pytorch spliceai-pytorch -q 2>/dev/null || true ;;
+      esac
       conda deactivate 2>/dev/null || true
     fi
   done
@@ -132,8 +150,8 @@ ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$SSH_TARGET" "$REM
 
 if [ -n "$GET_REPORT" ]; then
   local_report="./${REPORT_NAME}"
-  scp -o StrictHostKeyChecking=accept-new "$SSH_TARGET:$REMOTE_REPORT_PATH" "$local_report" 2>/dev/null || {
-    echo "Warning: could not scp report (path may differ if REPO_PATH expanded). Try: scp $SSH_TARGET:$REMOTE_REPORT_PATH ." >&2
+  scp -o StrictHostKeyChecking=accept-new "$SSH_TARGET:$SCP_REPORT_PATH" "$local_report" 2>/dev/null || {
+    echo "Warning: could not scp report. Try: scp $SSH_TARGET:$SCP_REPORT_PATH ." >&2
     exit 0
   }
   echo "Report saved to $local_report"

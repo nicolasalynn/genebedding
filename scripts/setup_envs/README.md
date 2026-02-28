@@ -45,6 +45,7 @@ CONDA_ENV=my_nt CUDA_VERSION=12.4 bash scripts/setup_envs/setup_nucleotide_trans
 
 - **AlphaGenome:** Installs `alphagenome_research` from GitHub (no PyPI package). Clone dir defaults to `$HOME/alphagenome_research`; override with `ALPHAGENOME_CLONE_DIR`.
 - **ConvNova:** For pretrained weights, add `genebeddings/assets/convnova/convnova.yaml` and `last.backbone.pth`; otherwise the wrapper uses random init.
+- **Borzoi (flash-attn):** The default FlashZoi checkpoint requires `flash_attn`. The setup script tries a pre-built wheel from [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention/releases) (Linux, Python 3.10, CUDA 12, PyTorch 2.4/2.5) so you don’t need to compile. If that fails, it falls back to building from source (needs nvcc, ninja, ~5 min).
 - **SpliceAI:** Set `OPENSPLICEAI_MODEL_DIR` to a directory containing OpenSpliceAI checkpoints if using the OpenSpliceAI backend.
 - **CUDA:** Default is CUDA 12.1 (`cu121`). Set `CUDA_VERSION=124` (or your driver version) if needed.
 
@@ -56,3 +57,26 @@ bash scripts/setup_envs/test_all_envs.sh
 ```
 
 Use `--skip-setup` to only run wrapper tests in already-created envs. When the package is made pip-installable, the setup and test scripts will be included so the same workflow can be run from an install.
+
+**HuggingFace token (for NT and other gated models):** On the remote host (e.g. Lambda instance), create a file so the token is available when the test runs:
+
+```bash
+# On the remote (e.g. ssh ubuntu@<ip>):
+echo 'YOUR_HF_TOKEN' > ~/.hf_token && chmod 600 ~/.hf_token
+```
+
+The remote script sources `~/.hf_token` and sets `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` before running tests. Use a token with read access to the models you need (e.g. InstaDeepAI/nucleotide-transformer-*, AlphaGenome, etc.).
+
+**Remote testing (e.g. Lambda Labs):** From your laptop, run the full test on a GPU host via SSH:
+
+```bash
+# From repo root (or scripts/setup_envs)
+bash scripts/setup_envs/run_tests_remote.sh ubuntu@<instance-ip>
+```
+
+Options: `--repo-url URL`, `--repo-path PATH` (on remote, default `~/genebeddings`), `--branch BRANCH`, `--skip-setup` (only run wrapper tests; envs must already exist), `--get-report` (scp the report file into the current directory). Repo URL and branch default to the current git origin and branch.
+
+```bash
+# Re-run only tests (no setup), fetch report
+bash scripts/setup_envs/run_tests_remote.sh --skip-setup --get-report ubuntu@10.0.0.5
+```
