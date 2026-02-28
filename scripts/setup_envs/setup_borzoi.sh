@@ -16,7 +16,8 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
+# PyTorch >=2.5 required for torch.library.wrap_triton (used by flash-attn 2.8.x)
+pip install "torch>=2.5" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
 pip install "borzoi-pytorch>=0.4"
 # flash-attn: pre-built wheels (no nvcc needed). Try torch2.5 then 2.4; else build from source.
 FLASH_WHEEL_2_5="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"

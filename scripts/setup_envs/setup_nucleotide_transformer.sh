@@ -17,9 +17,9 @@ conda create -n "$CONDA_ENV" python=3.10 -y
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-# PyTorch with CUDA
+# PyTorch with CUDA (>=2.6 required for torch.load CVE-2025-32434 when loading HF .bin weights)
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.0" "torchvision" "torchaudio" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
+pip install "torch>=2.6" "torchvision" "torchaudio" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
 
 # Transformers + genebeddings[nt]
 pip install "transformers>=4.30"

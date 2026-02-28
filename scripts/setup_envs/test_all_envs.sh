@@ -16,6 +16,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Load HF token so NT/AlphaGenome and gated models work when run directly on Lambda
+if [ -f ~/.hf_token ]; then export HF_TOKEN=$(cat ~/.hf_token); export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; fi
+
 # conda init
 source "$(conda info --base)/etc/profile.d/conda.sh"
 

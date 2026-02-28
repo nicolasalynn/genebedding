@@ -12,7 +12,8 @@ When a setup fails, the test run now writes the **last 100 lines** of that setup
 
 | Check | Command | What we need |
 |-------|---------|--------------|
-| HuggingFace token (for NT, gated models) | `cat ~/.hf_token` | A file with a single line: your HF token. If missing: `echo 'YOUR_TOKEN' > ~/.hf_token && chmod 600 ~/.hf_token` |
+| HuggingFace token (for NT, AlphaGenome, gated models) | `cat ~/.hf_token` | A file with a single line: your **valid** HF token (create at huggingface.co/settings/tokens). If invalid, replace it. `test_all_envs.sh` auto-loads it when present. |
+| git-lfs (for HyenaDNA and some HF models) | `git lfs version` | If missing: `sudo apt-get update && sudo apt-get install -y git-lfs && git lfs install` |
 | GPU visible | `nvidia-smi` | At least one GPU listed |
 | Conda | `conda --version` | e.g. 24.x or 25.x |
 | Repo and branch | `cd ~/genebeddings && git branch && git log -1 --oneline` | Branch should match what you push (e.g. `epistasis_framework_upgrade`). **Push your latest changes before running the remote test** so Lambda gets the fixes. |
@@ -74,3 +75,50 @@ Use this when a wrapper is failing: run the suggested command **on the Lambda ho
    - For any non–SETUP_FAIL test failure: the FAIL line from the report (DETAIL column)
 
 With that we can fix the remaining setups and get **all** wrappers running.
+
+---
+
+## 5. Quick fixes when you only ran `--skip-setup`
+
+If you ran `test_all_envs.sh --skip-setup` and some envs were never set up, install the missing bits and re-run tests:
+
+```bash
+# On Lambda, from repo root (~/genebeddings). Pull latest first: git pull origin epistasis_framework_upgrade
+
+# 1) HF token (required for NT, AlphaGenome). Use a valid token from https://huggingface.co/settings/tokens
+echo 'YOUR_HF_TOKEN' > ~/.hf_token && chmod 600 ~/.hf_token
+
+# 2) git-lfs (required for HyenaDNA and some HF models)
+sudo apt-get update && sudo apt-get install -y git-lfs && git lfs install
+
+# 3) Missing packages in envs that were never set up
+conda activate evo2    && pip install evo2
+conda activate specieslm && pip install "transformers>=4.30,<4.46"
+
+# 4) rinalmo: torch must be installed first; flash-attn must build with --no-build-isolation so it sees torch
+conda activate rinalmo && pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu121" && \
+  pip install flash-attn==2.3.2 --no-build-isolation && \
+  pip install "git+https://github.com/lbcb-sci/RiNALMo.git"
+
+# 5) caduceus / dnabert: force older transformers (tie_weights/recompute_mapping and is_decoder removed in 4.46+)
+conda activate caduceus && pip install "transformers>=4.30,<4.46" --force-reinstall
+conda activate dnabert  && pip install "transformers>=4.30,<4.46" --force-reinstall
+
+# 6) Borzoi needs PyTorch >=2.5 for wrap_triton
+conda activate borzoi && pip install "torch>=2.5" --index-url "https://download.pytorch.org/whl/cu121"
+
+# 7) genebeddings_main: install in order (torch first, then flash-attn with --no-build-isolation, then rinalmo)
+conda activate genebeddings_main && \
+  pip install "torch>=2.5" --index-url "https://download.pytorch.org/whl/cu121" && \
+  pip install "transformers>=4.30,<4.46" omegaconf && \
+  pip install flash-attn==2.3.2 --no-build-isolation && \
+  pip install "git+https://github.com/lbcb-sci/RiNALMo.git" borzoi-pytorch spliceai-pytorch
+```
+
+Then run again: `bash scripts/setup_envs/test_all_envs.sh --skip-setup`.
+
+**Or run the single fix script** (does all of the above in order):
+
+```bash
+bash scripts/setup_envs/fix_envs_after_skip_setup.sh
+```

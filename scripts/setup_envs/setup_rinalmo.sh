@@ -26,7 +26,8 @@ if [ ! -d "$CLONE_DIR/.git" ]; then
   git clone https://github.com/lbcb-sci/RiNALMo.git "$CLONE_DIR"
 fi
 pip install "$CLONE_DIR"
-pip install flash-attn==2.3.2
+# flash-attn build needs torch in environment; --no-build-isolation so it sees it
+pip install flash-attn==2.3.2 --no-build-isolation
 
 cd "$REPO_ROOT"
 pip install -e .

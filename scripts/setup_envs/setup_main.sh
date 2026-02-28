@@ -17,8 +17,12 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
-pip install "transformers>=4.30" "borzoi-pytorch>=0.4" rinalmo spliceai-pytorch omegaconf
+# torch>=2.6 for NT (torch.load CVE) and borzoi (wrap_triton)
+pip install "torch>=2.6" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
+pip install "transformers>=4.30,<4.46" "borzoi-pytorch>=0.4" spliceai-pytorch omegaconf
+# RiNALMo has no PyPI package; flash-attn must see torch (--no-build-isolation)
+pip install flash-attn==2.3.2 --no-build-isolation
+pip install "git+https://github.com/lbcb-sci/RiNALMo.git"
 pip install -e .
 
 echo ""
@@ -26,7 +30,7 @@ echo ">>> Smoke test: one model per family (NT, ConvNova, Borzoi, RiNALMo)"
 python -c "
 from genebeddings.wrappers import NTWrapper, ConvNovaWrapper, BorzoiWrapper, RiNALMoWrapper
 for name, w in [
-    ('NT', NTWrapper(model='nt500_multi')),
+    ('NT', NTWrapper(model='nt2500_multi')),
     ('ConvNova', ConvNovaWrapper()),
     ('RiNALMo', RiNALMoWrapper(model_name='giga-v1')),
 ]:

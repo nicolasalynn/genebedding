@@ -17,7 +17,8 @@ conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
 pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
-pip install "transformers>=4.30" einops
+# Pin transformers: BertConfig.is_decoder removed in 4.46+
+pip install "transformers>=4.30,<4.46" einops
 pip install -e .
 
 echo ""

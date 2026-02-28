@@ -17,7 +17,7 @@ conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
 pip install "torch>=2.6" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
-pip install "transformers>=4.30"
+pip install "transformers>=4.30,<4.46"
 pip install -e .
 
 echo ""

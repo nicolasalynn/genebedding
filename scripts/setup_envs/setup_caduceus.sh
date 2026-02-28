@@ -17,7 +17,8 @@ conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
 pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
-pip install "transformers>=4.30" mamba_ssm
+# Pin transformers: Caduceus uses tie_weights(recompute_mapping=...) removed in 4.46+
+pip install "transformers>=4.30,<4.46" mamba_ssm
 pip install -e .
 
 echo ""
