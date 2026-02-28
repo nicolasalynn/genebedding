@@ -25,12 +25,17 @@ pip install "torch>=2.0" "torchvision" "torchaudio" --index-url "https://downloa
 pip install "transformers>=4.30"
 pip install -e ".[nt]"
 
-# Smoke test (downloads HF model on first run)
+# Smoke test (downloads HF model on first run; gated model requires HF_TOKEN or ~/.hf_token)
 echo ""
-echo ">>> Smoke test: NTWrapper(nt500_multi)"
+echo ">>> Smoke test: NTWrapper(nt2500_multi)"
 python -c "
+import os
+token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+if token:
+    from huggingface_hub import login
+    login(token=token)
 from genebeddings.wrappers import NTWrapper
-w = NTWrapper(model='nt500_multi')
+w = NTWrapper(model='nt2500_multi')
 e = w.embed('ACGT' * 100, pool='mean')
 print(f'  embed shape: {e.shape}')
 print('  OK')

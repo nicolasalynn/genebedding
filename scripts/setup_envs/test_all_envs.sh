@@ -21,6 +21,8 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 
 # Report file (append each result)
 REPORT_FILE="${REPORT_FILE:-$SCRIPT_DIR/test_all_envs_report.txt}"
+LOG_DIR="${SETUP_LOG_DIR:-$SCRIPT_DIR/setup_logs}"
+mkdir -p "$LOG_DIR"
 echo "ENV|WRAPPER|STATUS|DETAIL" > "$REPORT_FILE"
 
 # Each row: "setup_script|conda_env|wrapper_key"
@@ -74,10 +76,13 @@ for row in "${ENVS[@]}"; do
 
   if [ "$SKIP_SETUP" = false ]; then
     echo "  Running $setup_script ..."
-    if ! bash "$SCRIPT_DIR/$setup_script"; then
-      echo "  Setup failed for $env_name" >> "$REPORT_FILE"
+    SETUP_LOG="$LOG_DIR/setup_${env_name}.log"
+    if ! bash "$SCRIPT_DIR/$setup_script" 2>&1 | tee "$SETUP_LOG"; then
+      # Capture last 100 lines for debugging; report points to log
+      tail -100 "$SETUP_LOG" > "$LOG_DIR/setup_${env_name}_last100.txt"
+      echo "  Setup failed for $env_name (last 100 lines in $LOG_DIR/setup_${env_name}_last100.txt)" >&2
       for w in "${wrapper_keys[@]}"; do
-        echo "${env_name}|${w}|SETUP_FAIL|setup script failed" >> "$REPORT_FILE"
+        echo "${env_name}|${w}|SETUP_FAIL|see $LOG_DIR/setup_${env_name}_last100.txt" >> "$REPORT_FILE"
         ((TOTAL++)) || true
       done
       continue

@@ -125,10 +125,14 @@ if [ -n \"$SKIP_SETUP\" ]; then
     if conda activate \"\$env\" 2>/dev/null; then
       echo \"Refreshing \$env ...\"
       pip install --upgrade setuptools wheel -q 2>/dev/null || true
-      pip install -e . -q 2>/dev/null || true
+      if [ \"\$env\" = alphagenome ]; then
+        pip install . -q 2>/dev/null || true
+      else
+        pip install -e . -q 2>/dev/null || true
+      fi
       case \"\$env\" in
-        evo2) pip install evo2 -q 2>/dev/null || true ;;
-        rinalmo) pip install rinalmo -q 2>/dev/null || true ;;
+        evo2) conda install -c conda-forge transformer-engine-torch=2.3.0 -y -q 2>/dev/null || true; pip install flash-attn==2.8.0.post2 --no-build-isolation -q 2>/dev/null || true; pip install evo2 -q 2>/dev/null || true ;;
+        rinalmo) pip install \"git+https://github.com/lbcb-sci/RiNALMo.git\" flash-attn==2.3.2 -q 2>/dev/null || true ;;
         borzoi) pip install \"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl\" -q 2>/dev/null || pip install \"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl\" -q 2>/dev/null || pip install flash-attn -q 2>/dev/null || true ;;
         caduceus) pip install mamba_ssm -q 2>/dev/null || true ;;
         dnabert) pip install einops -q 2>/dev/null || true ;;
@@ -155,4 +159,7 @@ if [ -n "$GET_REPORT" ]; then
     exit 0
   }
   echo "Report saved to $local_report"
+  # Fetch setup failure logs for debugging (last 100 lines per failed env)
+  scp -o StrictHostKeyChecking=accept-new -r "$SSH_TARGET:~/genebeddings/scripts/setup_envs/setup_logs" ./ 2>/dev/null || true
+  [ -d ./setup_logs ] && [ -n "$(ls -A ./setup_logs 2>/dev/null)" ] && echo "Setup failure logs in ./setup_logs/"
 fi

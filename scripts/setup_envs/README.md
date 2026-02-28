@@ -32,7 +32,7 @@ Requires: conda, CUDA-capable GPU, NVIDIA drivers.
 cd /path/to/genebeddings
 bash scripts/setup_envs/setup_nucleotide_transformer.sh
 conda activate nt
-python -c "from genebeddings.wrappers import NTWrapper; w = NTWrapper(model='nt500_multi'); print(w.embed('ACGT'*100, pool='mean').shape)"
+python -c "from genebeddings.wrappers import NTWrapper; w = NTWrapper(model='nt2500_multi'); print(w.embed('ACGT'*100, pool='mean').shape)"
 ```
 
 Override defaults with env vars (see top of each script), e.g.:
@@ -43,7 +43,10 @@ CONDA_ENV=my_nt CUDA_VERSION=12.4 bash scripts/setup_envs/setup_nucleotide_trans
 
 **Notes:**
 
-- **AlphaGenome:** Installs `alphagenome_research` from GitHub (no PyPI package). Clone dir defaults to `$HOME/alphagenome_research`; override with `ALPHAGENOME_CLONE_DIR`.
+- **Nucleotide Transformer:** Tests use the 2.5b multi-species model (`nt2500_multi` → [InstaDeepAI/nucleotide-transformer-2.5b-multi-species](https://huggingface.co/InstaDeepAI/nucleotide-transformer-2.5b-multi-species)). Gated; requires a HuggingFace token (see below).
+- **AlphaGenome:** Installs `alphagenome_research` from [GitHub](https://github.com/google-deepmind/alphagenome_research). Clone dir defaults to `$HOME/alphagenome_research`; override with `ALPHAGENOME_CLONE_DIR`. In this env, genebeddings is installed **non-editable** (`pip install .`) so the env works even when the build backend lacks the editable hook (“No module named 'genebeddings'” is then avoided).
+- **Evo2:** Per [ArcInstitute/evo2](https://github.com/ArcInstitute/evo2): Python 3.12, [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) (conda `transformer-engine-torch=2.3.0`), Flash Attention 2.8.0.post2, then `pip install evo2`.
+- **RiNALMo:** Per [lbcb-sci/RiNALMo](https://github.com/lbcb-sci/RiNALMo): clone repo, `pip install .`, then `pip install flash-attn==2.3.2`. Clone dir defaults to `$HOME/RiNALMo`; override with `RINALMO_CLONE_DIR`.
 - **ConvNova:** For pretrained weights, add `genebeddings/assets/convnova/convnova.yaml` and `last.backbone.pth`; otherwise the wrapper uses random init.
 - **Borzoi (flash-attn):** The default FlashZoi checkpoint requires `flash_attn`. The setup script tries a pre-built wheel from [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention/releases) (Linux, Python 3.10, CUDA 12, PyTorch 2.4/2.5) so you don’t need to compile. If that fails, it falls back to building from source (needs nvcc, ninja, ~5 min).
 - **SpliceAI:** Set `OPENSPLICEAI_MODEL_DIR` to a directory containing OpenSpliceAI checkpoints if using the OpenSpliceAI backend.

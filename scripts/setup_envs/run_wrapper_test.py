@@ -16,8 +16,17 @@ DEFAULT_SEQ = "ACGT" * 100   # 400 bp
 def run_test(wrapper_key: str, seq: str = DEFAULT_SEQ) -> bool:
     try:
         if wrapper_key == "nt":
+            import os
+            token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            if token:
+                try:
+                    from huggingface_hub import login
+                    login(token=token)
+                except Exception:
+                    pass
             from genebeddings.wrappers import NTWrapper
-            w = NTWrapper(model="nt500_multi")
+            # Use 2.5b multi-species (InstaDeepAI/nucleotide-transformer-2.5b-multi-species); gated, needs HF token
+            w = NTWrapper(model="nt2500_multi")
         elif wrapper_key == "alphagenome":
             from genebeddings.wrappers import AlphaGenomeWrapper
             w = AlphaGenomeWrapper(model_version="fold_0", source="huggingface")

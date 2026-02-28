@@ -33,8 +33,9 @@ if [ ! -d "$CLONE_DIR/.git" ]; then
 fi
 pip install -e "$CLONE_DIR"
 
-# Genebeddings (no NT/borzoi deps needed for this env)
-pip install -e .
+# Genebeddings: use non-editable install so this env works even if setuptools
+# lacks build_editable (avoids "No module named 'genebeddings'" in this env).
+pip install .
 
 # Smoke test (may download weights)
 echo ""

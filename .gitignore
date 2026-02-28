@@ -7,3 +7,6 @@ genebeddings/assets/benchmarks
 # Jupyter checkpoint dirs (do not track)
 **/.ipynb_checkpoints/
 .ipynb_checkpoints/
+
+# Setup failure logs (generated on remote test runs)
+scripts/setup_envs/setup_logs/
