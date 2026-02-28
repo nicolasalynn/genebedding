@@ -25,6 +25,7 @@ pip install "git+https://github.com/lbcb-sci/RiNALMo.git"
 pip install flash-attn --no-build-isolation
 # git-lfs for HyenaDNA model download
 sudo apt-get install -y git-lfs 2>/dev/null && git lfs install || true
+pip install seqmat scipy scikit-learn pyarrow
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

@@ -25,7 +25,7 @@ conda install -c conda-forge transformer-engine-torch=2.3.0 -y
 pip install psutil ninja
 pip install flash-attn --no-build-isolation
 # evo2 + core deps
-pip install evo2 matplotlib scipy scikit-learn pandas tqdm
+pip install evo2 matplotlib scipy scikit-learn pandas tqdm seqmat pyarrow
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

@@ -4,6 +4,8 @@
 
 This document describes how each **source dataset** of epistasis pairs or single variants is created. These datasets are the inputs to the **processing** pipeline (see `notebooks.processing.process_epistasis`), which computes embeddings and stores them in per-model databases.
 
+**Single entry point for the pipeline:** Edit `notebooks/processing/pipeline_config.py` to define sources, which tools run per source, and per-tool batch sizes and conda envs. Run locally via `notebooks/processing/run_everything.ipynb` (one env per kernel run) or on a cluster via `scripts/run_pipeline_cluster.sh` (embed per env, then `--phase metrics`). Output: `{output_base}/{source}/{model_key}.db`, `{output_base}/null_cov/{model_key}_pack.npz`, and one sheet per tool at `{output_base}/sheets/epistasis_metrics_{tool}.parquet`.
+
 ---
 
 ## Identifier formats

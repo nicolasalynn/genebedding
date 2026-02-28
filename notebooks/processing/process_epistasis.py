@@ -7,12 +7,11 @@ and writes one SQLite database per model under:
 
     {output_base}/{source_name}/{model_key}.db
 
-The special source name 'null' is always processed first so that a
-background distribution of embedding shifts exists for each model before
-any other analyses.
+Sources in pipeline_config.COV_INV_SOURCE_NAMES are processed first; cov_inv
+(Mahalanobis background) is computed from them and used for all other sources.
 
-SpliceAI runs only for "splicing" sources (fas_analysis, mst1r_analysis, kras).
-AlphaGenome and all other models run for every source.
+SpliceAI runs only for sources in pipeline_config.SPLICEAI_SOURCE_NAMES.
+All other tools run for every source. AlphaGenome and evo2 use dedicated envs.
 
 **Environment profiles:** Some models require a dedicated conda/env (e.g. AlphaGenome
 uses JAX/CUDA, Evo2 has its own stack). Use an env profile so only the models for the
@@ -45,8 +44,15 @@ import pandas as pd
 # Source name used for background / null distribution; must be processed first
 NULL_SOURCE_NAME = "null"
 
-# SpliceAI runs only for these sources (splicing-related datasets)
-SPLICING_SOURCES = {"fas_analysis", "mst1r_analysis", "kras"}
+# Source lists from config (exactly as in the data file). Lazy import to avoid circular import.
+def _spliceai_run_for_source(source_name: str) -> bool:
+    from notebooks.processing.pipeline_config import SPLICEAI_SOURCE_NAMES
+    return source_name in SPLICEAI_SOURCE_NAMES
+
+
+def _is_cov_inv_source(source_name: str) -> bool:
+    from notebooks.processing.pipeline_config import COV_INV_SOURCE_NAMES
+    return source_name in COV_INV_SOURCE_NAMES
 
 # All model keys and their (context, init_spec).
 # init_spec: "nt" => NTWrapper(model=key); "alphagenome" => AlphaGenomeWrapper(fixed_length=8192);
@@ -290,17 +296,10 @@ def _load_epistasis_df(path: Union[str, Path], id_col: str = "epistasis_id") -> 
 def _sort_sources_first_null(
     sources: Sequence[Tuple[str, Union[str, Path, pd.DataFrame]]],
 ) -> List[Tuple[str, Union[str, Path, pd.DataFrame]]]:
-    """Return sources with 'null' first; rest in original order."""
-    ordered = []
-    null_item = None
-    for name, payload in sources:
-        if name == NULL_SOURCE_NAME:
-            null_item = (name, payload)
-        else:
-            ordered.append((name, payload))
-    if null_item is not None:
-        ordered.insert(0, null_item)
-    return ordered
+    """Return sources with okgp (cov_inv) sources first, then rest. Process okgp first so cov_inv can be built."""
+    okgp_first = [(n, p) for n, p in sources if _is_cov_inv_source(n)]
+    rest = [(n, p) for n, p in sources if not _is_cov_inv_source(n)]
+    return okgp_first + rest
 
 
 def run_from_single_dataframe(
@@ -319,8 +318,11 @@ def run_from_single_dataframe(
     show_progress: bool = True,
     force: bool = False,
     batch_size: int = 8,
+    batch_size_by_model: Optional[Dict[str, int]] = None,
     save_annotated: bool = True,
     annotated_format: str = "parquet",
+    use_by_tool: bool = False,
+    status_path: Optional[Union[str, Path]] = None,
 ) -> None:
     """
     Run the full processing pipeline from a single DataFrame that contains all
@@ -328,6 +330,8 @@ def run_from_single_dataframe(
     directories are split by the value in `source_col`: each source gets
     `{output_base}/{source_value}/{model_key}.db`. Null is processed first if
     present so that null covariance is available for non-null sources.
+
+    If use_by_tool is True, runs one tool at a time over all sources (run_sources_by_tool).
 
     Parameters
     ----------
@@ -340,7 +344,7 @@ def run_from_single_dataframe(
         Column name whose values define the source (and thus the storage subdirectory).
     model_keys, env_profile, splicing_sources, source_model_map, embedding_lookup_bases,
     embedding_lookup_flat, spliceai_model_dir, id_col, genome, show_progress, force, batch_size,
-    save_annotated, annotated_format
+    batch_size_by_model, save_annotated, annotated_format
         Passed through to run_sources().
     """
     if id_col not in df.columns:
@@ -364,24 +368,50 @@ def run_from_single_dataframe(
         source_col,
         [name for name, _ in sources],
     )
-    run_sources(
-        sources,
-        output_base=output_base,
-        model_keys=model_keys,
-        env_profile=env_profile,
-        splicing_sources=splicing_sources,
-        source_model_map=source_model_map,
-        embedding_lookup_bases=embedding_lookup_bases,
-        embedding_lookup_flat=embedding_lookup_flat,
-        spliceai_model_dir=spliceai_model_dir,
-        id_col=id_col,
-        genome=genome,
-        show_progress=show_progress,
-        force=force,
-        batch_size=batch_size,
-        save_annotated=save_annotated,
-        annotated_format=annotated_format,
-    )
+    if use_by_tool:
+        if model_keys is None and env_profile is not None:
+            model_keys = get_model_keys_for_env(env_profile)
+        model_keys = model_keys or DEFAULT_MODEL_KEYS
+        run_sources_by_tool(
+            sources,
+            output_base=output_base,
+            model_keys=model_keys,
+            env_profile=env_profile,
+            splicing_sources=splicing_sources,
+            source_model_map=source_model_map,
+            embedding_lookup_bases=embedding_lookup_bases,
+            embedding_lookup_flat=embedding_lookup_flat,
+            spliceai_model_dir=spliceai_model_dir,
+            id_col=id_col,
+            genome=genome,
+            show_progress=show_progress,
+            force=force,
+            batch_size=batch_size,
+            batch_size_by_model=batch_size_by_model,
+            save_annotated=save_annotated,
+            annotated_format=annotated_format,
+            status_path=status_path,
+        )
+    else:
+        run_sources(
+            sources,
+            output_base=output_base,
+            model_keys=model_keys,
+            env_profile=env_profile,
+            splicing_sources=splicing_sources,
+            source_model_map=source_model_map,
+            embedding_lookup_bases=embedding_lookup_bases,
+            embedding_lookup_flat=embedding_lookup_flat,
+            spliceai_model_dir=spliceai_model_dir,
+            id_col=id_col,
+            genome=genome,
+            show_progress=show_progress,
+            force=force,
+            batch_size=batch_size,
+            batch_size_by_model=batch_size_by_model,
+            save_annotated=save_annotated,
+            annotated_format=annotated_format,
+        )
 
 
 def run_sources(
@@ -399,6 +429,7 @@ def run_sources(
     show_progress: bool = True,
     force: bool = False,
     batch_size: int = 8,
+    batch_size_by_model: Optional[Dict[str, int]] = None,
     save_annotated: bool = True,
     annotated_format: str = "parquet",
 ) -> None:
@@ -407,7 +438,7 @@ def run_sources(
     and add metrics. Writes one .db per model under output_base/source_name/,
     and optionally the annotated DataFrame (with metric columns) to
     output_base/source_name/{model_key}_annotated.parquet (or .csv).
-    SpliceAI is run only for sources in splicing_sources (default: fas_analysis, mst1r_analysis, kras).
+    SpliceAI is run only for sources in pipeline_config.SPLICEAI_SOURCE_NAMES.
     Use source_model_map to override which models run per source (see below).
 
     Parameters
@@ -416,7 +447,7 @@ def run_sources(
     output_base : path
     model_keys : list of str, optional; which models to run. If None, resolved from env_profile or DEFAULT_MODEL_KEYS.
     env_profile : str, optional; if model_keys is None, use get_model_keys_for_env(env_profile). One of: "alphagenome", "evo2", "main", "all".
-    splicing_sources : set of str, optional; sources for which SpliceAI is run; default SPLICING_SOURCES. Ignored when source_model_map is set.
+    splicing_sources : set of str, optional; unused (kept for API compat). SpliceAI runs only for sources in SPLICEAI_SOURCE_NAMES. Ignored when source_model_map is set.
     source_model_map : dict, optional; map source_name -> list of model keys for that source. If a source is missing, model_keys is used. Enables e.g. running SpliceAI only for certain sources or restricting null to a subset of models.
     embedding_lookup_bases : sequence of paths, optional; directories to search for existing embeddings. Layout depends on embedding_lookup_flat (see below).
     embedding_lookup_flat : bool, optional; if False (default), each base has layout base/source_name/model_key.db. If True, each base has .db files directly: base/model_key.db (one directory per run, no source subdirs).
@@ -427,6 +458,8 @@ def run_sources(
     force : bool
     batch_size : int
         Batched embedding in add_epistasis_metrics (e.g. 8 = 32 sequences per batch).
+    batch_size_by_model : dict, optional
+        Per-model override: {model_key: batch_size}. Overrides batch_size for that model.
     save_annotated : bool
         If True, save the DataFrame returned by add_epistasis_metrics to
         output_base/source_name/{model_key}_annotated.{parquet|csv}. Default True.
@@ -443,11 +476,12 @@ def run_sources(
         logger.info("Env profile %r -> models: %s", env_profile, model_keys)
     model_keys = model_keys or DEFAULT_MODEL_KEYS
     model_keys = list(model_keys)
-    splicing_sources = splicing_sources if splicing_sources is not None else SPLICING_SOURCES
     sources = _sort_sources_first_null(sources)
 
     null_cov_dir = output_base / "null_cov"
     null_cov_computed = False
+    okgp_names = [n for n, _ in sources if _is_cov_inv_source(n)]
+    seen_okgp: set = set()
 
     for source_name, payload in sources:
         if isinstance(payload, pd.DataFrame):
@@ -464,9 +498,9 @@ def run_sources(
         out_dir = output_base / source_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # For non-null sources we pass null cov_inv into add_epistasis_metrics (must be computed after null is done)
-        if source_name != NULL_SOURCE_NAME and not null_cov_computed:
-            logger.warning("Null covariance not yet computed; run null source first. Epistasis metrics will not include Mahalanobis (epi_mahal, etc.).")
+        # For non-okgp sources we pass cov_inv (from okgp) into add_epistasis_metrics (must be computed after okgp sources are done)
+        if not _is_cov_inv_source(source_name) and not null_cov_computed:
+            logger.warning("Cov_inv not yet computed; process okgp sources first. Epistasis metrics will not include Mahalanobis (epi_mahal, etc.).")
 
         models_for_source = (
             list(source_model_map[source_name])
@@ -477,11 +511,11 @@ def run_sources(
             if model_key not in FULL_MODEL_CONFIG:
                 logger.warning("Unknown model key %r, skipping", model_key)
                 continue
-            # SpliceAI only for splicing-related sources (when not using source_model_map)
+            # SpliceAI only for sources whose name contains "fas" (when not using source_model_map)
             if (
                 model_key == "spliceai"
                 and source_model_map is None
-                and source_name not in splicing_sources
+                and not _spliceai_run_for_source(source_name)
             ):
                 continue
             context, init_spec = FULL_MODEL_CONFIG[model_key]
@@ -495,12 +529,11 @@ def run_sources(
             db_path = out_dir / f"{model_key}.db"
             logger.info("Model %s -> %s (context=%s)", model_key, db_path, context)
 
-            # Load null cov_inv for non-null sources. genebeddings.add_epistasis_metrics uses it
+            # Load cov_inv (from okgp sources) for non-okgp sources. genebeddings.add_epistasis_metrics uses it
             # to compute epi_mahal (Mahalanobis distance of residual) and mahal_obs, mahal_add,
             # mahal_ratio, log_mahal_ratio (see genebeddings.genebeddings.add_epistasis_metrics).
-            # The residual is v12_obs - v12_exp (same as in epistasis_features.compute_core_vectors).
             cov_inv = None
-            if source_name != NULL_SOURCE_NAME:
+            if not _is_cov_inv_source(source_name):
                 null_pack = null_cov_dir / f"{model_key}_pack.npz"
                 if null_pack.exists():
                     try:
@@ -512,6 +545,7 @@ def run_sources(
                     except Exception as e:
                         logger.warning("Could not load null cov_inv for %r: %s", model_key, e)
 
+            bs = (batch_size_by_model or {}).get(model_key, batch_size)
             db = VariantEmbeddingDB(str(db_path))
             try:
                 if embedding_lookup_bases and not force:
@@ -533,7 +567,7 @@ def run_sources(
                     genome=genome,
                     show_progress=show_progress,
                     force=force,
-                    batch_size=batch_size,
+                    batch_size=bs,
                     cov_inv=cov_inv,
                 )
             finally:
@@ -558,16 +592,174 @@ def run_sources(
                     except Exception as e2:
                         logger.warning("Fallback save also failed: %s", e2)
 
-        # After finishing the null source: compute null covariance from null/*.db and save for use in non-null sources
-        if source_name == NULL_SOURCE_NAME:
-            run_null_covariance_and_save(
+        # After finishing all okgp sources: compute cov_inv from okgp source DBs and save for non-okgp sources
+        if _is_cov_inv_source(source_name):
+            seen_okgp.add(source_name)
+        if okgp_names and seen_okgp >= set(okgp_names) and not null_cov_computed:
+            run_covariance_and_save(
                 output_base,
-                models_for_source,
+                okgp_names,
+                model_keys=model_keys,
                 out_npz_dir=null_cov_dir,
                 method="ledoit_wolf",
                 show_progress=show_progress,
             )
             null_cov_computed = True
+
+
+def run_sources_by_tool(
+    sources: Sequence[Tuple[str, Union[str, Path, pd.DataFrame]]],
+    output_base: Union[str, Path],
+    model_keys: Optional[Sequence[str]] = None,
+    env_profile: Optional[str] = None,
+    splicing_sources: Optional[set] = None,
+    source_model_map: SourceModelMap = None,
+    embedding_lookup_bases: Optional[Sequence[Union[str, Path]]] = None,
+    embedding_lookup_flat: bool = False,
+    spliceai_model_dir: Optional[str] = None,
+    id_col: str = "epistasis_id",
+    genome: str = "hg38",
+    show_progress: bool = True,
+    force: bool = False,
+    batch_size: int = 8,
+    batch_size_by_model: Optional[Dict[str, int]] = None,
+    save_annotated: bool = True,
+    annotated_format: str = "parquet",
+    status_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """
+    Process one tool at a time: for each model, load once and run over all sources (null first).
+    Minimizes model load/unload and matches cluster usage (one env, one tool, all sources).
+    Same output layout as run_sources: output_base/source_name/model_key.db and null_cov.
+    If status_path is set (or PIPELINE_STATUS_FILE), writes progress for monitoring.
+    """
+    from genebeddings import VariantEmbeddingDB
+    from genebeddings.genebeddings import add_epistasis_metrics
+
+    try:
+        from notebooks.processing.pipeline_status import write_status as _write_status
+    except Exception:
+        _write_status = lambda **kw: None  # noqa: E731
+
+    def _status(**kwargs):
+        if status_path is not None:
+            _write_status(path=Path(status_path), phase="embed", env_profile=env_profile, **kwargs)
+
+    output_base = Path(output_base)
+    output_base.mkdir(parents=True, exist_ok=True)
+    if model_keys is None and env_profile is not None:
+        model_keys = get_model_keys_for_env(env_profile)
+        logger.info("Env profile %r -> models: %s", env_profile, model_keys)
+    model_keys = model_keys or DEFAULT_MODEL_KEYS
+    model_keys = list(model_keys)
+    sources_ordered = _sort_sources_first_null(sources)
+    null_cov_dir = output_base / "null_cov"
+    null_cov_dir.mkdir(parents=True, exist_ok=True)
+    batch_size_by_model = batch_size_by_model or {}
+    n_tools = len([k for k in model_keys if k in FULL_MODEL_CONFIG])
+
+    for tool_idx, model_key in enumerate(model_keys):
+        if model_key not in FULL_MODEL_CONFIG:
+            logger.warning("Unknown model key %r, skipping", model_key)
+            continue
+        context, init_spec = FULL_MODEL_CONFIG[model_key]
+        try:
+            model = _build_model(model_key, init_spec, spliceai_model_dir)
+        except Exception as e:
+            logger.warning("Skip model %r: %s", model_key, e)
+            continue
+        if model is None:
+            continue
+        bs = batch_size_by_model.get(model_key, batch_size)
+        logger.info("Tool %r: processing all sources (batch_size=%s)", model_key, bs)
+        _status(
+            model_key=model_key,
+            source=None,
+            tools_done=tool_idx,
+            tools_total=n_tools,
+            message=f"embed {model_key}",
+        )
+
+        for source_name, payload in sources_ordered:
+            models_for_source = (
+                list(source_model_map[source_name])
+                if source_model_map and source_name in source_model_map
+                else model_keys
+            )
+            if model_key not in models_for_source:
+                continue
+            if (
+                model_key == "spliceai"
+                and source_model_map is None
+                and not _spliceai_run_for_source(source_name)
+            ):
+                continue
+            if isinstance(payload, pd.DataFrame):
+                df = payload.copy()
+            else:
+                df = _load_epistasis_df(payload, id_col=id_col)
+            if len(df) == 0:
+                continue
+            _status(model_key=model_key, source=source_name, n_total=len(df), message=f"embed {model_key} -> {source_name}")
+            out_dir = output_base / source_name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            db_path = out_dir / f"{model_key}.db"
+            cov_inv = None
+            if not _is_cov_inv_source(source_name):
+                null_pack = null_cov_dir / f"{model_key}_pack.npz"
+                if null_pack.exists():
+                    try:
+                        data = np.load(null_pack, allow_pickle=True)
+                        cov_inv = np.asarray(data["cov_inv"], dtype=np.float64)
+                        if cov_inv.ndim != 2 or cov_inv.shape[0] != cov_inv.shape[1]:
+                            cov_inv = None
+                    except Exception:
+                        cov_inv = None
+            db = VariantEmbeddingDB(str(db_path))
+            try:
+                if embedding_lookup_bases and not force:
+                    _copy_embeddings_from_lookup_dbs(
+                        df, id_col, db, source_name, model_key, embedding_lookup_bases,
+                        embedding_lookup_flat=embedding_lookup_flat,
+                    )
+                annotated = add_epistasis_metrics(
+                    df,
+                    db,
+                    model=model,
+                    id_col=id_col,
+                    context=context,
+                    genome=genome,
+                    show_progress=show_progress,
+                    force=force,
+                    batch_size=bs,
+                    cov_inv=cov_inv,
+                )
+            finally:
+                db.close()
+            if save_annotated and annotated is not None:
+                ap = out_dir / f"{model_key}_annotated"
+                ap = ap.with_suffix(".parquet" if annotated_format == "parquet" else ".csv")
+                try:
+                    if annotated_format == "parquet":
+                        annotated.to_parquet(ap, index=False)
+                    else:
+                        annotated.to_csv(ap, index=False)
+                except Exception as e:
+                    logger.warning("Could not save annotated to %s: %s", ap, e)
+
+        # After processing all sources for this model: build cov_inv from okgp sources and save
+        okgp_names = [n for n, _ in sources_ordered if _is_cov_inv_source(n)]
+        if okgp_names:
+            run_covariance_and_save(
+                output_base,
+                okgp_names,
+                model_keys=[model_key],
+                out_npz_dir=null_cov_dir,
+                method="ledoit_wolf",
+                show_progress=show_progress,
+            )
+        else:
+            logger.debug("No okgp sources for cov_inv; skipping null_cov save for %r", model_key)
 
 
 def run_null_covariance_and_save(
