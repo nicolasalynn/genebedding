@@ -15,6 +15,8 @@ dependencies = [
     "pandas>=2.0",
     "scipy>=1.10",
     "scikit-learn>=1.2",
+    "matplotlib>=3.6",
+    "tqdm>=4.64",
 ]
 
 [project.optional-dependencies]
@@ -59,6 +61,10 @@ all = [
     "rinalmo",
     "spliceai-pytorch",
 ]
+
+# Pipeline: epistasis processing from coordinates (add_epistasis_metrics, embed_epistasis, etc.)
+# Requires reference genome FASTA configured for seqmat (e.g. hg38).
+pipeline = ["seqmat>=0.1"]
 
 # Development
 dev = [

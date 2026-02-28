@@ -102,6 +102,7 @@ __all__ = [
     # DataFrame integration
     "add_single_variant_metrics",
     "add_epistasis_metrics",
+    "add_conditional_nucleotide_probs",
     # Parsing utilities
     "parse_single_mut_id",
     "parse_epistasis_id",
@@ -112,6 +113,8 @@ __all__ = [
     "DependencyMapResult",
     "compute_pairwise_epistasis",
     "compute_dependency_map",
+    "compute_logodds_dependency_map",
+    "compute_embedding_perturbation_map",
 ]
 
 __version__ = "0.1.0"
@@ -416,6 +419,10 @@ class EpistasisMetrics:
         Ratio of observed to expected magnitude: ||v12_obs|| / ||v12_exp||.
         <1 = closer to WT than expected (sub-additive)
         >1 = further from WT than expected (super-additive)
+    log_magnitude_ratio : float
+        Log ratio of observed to expected magnitude:
+        log((||v12_obs|| + eps) / (||v12_exp|| + eps)).
+        0 = additive, negative = sub-additive, positive = super-additive.
     """
 
     len_WT_M1: float
@@ -427,6 +434,7 @@ class EpistasisMetrics:
     cos_v1_v2: float
     cos_exp_to_obs: float
     magnitude_ratio: float
+    log_magnitude_ratio: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -440,6 +448,7 @@ class EpistasisMetrics:
             "cos_v1_v2": self.cos_v1_v2,
             "cos_exp_to_obs": self.cos_exp_to_obs,
             "magnitude_ratio": self.magnitude_ratio,
+            "log_magnitude_ratio": self.log_magnitude_ratio,
         }
 
 
@@ -1078,6 +1087,7 @@ class EpistasisGeometry(_GeometryBase):
 
         # Magnitude ratio: how much closer/further from WT than expected
         magnitude_ratio = a12 / (a12_exp + self.eps)
+        log_magnitude_ratio = math.log((a12 + self.eps) / (a12_exp + self.eps))
 
         self._cached_metrics = EpistasisMetrics(
             len_WT_M1=a1,
@@ -1089,6 +1099,7 @@ class EpistasisGeometry(_GeometryBase):
             cos_v1_v2=cos_v1_v2,
             cos_exp_to_obs=cos_exp_to_obs,
             magnitude_ratio=magnitude_ratio,
+            log_magnitude_ratio=log_magnitude_ratio,
         )
 
         return self._cached_metrics
@@ -2151,8 +2162,13 @@ def embed_single_variant(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_ref = model.embed(s.seq, pool=pool)
-    h_mut = model.embed(m.seq, pool=pool)
+    # Try batched forward pass (single call, ~2x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m.seq], pool=pool)
+        h_ref, h_mut = embs[0], embs[1]
+    except (TypeError, AttributeError):
+        h_ref = model.embed(s.seq, pool=pool)
+        h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_ref
 
     return h_ref, h_mut, delta
@@ -2222,10 +2238,15 @@ def embed_epistasis(
     m2.apply_mutations([var2])
     m12.apply_mutations([var1, var2])
 
-    h_ref = model.embed(s.seq, pool=pool)
-    h_m1 = model.embed(m1.seq, pool=pool)
-    h_m2 = model.embed(m2.seq, pool=pool)
-    h_m12 = model.embed(m12.seq, pool=pool)
+    # Try batched forward pass (single call, ~4x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m1.seq, m2.seq, m12.seq], pool=pool)
+        h_ref, h_m1, h_m2, h_m12 = embs[0], embs[1], embs[2], embs[3]
+    except (TypeError, AttributeError):
+        h_ref = model.embed(s.seq, pool=pool)
+        h_m1 = model.embed(m1.seq, pool=pool)
+        h_m2 = model.embed(m2.seq, pool=pool)
+        h_m12 = model.embed(m12.seq, pool=pool)
 
     return h_ref, h_m1, h_m2, h_m12
 
@@ -2637,11 +2658,59 @@ def _embed_single_variant_direct(
     m = s.clone()
     m.apply_mutations([(pos, ref, alt)])
 
-    h_wt = model.embed(s.seq, pool=pool)
-    h_mut = model.embed(m.seq, pool=pool)
+    # Try batched forward pass (single call, ~2x faster on GPU)
+    try:
+        embs = model.embed([s.seq, m.seq], pool=pool)
+        h_wt, h_mut = embs[0], embs[1]
+    except (TypeError, AttributeError):
+        h_wt = model.embed(s.seq, pool=pool)
+        h_mut = model.embed(m.seq, pool=pool)
     delta = h_mut - h_wt
 
     return h_wt, h_mut, delta
+
+
+def _prepare_epistasis_sequences(
+    chrom: str,
+    pos1: int,
+    ref1: str,
+    alt1: str,
+    pos2: int,
+    ref2: str,
+    alt2: str,
+    reverse_complement: bool = False,
+    context: int = DEFAULT_CONTEXT,
+    genome: str = DEFAULT_GENOME,
+) -> tuple[str, str, str, str]:
+    """
+    Prepare the 4 sequences (WT, M1, M2, M12) for an epistasis pair.
+
+    Returns (wt_seq, m1_seq, m2_seq, m12_seq) as raw strings ready for
+    ``model.embed()``.  All four sequences are identical length.
+    """
+    from seqmat import SeqMat
+
+    p_min = min(pos1, pos2)
+    p_max = max(pos1, pos2)
+    start = p_min - context
+    end = p_max + context - 1
+
+    s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
+    if reverse_complement:
+        s.reverse_complement()
+
+    var1 = (pos1, ref1, alt1)
+    var2 = (pos2, ref2, alt2)
+
+    m1 = s.clone()
+    m2 = s.clone()
+    m12 = s.clone()
+
+    m1.apply_mutations([var1])
+    m2.apply_mutations([var2])
+    m12.apply_mutations([var1, var2])
+
+    return s.seq, m1.seq, m2.seq, m12.seq
 
 
 def _embed_epistasis_direct(
@@ -2662,38 +2731,33 @@ def _embed_epistasis_direct(
     Compute embeddings for epistasis from genomic coordinates.
 
     Returns (h_wt, h_m1, h_m2, h_m12) embeddings with specified pooling.
+
+    Automatically batches the four sequences into a single forward pass
+    when the model supports list input, falling back to sequential
+    embedding otherwise.
     """
-    from seqmat import SeqMat
-
-    p_min = min(pos1, pos2)
-    p_max = max(pos1, pos2)
-    start = p_min - context
-    end = p_max + context - 1
-
     logger.debug(
         "Embedding epistasis chr%s:%d,%d (rev=%s)",
         chrom, pos1, pos2, reverse_complement
     )
 
-    s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
-    if reverse_complement:
-        s.reverse_complement()
+    wt_seq, m1_seq, m2_seq, m12_seq = _prepare_epistasis_sequences(
+        chrom, pos1, ref1, alt1, pos2, ref2, alt2,
+        reverse_complement=reverse_complement,
+        context=context,
+        genome=genome,
+    )
 
-    var1 = (pos1, ref1, alt1)
-    var2 = (pos2, ref2, alt2)
-
-    m1 = s.clone()
-    m2 = s.clone()
-    m12 = s.clone()
-
-    m1.apply_mutations([var1])
-    m2.apply_mutations([var2])
-    m12.apply_mutations([var1, var2])
-
-    h_wt = model.embed(s.seq, pool=pool)
-    h_m1 = model.embed(m1.seq, pool=pool)
-    h_m2 = model.embed(m2.seq, pool=pool)
-    h_m12 = model.embed(m12.seq, pool=pool)
+    # Try batched forward pass (single call, ~4x faster on GPU)
+    try:
+        embs = model.embed([wt_seq, m1_seq, m2_seq, m12_seq], pool=pool)
+        h_wt, h_m1, h_m2, h_m12 = embs[0], embs[1], embs[2], embs[3]
+    except (TypeError, AttributeError):
+        # Fallback for models that don't accept list input
+        h_wt = model.embed(wt_seq, pool=pool)
+        h_m1 = model.embed(m1_seq, pool=pool)
+        h_m2 = model.embed(m2_seq, pool=pool)
+        h_m12 = model.embed(m12_seq, pool=pool)
 
     return h_wt, h_m1, h_m2, h_m12
 
@@ -2927,6 +2991,8 @@ def add_epistasis_metrics(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     pool: str = "mean",
     force: bool = False,
+    cov_inv: Optional[np.ndarray] = None,
+    batch_size: int = 1,
 ) -> "pd.DataFrame":
     """
     Add epistasis geometry metrics to a DataFrame.
@@ -2946,6 +3012,12 @@ def add_epistasis_metrics(
     - cos_v1_v2: Alignment of single mutation effects
     - cos_exp_to_obs: Direction indicator (-1=toward WT, +1=away from WT)
     - magnitude_ratio: Ratio of observed to expected effect
+    - log_magnitude_ratio: Log ratio of observed to expected effect
+    - epi_mahal: Mahalanobis distance of residual (if cov_inv provided)
+    - mahal_obs: Mahalanobis magnitude of observed effect (if cov_inv provided)
+    - mahal_add: Mahalanobis magnitude of additive effect (if cov_inv provided)
+    - mahal_ratio: mahal_obs / mahal_add (if cov_inv provided)
+    - log_mahal_ratio: log((mahal_obs + eps) / (mahal_add + eps))
 
     Parameters
     ----------
@@ -2989,6 +3061,16 @@ def add_epistasis_metrics(
     force : bool, optional
         If True, recompute embeddings even if they exist in the database.
         Default: False.
+    cov_inv : np.ndarray, optional
+        Precomputed inverse covariance for residuals. If provided, adds
+        covariance-aware epistasis metrics (epi_mahal, mahal_*).
+    batch_size : int, optional
+        Number of epistasis pairs to embed in a single forward pass.
+        Each pair requires 4 sequences (WT, M1, M2, M12), so
+        ``batch_size=8`` sends 32 sequences through the model at once.
+        Requires a model whose ``.embed()`` accepts ``list[str]`` input
+        (most wrappers do). Falls back to sequential if the model does
+        not support batched input. Default: 1 (original per-pair behavior).
 
     Returns
     -------
@@ -3002,6 +3084,9 @@ def add_epistasis_metrics(
 
     >>> # Force recomputation of all embeddings
     >>> df = add_epistasis_metrics(df, db, model=borzoi, force=True)
+
+    >>> # Batched embedding - ~batch_size x faster on GPU
+    >>> df = add_epistasis_metrics(df, db, model=borzoi, batch_size=8)
 
     >>> # Per-row strand from column
     >>> df = add_epistasis_metrics(
@@ -3027,14 +3112,249 @@ def add_epistasis_metrics(
         "epi_R_singles",   # Normalized residual (comparable across events)
         "cos_v1_v2",       # Alignment of single mutation effects
         "cos_exp_to_obs",  # Direction indicator: -1=toward WT, +1=away from WT
-        "magnitude_ratio", # Ratio of observed to expected effect
+        "magnitude_ratio",     # Ratio of observed to expected effect
+        "log_magnitude_ratio", # Log ratio of observed to expected effect
     ]
+    if cov_inv is not None:
+        metric_cols.append("epi_mahal")
+        metric_cols.extend(["mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"])
 
     # Initialize columns with user prefix (all at once to avoid fragmentation)
     col_names = [f"{prefix}{name}" for name in metric_cols]
     new_cols_df = pd.DataFrame(float("nan"), index=df.index, columns=col_names)
     df = pd.concat([df, new_cols_df], axis=1)
 
+    # ------------------------------------------------------------------
+    # Helper: assign metrics for one row given its four embeddings
+    # ------------------------------------------------------------------
+    def _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12, skip_mahal_columns=False):
+        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
+        metrics = geom.metrics()
+        for name in metric_cols:
+            if skip_mahal_columns and (name == "epi_mahal" or name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio")):
+                continue  # already filled by batched Mahalanobis
+            if name == "epi_mahal":
+                residual = geom.v12_obs - geom.v12_exp
+                r = residual.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != r.shape[0] or cov_inv.shape[1] != r.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {r.shape[0]}"
+                    )
+                df.at[idx, f"{prefix}{name}"] = float(math.sqrt(r.T @ cov_inv @ r))
+            elif name in ("mahal_obs", "mahal_add", "mahal_ratio", "log_mahal_ratio"):
+                v_obs = geom.v12_obs.detach().cpu().numpy().astype(np.float64, copy=False)
+                v_add = geom.v12_exp.detach().cpu().numpy().astype(np.float64, copy=False)
+                if cov_inv.shape[0] != v_obs.shape[0] or cov_inv.shape[1] != v_obs.shape[0]:
+                    raise ValueError(
+                        f"cov_inv shape {cov_inv.shape} does not match residual dim {v_obs.shape[0]}"
+                    )
+                mahal_obs = float(math.sqrt(v_obs.T @ cov_inv @ v_obs))
+                mahal_add = float(math.sqrt(v_add.T @ cov_inv @ v_add))
+                if name == "mahal_obs":
+                    df.at[idx, f"{prefix}{name}"] = mahal_obs
+                elif name == "mahal_add":
+                    df.at[idx, f"{prefix}{name}"] = mahal_add
+                else:
+                    ratio = mahal_obs / (mahal_add + DEFAULT_EPS)
+                    df.at[idx, f"{prefix}mahal_ratio"] = ratio
+                    df.at[idx, f"{prefix}log_mahal_ratio"] = math.log(
+                        (mahal_obs + DEFAULT_EPS) / (mahal_add + DEFAULT_EPS)
+                    )
+            else:
+                df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
+
+    # ------------------------------------------------------------------
+    # Helper: parse one row into coordinates + strand
+    # ------------------------------------------------------------------
+    def _parse_row(row):
+        """Return (chrom, p1, r1, a1, p2, r2, a2, rev) or None on failure."""
+        epi_id = row[id_col]
+        use_columns = (
+            chrom_col and pos1_col and ref1_col and alt1_col
+            and pos2_col and ref2_col and alt2_col
+        )
+        if use_columns:
+            chrom = str(row[chrom_col])
+            p1 = int(row[pos1_col])
+            r1 = str(row[ref1_col])
+            a1 = str(row[alt1_col])
+            p2 = int(row[pos2_col])
+            r2 = str(row[ref2_col])
+            a2 = str(row[alt2_col])
+            rev_from_id = None
+        else:
+            try:
+                (chrom, p1, r1, a1, rev1), (_, p2, r2, a2, _) = parse_epistasis_id(epi_id)
+                rev_from_id = rev1
+            except ValueError as e:
+                logger.warning("Cannot parse %s: %s", epi_id, e)
+                return None
+        # Determine strand
+        if strand_col and strand_col in df.columns:
+            rev = _parse_strand(row[strand_col])
+        elif rev_from_id is not None:
+            rev = rev_from_id
+        else:
+            rev = reverse_complement
+        return chrom, p1, r1, a1, p2, r2, a2, rev
+
+    # ==================================================================
+    # BATCHED PATH — batch_size > 1
+    # ==================================================================
+    if batch_size > 1 and model is not None:
+        n_processed = 0
+        n_computed = 0
+        n_loaded = 0
+        n_skipped = 0
+        total = len(df)
+
+        # Phase 1 — parse rows, check DB, partition into loaded / to_compute
+        embeddings = {}   # idx -> (h_wt, h_m1, h_m2, h_m12)
+        to_compute = []   # (idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev)
+
+        parse_iter = df.iterrows()
+        if show_progress:
+            parse_iter = tqdm(parse_iter, total=total, desc="Parsing / DB lookup")
+
+        for idx, row in parse_iter:
+            epi_id = row[id_col]
+            parsed = _parse_row(row)
+            if parsed is None:
+                n_skipped += 1
+                continue
+            chrom, p1, r1, a1, p2, r2, a2, rev = parsed
+
+            wt_key = f"{epi_id}{KEY_WT}"
+            m1_key = f"{epi_id}{KEY_M1}"
+            m2_key = f"{epi_id}{KEY_M2}"
+            m12_key = f"{epi_id}{KEY_M12}"
+
+            if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
+                embeddings[idx] = (db.load(wt_key), db.load(m1_key), db.load(m2_key), db.load(m12_key))
+                n_loaded += 1
+            else:
+                to_compute.append((idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev))
+
+        # Phase 2 — batch compute missing embeddings
+        if to_compute:
+            chunk_starts = range(0, len(to_compute), batch_size)
+            if show_progress:
+                chunk_starts = tqdm(
+                    list(chunk_starts),
+                    desc=f"Embedding (batch_size={batch_size})",
+                )
+
+            for chunk_start in chunk_starts:
+                chunk = to_compute[chunk_start:chunk_start + batch_size]
+                all_seqs = []
+                valid_items = []
+
+                for item in chunk:
+                    (idx_i, epi_id_i, chrom_i,
+                     p1_i, r1_i, a1_i, p2_i, r2_i, a2_i, rev_i) = item
+                    try:
+                        seqs = _prepare_epistasis_sequences(
+                            chrom_i, p1_i, r1_i, a1_i, p2_i, r2_i, a2_i,
+                            reverse_complement=rev_i, context=context, genome=genome,
+                        )
+                        all_seqs.extend(seqs)
+                        valid_items.append(item)
+                    except Exception as e:
+                        logger.warning("Failed to prepare sequences for %s: %s", epi_id_i, e)
+                        n_skipped += 1
+
+                if not all_seqs:
+                    continue
+
+                # Single forward pass for the entire chunk
+                try:
+                    all_embs = model.embed(all_seqs, pool=pool)
+                except (TypeError, AttributeError):
+                    # Fallback: sequential embedding for models without batch support
+                    all_embs = np.stack([model.embed(s, pool=pool) for s in all_seqs])
+
+                for j, item in enumerate(valid_items):
+                    idx_i, epi_id_i = item[0], item[1]
+                    h_wt = all_embs[j * 4]
+                    h_m1 = all_embs[j * 4 + 1]
+                    h_m2 = all_embs[j * 4 + 2]
+                    h_m12 = all_embs[j * 4 + 3]
+
+                    # Cache in DB
+                    wt_key = f"{epi_id_i}{KEY_WT}"
+                    m1_key = f"{epi_id_i}{KEY_M1}"
+                    m2_key = f"{epi_id_i}{KEY_M2}"
+                    m12_key = f"{epi_id_i}{KEY_M12}"
+                    db.store(wt_key, h_wt)
+                    db.store(m1_key, h_m1)
+                    db.store(m2_key, h_m2)
+                    db.store(m12_key, h_m12)
+                    db.store(f"{epi_id_i}{KEY_DELTA1}", h_m1 - h_wt)
+                    db.store(f"{epi_id_i}{KEY_DELTA2}", h_m2 - h_wt)
+                    db.store(f"{epi_id_i}{KEY_DELTA12}", h_m12 - h_wt)
+
+                    embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
+                    n_computed += 1
+
+        # Phase 2.5 — batched Mahalanobis when cov_inv is set (avoids O(N*d^2) row-by-row loop)
+        if cov_inv is not None and embeddings:
+            _torch = None
+            try:
+                import torch
+                _torch = torch
+            except ImportError:
+                pass
+
+            def _to_np(x):
+                if _torch is not None and isinstance(x, _torch.Tensor):
+                    return x.detach().cpu().numpy().astype(np.float64, copy=False)
+                return np.asarray(x, dtype=np.float64)
+
+            inds = list(embeddings.keys())
+            h_wt = np.stack([_to_np(embeddings[i][0]) for i in inds])
+            h_m1 = np.stack([_to_np(embeddings[i][1]) for i in inds])
+            h_m2 = np.stack([_to_np(embeddings[i][2]) for i in inds])
+            h_m12 = np.stack([_to_np(embeddings[i][3]) for i in inds])
+            v12_obs = h_m12 - h_wt
+            v12_exp = (h_m1 - h_wt) + (h_m2 - h_wt)
+            residual = v12_obs - v12_exp
+            # (N, d) @ (d, d) -> (N, d); then (N, d) * (N, d) sum axis=1 -> (N,)
+            epi_mahal = np.sqrt(np.maximum(0.0, np.sum((residual @ cov_inv) * residual, axis=1)))
+            mahal_obs = np.sqrt(np.maximum(0.0, np.sum((v12_obs @ cov_inv) * v12_obs, axis=1)))
+            mahal_add = np.sqrt(np.maximum(0.0, np.sum((v12_exp @ cov_inv) * v12_exp, axis=1)))
+            eps = DEFAULT_EPS
+            mahal_ratio = mahal_obs / (mahal_add + eps)
+            log_mahal_ratio = np.log((mahal_obs + eps) / (mahal_add + eps))
+            df.loc[inds, f"{prefix}epi_mahal"] = epi_mahal
+            df.loc[inds, f"{prefix}mahal_obs"] = mahal_obs
+            df.loc[inds, f"{prefix}mahal_add"] = mahal_add
+            df.loc[inds, f"{prefix}mahal_ratio"] = mahal_ratio
+            df.loc[inds, f"{prefix}log_mahal_ratio"] = log_mahal_ratio
+
+        # Phase 3 — compute metrics (non-Mahal when batched above)
+        metrics_iter = df.iterrows()
+        if show_progress:
+            metrics_iter = tqdm(metrics_iter, total=total, desc="Computing metrics")
+
+        skip_mahal = cov_inv is not None and bool(embeddings)
+        for i, (idx, row) in enumerate(metrics_iter):
+            if progress_callback:
+                progress_callback(i, total, str(row[id_col]))
+            if idx not in embeddings:
+                continue
+            h_wt, h_m1, h_m2, h_m12 = embeddings[idx]
+            _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12, skip_mahal_columns=skip_mahal)
+            n_processed += 1
+
+        logger.info(
+            "Epistasis metrics (batched, bs=%d): %d processed (%d computed, %d loaded), %d skipped",
+            batch_size, n_processed, n_computed, n_loaded, n_skipped
+        )
+        return df
+
+    # ==================================================================
+    # ORIGINAL PATH — batch_size <= 1 (unchanged behaviour)
+    # ==================================================================
     n_processed = 0
     n_computed = 0
     n_loaded = 0
@@ -3134,19 +3454,250 @@ def add_epistasis_metrics(
             n_skipped += 1
             continue
 
-        # Create geometry with additive expectation (default)
-        geom = EpistasisGeometry(h_wt, h_m1, h_m2, h_m12, diff=diff)
-
-        # Assign all metrics
-        metrics = geom.metrics()
-        for name in metric_cols:
-            df.at[idx, f"{prefix}{name}"] = getattr(metrics, name)
-
+        _assign_metrics(idx, h_wt, h_m1, h_m2, h_m12)
         n_processed += 1
 
     logger.info(
         "Epistasis metrics: %d processed (%d computed, %d loaded), %d skipped",
         n_processed, n_computed, n_loaded, n_skipped
+    )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Conditional Nucleotide Probability Analysis (RiNALMo / MLM)
+# ---------------------------------------------------------------------------
+
+
+def add_conditional_nucleotide_probs(
+    df: "pd.DataFrame",
+    model,
+    id_col: str = "epistasis_id",
+    chrom_col: Optional[str] = None,
+    pos1_col: Optional[str] = None,
+    ref1_col: Optional[str] = None,
+    alt1_col: Optional[str] = None,
+    pos2_col: Optional[str] = None,
+    ref2_col: Optional[str] = None,
+    alt2_col: Optional[str] = None,
+    strand_col: Optional[str] = None,
+    reverse_complement: bool = False,
+    context: int = DEFAULT_CONTEXT,
+    genome: str = DEFAULT_GENOME,
+    prefix: str = "",
+    inplace: bool = False,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> "pd.DataFrame":
+    """
+    Probe conditional nucleotide dependencies between epistatic positions.
+
+    For each epistasis pair (pos1, pos2), this function:
+    1. Fetches the reference sequence around both positions
+    2. For each nucleotide N1 in {A, C, G, T}, sets pos1 = N1
+    3. Masks pos2 and queries the model for P(pos2 | pos1 = N1)
+    4. Records the full 4-nucleotide probability distribution at pos2
+
+    This reveals how the identity at site 1 influences the model's belief
+    about site 2 — a direct probe of learned pairwise dependencies.
+
+    Adds columns
+    -------------
+    - ``{prefix}ref1_nuc``: Reference nucleotide at pos1 (in sequence orientation)
+    - ``{prefix}ref2_nuc``: Reference nucleotide at pos2 (in sequence orientation)
+    - ``{prefix}{N1}_{N2}`` for N1, N2 in {A, C, G, T}:
+        P(pos2 = N2 | pos1 = N1). 16 columns total forming a 4×4
+        conditional probability matrix.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing epistasis data.
+    model : object
+        Model wrapper with a ``predict_nucleotides(seq, positions)`` method
+        (e.g. ``RiNALMoWrapper``).
+    id_col : str, optional
+        Column with epistasis IDs (format: mut1|mut2). Default: ``"epistasis_id"``.
+    chrom_col : str, optional
+        Column with chromosome. If None, parsed from *id_col*.
+    pos1_col, pos2_col : str, optional
+        Columns with genomic positions. If None, parsed from *id_col*.
+    ref1_col, ref2_col : str, optional
+        Columns with reference alleles. If None, parsed from *id_col*.
+    alt1_col, alt2_col : str, optional
+        Columns with alternate alleles. If None, parsed from *id_col*.
+    strand_col : str, optional
+        Column with strand info (``"+"/"-"``). Overrides *reverse_complement*.
+    reverse_complement : bool, optional
+        Default strand orientation. ``True`` = negative strand. Default: ``False``.
+    context : int, optional
+        Context window size (bp flanking each position). Default: 3000.
+    genome : str, optional
+        Genome assembly. Default: ``"hg38"``.
+    prefix : str, optional
+        Prefix for new column names. Default: ``""``.
+    inplace : bool, optional
+        Modify DataFrame in place. Default: ``False``.
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: ``False``.
+    progress_callback : callable, optional
+        Called with ``(current_index, total, epistasis_id)`` for progress.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with added conditional probability columns.
+
+    Examples
+    --------
+    >>> from genebeddings.wrappers.rinalmo_wrapper import RiNALMoWrapper
+    >>> model = RiNALMoWrapper("giga-v1")
+    >>> df = add_conditional_nucleotide_probs(df, model, show_progress=True)
+    >>> # Each row now has 16 probability columns, e.g.:
+    >>> df[["A_A", "A_C", "A_G", "A_T"]].head()  # P(pos2 | pos1=A)
+    """
+    _require_pandas()
+    import pandas as pd
+    from seqmat import SeqMat
+
+    if id_col not in df.columns:
+        raise ValueError(f"Column {id_col!r} not found in DataFrame")
+
+    if not hasattr(model, "predict_nucleotides"):
+        raise TypeError(
+            f"Model {type(model).__name__} does not have a predict_nucleotides method. "
+            "This function requires a masked-language model wrapper (e.g. RiNALMoWrapper)."
+        )
+
+    if not inplace:
+        df = df.copy()
+
+    nucs = ["A", "C", "G", "T"]
+
+    # Build column names: 16 probability cols + 2 ref nucleotide cols
+    prob_col_names = [f"{prefix}{n1}_{n2}" for n1 in nucs for n2 in nucs]
+    meta_col_names = [f"{prefix}ref1_nuc", f"{prefix}ref2_nuc"]
+    all_new_cols = meta_col_names + prob_col_names
+
+    new_cols_df = pd.DataFrame(
+        {c: (np.nan if c in prob_col_names else "") for c in all_new_cols},
+        index=df.index,
+    )
+    df = pd.concat([df, new_cols_df], axis=1)
+
+    n_processed = 0
+    n_skipped = 0
+    total = len(df)
+
+    iterator = df.iterrows()
+    if show_progress:
+        iterator = tqdm(iterator, total=total, desc="Conditional nucleotide probs")
+
+    for i, (idx, row) in enumerate(iterator):
+        epi_id = row[id_col]
+
+        if progress_callback:
+            progress_callback(i, total, str(epi_id))
+
+        # ---- Parse coordinates (same logic as add_epistasis_metrics) ----
+        use_columns = (
+            chrom_col and pos1_col and ref1_col and alt1_col
+            and pos2_col and ref2_col and alt2_col
+        )
+
+        if use_columns:
+            chrom = str(row[chrom_col])
+            pos1 = int(row[pos1_col])
+            ref1 = str(row[ref1_col])
+            alt1 = str(row[alt1_col])
+            pos2 = int(row[pos2_col])
+            ref2 = str(row[ref2_col])
+            alt2 = str(row[alt2_col])
+            rev_from_id = None
+        else:
+            try:
+                (chrom, pos1, ref1, alt1, rev1), (_, pos2, ref2, alt2, rev2) = (
+                    parse_epistasis_id(epi_id)
+                )
+                rev_from_id = rev1
+            except ValueError as e:
+                logger.warning("Cannot parse %s: %s", epi_id, e)
+                n_skipped += 1
+                continue
+
+        # Determine strand
+        if strand_col and strand_col in df.columns:
+            rev = _parse_strand(row[strand_col])
+        elif rev_from_id is not None:
+            rev = rev_from_id
+        else:
+            rev = reverse_complement
+
+        # ---- Fetch reference sequence ----
+        try:
+            p_min = min(pos1, pos2)
+            p_max = max(pos1, pos2)
+            start = p_min - context
+            end = p_max + context - 1
+
+            s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
+            if rev:
+                s.reverse_complement()
+
+            ref_seq = s.seq
+        except Exception as e:
+            logger.warning("Failed to fetch sequence for %s: %s", epi_id, e)
+            n_skipped += 1
+            continue
+
+        # ---- Compute 0-based offsets into the sequence string ----
+        if rev:
+            idx1 = end - pos1
+            idx2 = end - pos2
+        else:
+            idx1 = pos1 - start
+            idx2 = pos2 - start
+
+        if not (0 <= idx1 < len(ref_seq)) or not (0 <= idx2 < len(ref_seq)):
+            logger.warning(
+                "Position out of bounds for %s: idx1=%d, idx2=%d, seq_len=%d",
+                epi_id, idx1, idx2, len(ref_seq),
+            )
+            n_skipped += 1
+            continue
+
+        # Record reference nucleotides (in sequence orientation)
+        df.at[idx, f"{prefix}ref1_nuc"] = ref_seq[idx1]
+        df.at[idx, f"{prefix}ref2_nuc"] = ref_seq[idx2]
+
+        # ---- For each nucleotide at pos1, get distribution at masked pos2 ----
+        try:
+            for n1 in nucs:
+                # Build sequence with n1 at pos1
+                seq_list = list(ref_seq)
+                seq_list[idx1] = n1
+                mutated_seq = "".join(seq_list)
+
+                # Query model: mask pos2 and get nucleotide probabilities
+                probs = model.predict_nucleotides(
+                    mutated_seq, positions=[idx2], return_dict=True
+                )
+                # probs is a list of 1 dict: [{'A': p, 'C': p, 'G': p, 'T': p}]
+                prob_dict = probs[0]
+
+                for n2 in nucs:
+                    df.at[idx, f"{prefix}{n1}_{n2}"] = prob_dict.get(n2, float("nan"))
+        except Exception as e:
+            logger.warning("Failed predict_nucleotides for %s: %s", epi_id, e)
+            n_skipped += 1
+            continue
+
+        n_processed += 1
+
+    logger.info(
+        "Conditional nucleotide probs: %d processed, %d skipped (of %d total)",
+        n_processed, n_skipped, total,
     )
 
     return df
@@ -3589,6 +4140,507 @@ def compute_dependency_map(
         matrix=matrix,
         aggregation=aggregation,
         metric=metric,
+        sequence=sequence,
+        details=details,
+    )
+
+
+def compute_logodds_dependency_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    symmetrize: bool = True,
+    eps: float = 1e-10,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    store_details: bool = False,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map using masked-language-model log-odds.
+
+    For each ordered pair (i, j) the score D(i, j) is computed as follows:
+
+    1. **Baseline**: mask position j in the original sequence and obtain the
+       model's predicted nucleotide distribution P_base(j).
+    2. **Perturbation**: for each of the 3 alternative nucleotides at
+       position i, mutate i, mask j, and obtain the new distribution
+       P_mut(j).
+    3. **Log-odds**: for every nucleotide n at j, compute
+       ``log(P_mut(j, n) / P_base(j, n))``.
+    4. **Aggregate**: keep the largest absolute log-odds across the 4
+       nucleotides at j, then take the maximum across the 3 mutations at i.
+
+    By default the map is symmetrised: ``D_sym(i, j) = max(D(i, j), D(j, i))``.
+
+    Complexity
+    ----------
+    The function makes ``1 + 3·N`` calls to ``predict_nucleotides``, each
+    batching up to N masked positions internally (one forward pass per call).
+    This is much cheaper than the ``O(N²)`` approach of calling per-pair.
+
+    Parameters
+    ----------
+    model : object
+        Model wrapper with a ``predict_nucleotides(seq, positions,
+        return_dict=True)`` method (e.g. ``RiNALMoWrapper``).
+    sequence : str
+        Reference DNA/RNA sequence.
+    positions : list[int], optional
+        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
+    start : int, optional
+        Start position (inclusive). Default: 0.
+    end : int, optional
+        End position (exclusive). Default: ``len(sequence)``.
+    step : int, optional
+        Step size between positions. Default: 1.
+    symmetrize : bool, optional
+        If True (default), return ``max(D(i,j), D(j,i))``. If False,
+        return the raw asymmetric matrix.
+    eps : float, optional
+        Small constant added to probabilities before taking the log to
+        avoid ``log(0)``. Default: 1e-10.
+    show_progress : bool, optional
+        Show a tqdm progress bar. Default: False.
+    progress_callback : callable, optional
+        Called with ``(current_step, total_steps, description)``.
+    store_details : bool, optional
+        If True, store per-pair baseline and mutant distributions in
+        ``result.details``. Useful for inspection but memory-intensive
+        for large position sets. Default: False.
+
+    Returns
+    -------
+    DependencyMapResult
+        Object containing the dependency matrix and metadata.
+        ``result.details["D_asymmetric"]`` always contains the raw
+        asymmetric matrix before symmetrisation.
+
+    Examples
+    --------
+    >>> from genebeddings.wrappers.rinalmo_wrapper import RiNALMoWrapper
+    >>> model = RiNALMoWrapper("giga-v1")
+    >>> result = compute_logodds_dependency_map(
+    ...     model, sequence,
+    ...     positions=[2900, 2950, 3000, 3050, 3100],
+    ...     show_progress=True,
+    ... )
+    >>> result.plot(title="Log-odds dependency map")
+    >>> result.top_pairs(5)
+    """
+    if not hasattr(model, "predict_nucleotides"):
+        raise TypeError(
+            f"Model {type(model).__name__} does not have a predict_nucleotides "
+            "method. This function requires a masked-language model wrapper "
+            "(e.g. RiNALMoWrapper)."
+        )
+
+    # ---- Determine positions ----
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for a dependency map")
+
+    pos_list = pos_array.tolist()
+
+    for p in pos_list:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(
+                f"Position {p} out of bounds for sequence length {len(sequence)}"
+            )
+
+    nucs = ["A", "C", "G", "T"]
+
+    logger.info(
+        "Computing log-odds dependency map: %d positions (%d baseline + "
+        "%d mutation calls)",
+        n, 1, 3 * n,
+    )
+
+    # ---- Step 1: baseline distributions (one batched call) ----
+    baseline_dicts = model.predict_nucleotides(
+        sequence, positions=pos_list, return_dict=True
+    )
+    # baseline_dicts: list of N dicts  [{'A': p, 'C': p, 'G': p, 'T': p}, ...]
+    baseline_matrix = np.array(
+        [[d[nt] for nt in nucs] for d in baseline_dicts]
+    )  # (N, 4)
+
+    # ---- Step 2: perturb each query position, read all targets ----
+    D_raw = np.full((n, n), np.nan)  # asymmetric D(i, j)
+
+    details: dict = {}
+
+    total_steps = 3 * n  # 3 mutations per query position
+    step_count = 0
+
+    iterator = range(n)
+    if show_progress:
+        iterator = tqdm(iterator, total=n, desc="Log-odds dependency map")
+
+    for i_idx in iterator:
+        pos_i = int(pos_array[i_idx])
+        ref_i = sequence[pos_i]
+        alts_i = [nt for nt in nucs if nt != ref_i]
+
+        # Accumulate max |log-odds| across the 3 mutations at i,
+        # separately for each target j.
+        max_logodds_per_j = np.zeros(n)
+
+        for alt in alts_i:
+            if progress_callback:
+                progress_callback(
+                    step_count, total_steps,
+                    f"pos {pos_i}: {ref_i}>{alt}",
+                )
+            step_count += 1
+
+            # Build mutated sequence (only pos_i changes)
+            mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
+
+            # Get distributions at ALL target positions in one call
+            mut_dicts = model.predict_nucleotides(
+                mutated_seq, positions=pos_list, return_dict=True
+            )
+            mut_matrix = np.array(
+                [[d[nt] for nt in nucs] for d in mut_dicts]
+            )  # (N, 4)
+
+            # Log-odds per (target, nucleotide)
+            log_odds = np.log(
+                (mut_matrix + eps) / (baseline_matrix + eps)
+            )  # (N, 4)
+
+            # Max absolute log-odds across the 4 nucleotides at each target
+            max_abs = np.max(np.abs(log_odds), axis=1)  # (N,)
+
+            # Keep running max across the 3 mutations at i
+            max_logodds_per_j = np.maximum(max_logodds_per_j, max_abs)
+
+            # Optional: store per-mutation detail
+            if store_details:
+                for j_idx in range(n):
+                    if j_idx == i_idx:
+                        continue
+                    pos_j = int(pos_array[j_idx])
+                    key = (pos_i, pos_j)
+                    if key not in details:
+                        details[key] = {
+                            "ref_i": ref_i,
+                            "ref_j": sequence[pos_j],
+                            "baseline_probs": {
+                                nt: float(baseline_matrix[j_idx, k])
+                                for k, nt in enumerate(nucs)
+                            },
+                            "mutations": [],
+                        }
+                    details[key]["mutations"].append({
+                        "alt_i": alt,
+                        "mutant_probs": {
+                            nt: float(mut_matrix[j_idx, k])
+                            for k, nt in enumerate(nucs)
+                        },
+                        "log_odds": {
+                            nt: float(log_odds[j_idx, k])
+                            for k, nt in enumerate(nucs)
+                        },
+                        "max_abs_logodds": float(max_abs[j_idx]),
+                    })
+
+        # Write row i of asymmetric matrix
+        D_raw[i_idx, :] = max_logodds_per_j
+        D_raw[i_idx, i_idx] = np.nan  # no self-dependency
+
+    # ---- Step 3: symmetrise ----
+    if symmetrize:
+        matrix = np.fmax(D_raw, D_raw.T)  # element-wise max, NaN-safe
+    else:
+        matrix = D_raw
+
+    # Always store the asymmetric matrix so users can inspect directionality
+    details["D_asymmetric"] = D_raw.copy()
+
+    logger.info(
+        "Log-odds dependency map complete: %d positions, %d model calls",
+        n, 1 + 3 * n,
+    )
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation="max" if symmetrize else "max_asymmetric",
+        metric="logodds",
+        sequence=sequence,
+        details=details,
+    )
+
+
+def _detect_base_token_offset(model, sequence: str) -> int:
+    """
+    Detect the token index of the first base in ``pool='tokens'`` output.
+
+    Mutates the first base and finds the token whose embedding changes
+    **the most**, which must be the first base token (e.g. after a BOS
+    token).  In attention-based models every token representation shifts
+    when any input changes, so we cannot simply look for the first
+    non-zero difference — we need the *largest* difference.
+    """
+    alt = "C" if sequence[0] != "C" else "A"
+    seq_probe = alt + sequence[1:]
+
+    tokens_orig = model.embed(sequence, pool="tokens", return_numpy=False)
+    tokens_probe = model.embed(seq_probe, pool="tokens", return_numpy=False)
+
+    tokens_orig = torch.as_tensor(tokens_orig).float()
+    tokens_probe = torch.as_tensor(tokens_probe).float()
+
+    diffs = torch.norm(tokens_orig - tokens_probe, dim=-1)  # (T,)
+    offset = int(torch.argmax(diffs).item())
+    return offset
+
+
+def compute_embedding_perturbation_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    diff: Union[str, DiffFn] = "cosine",
+    aggregation: str = "max",
+    symmetrize: bool = True,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map by measuring embedding perturbation at each token.
+
+    This is the **embedding-space analog** of
+    :func:`compute_logodds_dependency_map`. Instead of asking *"how do the
+    predicted probabilities at j change when I mutate i?"*, it asks *"how
+    does the model's internal representation at j change when I mutate i?"*
+
+    For each ordered pair (i, j):
+
+    1. Embed the original sequence with ``pool='tokens'`` to get per-token
+       representations.
+    2. For each of the 3 alternative nucleotides at position i, mutate i,
+       re-embed with ``pool='tokens'``, and measure the distance between
+       the baseline and mutated embeddings **at token j**.
+    3. Keep the maximum distance across the 3 mutations.
+
+    By default the map is symmetrised:
+    ``D(i, j) = max(D_raw(i, j), D_raw(j, i))``.
+
+    Complexity
+    ----------
+    ``3 + 3·N`` forward passes (3 for offset detection + baseline, then
+    one per mutation), each returning the full token-level embedding.
+    This is the same ``O(N)`` scaling as the log-odds map and dramatically
+    cheaper than the ``O(N²)`` embedding-epistasis map.
+
+    Comparison with other dependency maps
+    --------------------------------------
+    - **Epistasis map** (``compute_dependency_map``): measures deviation
+      from additive expectation — requires the double mutant (M12), so is
+      ``O(N²)``. Captures true *epistasis*.
+    - **Log-odds map** (``compute_logodds_dependency_map``): measures
+      shifts in nucleotide probabilities. Requires an MLM head.
+    - **Embedding perturbation map** (this function): measures shifts in
+      hidden representations. Works with *any* model that supports
+      ``pool='tokens'``, no MLM head required.
+
+    Parameters
+    ----------
+    model : object
+        Model wrapper with ``embed(seq, pool='tokens')`` support.
+    sequence : str
+        Reference DNA/RNA sequence.
+    positions : list[int], optional
+        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
+    start : int, optional
+        Start position (inclusive). Default: 0.
+    end : int, optional
+        End position (exclusive). Default: ``len(sequence)``.
+    step : int, optional
+        Step size between positions. Default: 1.
+    diff : str or callable, optional
+        Distance metric for comparing token embeddings: ``"cosine"``
+        (default) or ``"l2"``, or a callable ``(x, y) -> float``.
+    aggregation : str, optional
+        How to aggregate across the 3 mutations at a query position:
+        ``"max"`` (default) or ``"mean"``.
+    symmetrize : bool, optional
+        If True (default), return ``max(D(i,j), D(j,i))``.
+    show_progress : bool, optional
+        Show tqdm progress bar. Default: False.
+    progress_callback : callable, optional
+        Called with ``(current_step, total_steps, description)``.
+
+    Returns
+    -------
+    DependencyMapResult
+        Object containing the dependency matrix and metadata.
+        ``result.details["D_asymmetric"]`` holds the raw asymmetric matrix.
+
+    Examples
+    --------
+    >>> result = compute_embedding_perturbation_map(
+    ...     model, sequence,
+    ...     positions=[2900, 2950, 3000, 3050, 3100],
+    ...     diff="cosine",
+    ...     show_progress=True,
+    ... )
+    >>> result.plot(title="Embedding perturbation map")
+    >>> result.top_pairs(5)
+    """
+    # ---- Resolve distance function ----
+    if isinstance(diff, str):
+        diff_lower = diff.lower()
+        if diff_lower == "cosine":
+            dist_fn = cosine_distance
+        elif diff_lower == "l2":
+            dist_fn = l2_distance
+        else:
+            raise ValueError(f"Unknown diff metric: {diff!r}")
+        diff_name = diff_lower
+    elif callable(diff):
+        dist_fn = diff
+        diff_name = getattr(diff, "__name__", "custom")
+    else:
+        raise TypeError(f"diff must be str or callable, got {type(diff)}")
+
+    # ---- Determine positions ----
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for a dependency map")
+
+    pos_list = pos_array.tolist()
+
+    for p in pos_list:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(
+                f"Position {p} out of bounds for sequence length "
+                f"{len(sequence)}"
+            )
+
+    nucs = ["A", "C", "G", "T"]
+    k = getattr(model, "k", 1)
+
+    logger.info(
+        "Computing embedding perturbation map: %d positions, diff=%s",
+        n, diff_name,
+    )
+
+    # ---- Detect base-token offset and get baseline embeddings ----
+    offset = _detect_base_token_offset(model, sequence)
+    tokens_wt = model.embed(sequence, pool="tokens", return_numpy=False)
+    tokens_wt = torch.as_tensor(tokens_wt).float()  # (T, H)
+
+    # Map sequence positions to token indices
+    tok_indices = [offset + p // k for p in pos_list]
+
+    T = tokens_wt.shape[0]
+    for p, ti in zip(pos_list, tok_indices):
+        if ti >= T:
+            raise ValueError(
+                f"Position {p} maps to token index {ti} but model "
+                f"only returns {T} tokens"
+            )
+
+    # Extract baseline token embeddings at target positions: (N, H)
+    baseline_tokens = tokens_wt[tok_indices]  # (N, H)
+
+    # ---- Perturb each query position ----
+    D_raw = np.full((n, n), np.nan)
+
+    total_steps = 3 * n
+    step_count = 0
+
+    iterator = range(n)
+    if show_progress:
+        iterator = tqdm(iterator, total=n, desc="Embedding perturbation map")
+
+    for i_idx in iterator:
+        pos_i = int(pos_array[i_idx])
+        ref_i = sequence[pos_i]
+        alts_i = [nt for nt in nucs if nt != ref_i]
+
+        # Accumulate distances across mutations: (n_mutations, N)
+        all_dists = []
+
+        for alt in alts_i:
+            if progress_callback:
+                progress_callback(
+                    step_count, total_steps,
+                    f"pos {pos_i}: {ref_i}>{alt}",
+                )
+            step_count += 1
+
+            mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
+            tokens_mut = model.embed(mutated_seq, pool="tokens", return_numpy=False)
+            tokens_mut = torch.as_tensor(tokens_mut).float()  # (T, H)
+
+            # Extract mutated token embeddings at target positions
+            mut_tokens = tokens_mut[tok_indices]  # (N, H)
+
+            # Compute distance for each target position j
+            dists_j = np.array([
+                dist_fn(baseline_tokens[j], mut_tokens[j])
+                for j in range(n)
+            ])
+            all_dists.append(dists_j)
+
+        all_dists = np.stack(all_dists, axis=0)  # (3, N)
+
+        # Aggregate across mutations
+        if aggregation == "max":
+            D_raw[i_idx, :] = np.max(all_dists, axis=0)
+        elif aggregation == "mean":
+            D_raw[i_idx, :] = np.mean(all_dists, axis=0)
+        else:
+            raise ValueError(f"Unknown aggregation: {aggregation!r}")
+
+        D_raw[i_idx, i_idx] = np.nan
+
+    # ---- Symmetrise ----
+    if symmetrize:
+        matrix = np.fmax(D_raw, D_raw.T)
+    else:
+        matrix = D_raw
+
+    details: dict = {"D_asymmetric": D_raw.copy()}
+
+    logger.info(
+        "Embedding perturbation map complete: %d positions, %d forward passes, "
+        "diff=%s",
+        n, 3 + 3 * n, diff_name,
+    )
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation=aggregation,
+        metric=f"perturbation_{diff_name}",
         sequence=sequence,
         details=details,
     )

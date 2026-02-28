@@ -29,7 +29,7 @@ ALPHAGENOME_VERSIONS = [
     "fold_4",
 ]
 
-AlphaGenomeSource = Literal["kaggle", "huggingface"]
+AlphaGenomeSource = Literal["kaggle", "huggingface", "local"]
 
 
 class AlphaGenomeWrapper(BaseWrapper):
@@ -69,6 +69,7 @@ class AlphaGenomeWrapper(BaseWrapper):
         model_version: str = "all_folds",
         *,
         source: AlphaGenomeSource = "huggingface",
+        checkpoint_path: str | None = None,
         organism_settings=None,
         device=None,
         fixed_length: int | None = None,
@@ -97,7 +98,11 @@ class AlphaGenomeWrapper(BaseWrapper):
         if device is not None:
             kwargs["device"] = device
 
-        if source == "kaggle":
+        if source == "local":
+            if checkpoint_path is None:
+                raise ValueError("checkpoint_path is required when source='local'")
+            self._model = dna_model.create(checkpoint_path, **kwargs)
+        elif source == "kaggle":
             self._model = dna_model.create_from_kaggle(
                 model_version, **kwargs
             )
@@ -106,7 +111,7 @@ class AlphaGenomeWrapper(BaseWrapper):
                 model_version, **kwargs
             )
         else:
-            raise ValueError(f"source must be 'kaggle' or 'huggingface', got {source!r}")
+            raise ValueError(f"source must be 'kaggle', 'huggingface', or 'local', got {source!r}")
 
         # Store references for direct JAX access
         self._params = self._model._params
@@ -114,9 +119,20 @@ class AlphaGenomeWrapper(BaseWrapper):
         self._device_context = self._model._device_context
         self._metadata = self._model._metadata
 
-        # Build a dedicated embedding extraction function.
-        # The standard _apply_fn discards the Embeddings object returned by
-        # AlphaGenome.__call__. We build our own that returns just embeddings.
+        # Build an embedding extraction function by re-using the same
+        # hk.transform_with_state that create_model() produces.  This
+        # guarantees the parameter tree matches self._params exactly.
+        # The standard _apply_fn discards embeddings; our version keeps them.
+        from alphagenome_research.model.dna_model import create_model as _create_model
+
+        _init_fn, _apply_fn, _junctions_apply_fn = _create_model(
+            self._metadata,
+        )
+        # _apply_fn internally calls _forward.apply() which returns
+        # ((predictions, embeddings), state).  We need a variant that
+        # returns embeddings instead of predictions.  _forward is captured
+        # in the closure of _apply_fn, so we rebuild from the same module.
+
         jmp_policy = jmp.get_policy("params=float32,compute=bfloat16,output=bfloat16")
         metadata = self._metadata
 
