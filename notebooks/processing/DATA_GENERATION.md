@@ -1,6 +1,8 @@
 # Data Generation: Epistasis and Variant Sets
 
-This document describes how each **source dataset** of epistasis pairs or single variants is created. These datasets are the inputs to the **processing** pipeline (see `process_epistasis`), which computes embeddings and stores them in per-model databases.
+**Notebooks and code that create these datasets** live in `/Users/nicolaslynn/Documents/phd/projects/genomenet/data_generation`. This doc is kept here as reference for what the processing pipeline expects; a copy lives in genomenet.
+
+This document describes how each **source dataset** of epistasis pairs or single variants is created. These datasets are the inputs to the **processing** pipeline (see `notebooks.processing.process_epistasis`), which computes embeddings and stores them in per-model databases.
 
 ---
 

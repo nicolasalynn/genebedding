@@ -48,7 +48,7 @@ embeddings/
 
 3. Optional combined covariance: `embeddings/{model_key}_pack.npz` with `cov`, `cov_inv` from all source DBs combined (for other uses).
 
-**Models:** AlphaGenome runs for all sources. SpliceAI runs only for **splicing** sources: `fas_analysis`, `mst1r_analysis`, `kras`. Set `OPENSPLICEAI_MODEL_DIR` or pass `spliceai_model_dir` for SpliceAI. Full list in `process_epistasis.FULL_MODEL_CONFIG`.
+**Models:** AlphaGenome runs for all sources. SpliceAI runs only for **splicing** sources: `fas_analysis`, `mst1r_analysis`, `kras`. Set `OPENSPLICEAI_MODEL_DIR` or pass `spliceai_model_dir` for SpliceAI. Full list in `notebooks.processing.process_epistasis.FULL_MODEL_CONFIG`.
 
 **Order:** The pipeline always processes the source named `null` first, then the remaining sources.
 
@@ -64,7 +64,7 @@ In the notebook: set `ENV_PROFILE = "alphagenome"` (or `"evo2"` / `"main"` / `"a
 
 ```bash
 # Example: null first, then fas and mst1r
-python -m notebooks.process_epistasis \
+python -m notebooks.processing.process_epistasis \
   --sources null:path/to/null_epistasis.csv fas_analysis:path/to/fas_subset.csv mst1r_analysis:path/to/mst1r.csv \
   --output embeddings \
   --id-col epistasis_id
@@ -75,7 +75,7 @@ Or from Python:
 ```python
 from pathlib import Path
 import pandas as pd
-from notebooks.process_epistasis import run_sources, run_from_single_dataframe
+from notebooks.processing.process_epistasis import run_sources, run_from_single_dataframe
 
 # Option A: per-source list
 run_sources(
