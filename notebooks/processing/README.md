@@ -50,6 +50,8 @@ embeddings/
 
 **Models:** AlphaGenome runs for all sources. SpliceAI runs only for **splicing** sources: `fas_analysis`, `mst1r_analysis`, `kras`. Set `OPENSPLICEAI_MODEL_DIR` or pass `spliceai_model_dir` for SpliceAI. Full list in `notebooks.processing.process_epistasis.FULL_MODEL_CONFIG`.
 
+**Per-source model control:** Pass `source_model_map` (dict: `source_name -> list of model keys`) to run only selected models per source. If a source is missing from the map, the global `model_keys` is used. Example: `{"null": ["nt500_multi", "convnova"], "fas_analysis": ["nt500_multi", "convnova", "spliceai"]}`. When set, the default SpliceAI-on-splicing-sources rule is not applied; the map fully defines which models run where.
+
 **Order:** The pipeline always processes the source named `null` first, then the remaining sources.
 
 **Environment profiles:** Some models require a dedicated environment. Use one profile per run so only the models for the current env execute:
@@ -97,5 +99,14 @@ run_from_single_dataframe(
     source_col="source",
     id_col="epistasis_id",
     model_keys=["nt500_multi", "convnova", "borzoi"],
+)
+
+# Option C: different models per source (source_model_map)
+run_sources(
+    [("null", Path("data/null_epistasis.csv")), ("fas_analysis", Path("data/fas_subset.csv"))],
+    output_base=Path("embeddings"),
+    model_keys=["nt500_multi", "convnova", "spliceai"],
+    source_model_map={"null": ["nt500_multi", "convnova"], "fas_analysis": ["nt500_multi", "convnova", "spliceai"]},
+    id_col="epistasis_id",
 )
 ```

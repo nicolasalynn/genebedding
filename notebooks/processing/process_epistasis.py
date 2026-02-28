@@ -35,6 +35,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+# Type for per-source model override: source_name -> list of model keys to run for that source.
+# If a source is missing, global model_keys is used. Enables e.g. SpliceAI only for splicing sources.
+SourceModelMap = Optional[Dict[str, Sequence[str]]]
+
 import numpy as np
 import pandas as pd
 
@@ -225,6 +229,7 @@ def run_from_single_dataframe(
     model_keys: Optional[Sequence[str]] = None,
     env_profile: Optional[str] = None,
     splicing_sources: Optional[set] = None,
+    source_model_map: SourceModelMap = None,
     spliceai_model_dir: Optional[str] = None,
     id_col: str = "epistasis_id",
     genome: str = "hg38",
@@ -250,7 +255,7 @@ def run_from_single_dataframe(
         Base directory for outputs. Each source gets a subdir: output_base/source_name/.
     source_col : str, default "source"
         Column name whose values define the source (and thus the storage subdirectory).
-    model_keys, env_profile, splicing_sources, spliceai_model_dir, id_col, genome,
+    model_keys, env_profile, splicing_sources, source_model_map, spliceai_model_dir, id_col, genome,
     show_progress, force, batch_size, save_annotated, annotated_format
         Passed through to run_sources().
     """
@@ -281,6 +286,7 @@ def run_from_single_dataframe(
         model_keys=model_keys,
         env_profile=env_profile,
         splicing_sources=splicing_sources,
+        source_model_map=source_model_map,
         spliceai_model_dir=spliceai_model_dir,
         id_col=id_col,
         genome=genome,
@@ -298,6 +304,7 @@ def run_sources(
     model_keys: Optional[Sequence[str]] = None,
     env_profile: Optional[str] = None,
     splicing_sources: Optional[set] = None,
+    source_model_map: SourceModelMap = None,
     spliceai_model_dir: Optional[str] = None,
     id_col: str = "epistasis_id",
     genome: str = "hg38",
@@ -313,6 +320,7 @@ def run_sources(
     and optionally the annotated DataFrame (with metric columns) to
     output_base/source_name/{model_key}_annotated.parquet (or .csv).
     SpliceAI is run only for sources in splicing_sources (default: fas_analysis, mst1r_analysis, kras).
+    Use source_model_map to override which models run per source (see below).
 
     Parameters
     ----------
@@ -320,7 +328,8 @@ def run_sources(
     output_base : path
     model_keys : list of str, optional; which models to run. If None, resolved from env_profile or DEFAULT_MODEL_KEYS.
     env_profile : str, optional; if model_keys is None, use get_model_keys_for_env(env_profile). One of: "alphagenome", "evo2", "main", "all".
-    splicing_sources : set of str, optional; sources for which SpliceAI is run; default SPLICING_SOURCES.
+    splicing_sources : set of str, optional; sources for which SpliceAI is run; default SPLICING_SOURCES. Ignored when source_model_map is set.
+    source_model_map : dict, optional; map source_name -> list of model keys for that source. If a source is missing, model_keys is used. Enables e.g. running SpliceAI only for certain sources or restricting null to a subset of models.
     spliceai_model_dir : str, optional; OpenSpliceAI checkpoint dir; else OPENSPLICEAI_MODEL_DIR.
     id_col : str
     genome : str
@@ -343,6 +352,7 @@ def run_sources(
         model_keys = get_model_keys_for_env(env_profile)
         logger.info("Env profile %r -> models: %s", env_profile, model_keys)
     model_keys = model_keys or DEFAULT_MODEL_KEYS
+    model_keys = list(model_keys)
     splicing_sources = splicing_sources if splicing_sources is not None else SPLICING_SOURCES
     sources = _sort_sources_first_null(sources)
 
@@ -368,12 +378,21 @@ def run_sources(
         if source_name != NULL_SOURCE_NAME and not null_cov_computed:
             logger.warning("Null covariance not yet computed; run null source first. Epistasis metrics will not include Mahalanobis (epi_mahal, etc.).")
 
-        for model_key in model_keys:
+        models_for_source = (
+            list(source_model_map[source_name])
+            if source_model_map and source_name in source_model_map
+            else model_keys
+        )
+        for model_key in models_for_source:
             if model_key not in FULL_MODEL_CONFIG:
                 logger.warning("Unknown model key %r, skipping", model_key)
                 continue
-            # SpliceAI only for splicing-related sources
-            if model_key == "spliceai" and source_name not in splicing_sources:
+            # SpliceAI only for splicing-related sources (when not using source_model_map)
+            if (
+                model_key == "spliceai"
+                and source_model_map is None
+                and source_name not in splicing_sources
+            ):
                 continue
             context, init_spec = FULL_MODEL_CONFIG[model_key]
             try:
@@ -443,7 +462,7 @@ def run_sources(
         if source_name == NULL_SOURCE_NAME:
             run_null_covariance_and_save(
                 output_base,
-                model_keys,
+                models_for_source,
                 out_npz_dir=null_cov_dir,
                 method="ledoit_wolf",
                 show_progress=show_progress,
