@@ -22,7 +22,12 @@ Directory layout:
 import os
 from pathlib import Path
 
-_DEFAULT_ROOT = Path("/tamir2/nicolaslynn/data/epistasis_paper")
+_CLUSTER_ROOT = Path("/tamir2/nicolaslynn/data/epistasis_paper")
+_HOME_ROOT = Path.home() / "data" / "epistasis_paper"
+
+# Use cluster path if it exists (Tamir cluster), otherwise ~/data/epistasis_paper.
+# Override with env EPISTASIS_PAPER_ROOT.
+_DEFAULT_ROOT = _CLUSTER_ROOT if _CLUSTER_ROOT.parent.exists() else _HOME_ROOT
 
 EPISTASIS_PAPER_ROOT: Path = Path(
     os.environ.get("EPISTASIS_PAPER_ROOT", _DEFAULT_ROOT)

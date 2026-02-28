@@ -53,7 +53,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
+# Source conda — try conda info first, then common install locations
+if command -v conda &>/dev/null; then
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+  source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+  source "$HOME/anaconda3/etc/profile.d/conda.sh"
+else
+  echo "ERROR: conda not found. Install conda or set CONDA_BASE."
+  exit 1
+fi
 if [ -f ~/.hf_token ]; then export HF_TOKEN=$(cat ~/.hf_token); export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; fi
 
 # Map env profile names to conda env names (setup scripts may use different names)
