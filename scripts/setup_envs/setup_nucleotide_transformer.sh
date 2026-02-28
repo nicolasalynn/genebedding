@@ -1,45 +1,24 @@
 #!/usr/bin/env bash
-# Nucleotide Transformer family (all NT v1/v2 models: nt50_3mer, nt50_multi, ..., nt2500_okgp, v2-*)
+# Nucleotide Transformer (all NT v1/v2 models)
+# Official: https://github.com/instadeepai/nucleotide-transformer
 # Weights: HuggingFace InstaDeepAI/nucleotide-transformer-* (downloaded on first use)
 set -e
 CONDA_ENV="${CONDA_ENV:-nt}"
-CUDA_VERSION="${CUDA_VERSION:-121}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "============================================"
-echo "  Nucleotide Transformer env: $CONDA_ENV"
-echo "  CUDA: $CUDA_VERSION  Repo: $REPO_ROOT"
-echo "============================================"
+echo "=== Nucleotide Transformer env: $CONDA_ENV ==="
 
-# Create conda env (Python 3.10)
 conda create -n "$CONDA_ENV" python=3.10 -y
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-# PyTorch with CUDA (>=2.6 required for torch.load CVE-2025-32434 when loading HF .bin weights)
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.6" "torchvision" "torchaudio" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
+# torch>=2.6 required (CVE-2025-32434 blocks torch.load in older versions)
+# cu121 only has torch 2.5; cu128 has 2.6+ which we need for the torch.load CVE fix
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Latest transformers supports safetensors loading natively
+pip install transformers
+pip install -e .
 
-# Transformers + genebeddings[nt]
-pip install "transformers>=4.30"
-pip install -e ".[nt]"
-
-# Smoke test (downloads HF model on first run; gated model requires HF_TOKEN or ~/.hf_token)
-echo ""
-echo ">>> Smoke test: NTWrapper(nt2500_multi)"
-python -c "
-import os
-token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
-if token:
-    from huggingface_hub import login
-    login(token=token)
-from genebeddings.wrappers import NTWrapper
-w = NTWrapper(model='nt2500_multi')
-e = w.embed('ACGT' * 100, pool='mean')
-print(f'  embed shape: {e.shape}')
-print('  OK')
-"
-
-echo ""
 echo "Done. Activate with: conda activate $CONDA_ENV"

@@ -30,6 +30,8 @@ def run_test(wrapper_key: str, seq: str = DEFAULT_SEQ) -> bool:
         elif wrapper_key == "alphagenome":
             from genebeddings.wrappers import AlphaGenomeWrapper
             w = AlphaGenomeWrapper(model_version="fold_0", source="huggingface")
+            # AlphaGenome needs longer sequences (128bp resolution attention)
+            seq = "ACGT" * 512  # 2048 bp
         elif wrapper_key == "evo2":
             from genebeddings.wrappers import Evo2Wrapper
             w = Evo2Wrapper(model="7b_base")

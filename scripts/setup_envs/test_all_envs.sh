@@ -43,9 +43,9 @@ ENVS=(
   "setup_dnabert.sh|dnabert|dnabert"
   "setup_rinalmo.sh|rinalmo|rinalmo"
   "setup_specieslm.sh|specieslm|specieslm"
-  "setup_main.sh|genebeddings_main|nt|convnova|mutbert|hyenadna|caduceus|dnabert|rinalmo|specieslm"
+  # Combined env disabled: individual envs are the canonical setup
+  # "setup_main.sh|genebeddings_main|nt|convnova|mutbert|hyenadna|caduceus|dnabert|rinalmo|specieslm"
 )
-# Note: main env does not test borzoi/spliceai in this list to keep runtime down; add if desired.
 
 run_one_test() {
   local env_name="$1"

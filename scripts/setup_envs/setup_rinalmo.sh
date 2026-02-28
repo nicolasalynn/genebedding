@@ -1,46 +1,30 @@
 #!/usr/bin/env bash
-# RiNALMo (RNA language model). Install from https://github.com/lbcb-sci/RiNALMo:
-#   clone, pip install ., flash-attn==2.3.2; weights via get_pretrained_model().
+# RiNALMo (RNA language model)
+# Official: https://github.com/lbcb-sci/RiNALMo
+# Not on PyPI - must install from GitHub. Requires flash-attn==2.3.2.
+# We pin torch==2.1 to match official RiNALMo requirements and ensure
+# flash-attn 2.3.2 compiles cleanly (newer torch breaks the build).
 set -e
 CONDA_ENV="${CONDA_ENV:-rinalmo}"
-CUDA_VERSION="${CUDA_VERSION:-121}"
-CLONE_DIR="${RINALMO_CLONE_DIR:-$HOME/RiNALMo}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "============================================"
-echo "  RiNALMo env: $CONDA_ENV"
-echo "  CUDA: $CUDA_VERSION  Clone: $CLONE_DIR"
-echo "============================================"
+echo "=== RiNALMo env: $CONDA_ENV ==="
 
 conda create -n "$CONDA_ENV" python=3.10 -y
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
-
-# RiNALMo: install from GitHub (no PyPI package). Per https://github.com/lbcb-sci/RiNALMo
-if [ ! -d "$CLONE_DIR/.git" ]; then
-  rm -rf "$CLONE_DIR"
-  git clone https://github.com/lbcb-sci/RiNALMo.git "$CLONE_DIR"
-fi
-pip install "$CLONE_DIR"
-# flash-attn build needs torch in environment; --no-build-isolation so it sees it
+# torch 2.1 (official RiNALMo requirement; flash-attn 2.3.2 won't compile against newer)
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+# RiNALMo from GitHub (no PyPI package)
+pip install "git+https://github.com/lbcb-sci/RiNALMo.git"
+# flash-attn 2.3.2 (pinned; newer versions break RiNALMo's RotaryEmbedding/unpad_input API)
+pip install ninja psutil
 pip install flash-attn==2.3.2 --no-build-isolation
-
-cd "$REPO_ROOT"
+# numpy<2 required (torch 2.1 is incompatible with numpy 2.x)
+pip install "numpy<2"
 pip install -e .
 
-echo ""
-echo ">>> Smoke test: RiNALMoWrapper (giga-v1)"
-python -c "
-from genebeddings.wrappers import RiNALMoWrapper
-w = RiNALMoWrapper(model_name='giga-v1')
-e = w.embed('ACGT' * 50, pool='mean')
-print(f'  embed shape: {e.shape}')
-print('  OK')
-"
-
-echo ""
 echo "Done. Activate with: conda activate $CONDA_ENV"
