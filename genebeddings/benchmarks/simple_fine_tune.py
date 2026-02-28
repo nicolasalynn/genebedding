@@ -72,7 +72,9 @@ def extract_single_variant_embeddings(model, variant_row, sequence_length: int, 
         var_emb = model.embed(var_seq, pool='mean', return_numpy=True)
 
         return wt_emb, var_emb
-    except:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("Embedding failed for variant: %s", e)
         return None, None
 
 def fine_tune_model(model, model_name: str, max_variants: int = 1000, epochs: int = 5,

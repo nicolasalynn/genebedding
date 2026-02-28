@@ -52,7 +52,11 @@ embeddings/
 
 **Per-source model control:** Pass `source_model_map` (dict: `source_name -> list of model keys`) to run only selected models per source. If a source is missing from the map, the global `model_keys` is used. Example: `{"null": ["nt500_multi", "convnova"], "fas_analysis": ["nt500_multi", "convnova", "spliceai"]}`. When set, the default SpliceAI-on-splicing-sources rule is not applied; the map fully defines which models run where.
 
+**Reuse existing embeddings:** Pass `embedding_lookup_bases` (list of directory paths). For each epistasis_id, the pipeline searches these DBs first; if WT/M1/M2/M12 are found, they are copied into the new DB and the model is not run for that id. Layout: if `embedding_lookup_flat` is False (default), each base has `base/source_name/model_key.db` (same as output_base). If **True**, each base has `.db` files directly (`base/model_key.db`), e.g. `/path/embeddings/nt500_multi.db`, `convnova.db`, etc.—one directory per run, no source subdirs. Skipped when `force=True`.
+
 **Order:** The pipeline always processes the source named `null` first, then the remaining sources.
+
+**Recompute metrics with a custom cov_inv (after processing):** Once the new DBs are filled, (1) compute cov_inv from a chosen source and set of epistasis_ids with `compute_cov_inv(output_base, source_df=df_subset, source_col="source", id_col="epistasis_id", model_keys=...)`; (2) recompute metrics with `recompute_metrics_with_cov_inv(...)`. You get a **series of tables**: one DataFrame per model (tool). Each table has the same structure (epistasis_id, source, len_WT_M1, epi_mahal, …); only the tool differs. Save each table separately (e.g. one parquet per tool) for downstream use.
 
 **Environment profiles:** Some models require a dedicated environment. Use one profile per run so only the models for the current env execute:
 - **alphagenome** — run only AlphaGenome (use in AlphaGenome / JAX env)
@@ -107,6 +111,18 @@ run_sources(
     output_base=Path("embeddings"),
     model_keys=["nt500_multi", "convnova", "spliceai"],
     source_model_map={"null": ["nt500_multi", "convnova"], "fas_analysis": ["nt500_multi", "convnova", "spliceai"]},
+    id_col="epistasis_id",
+)
+
+# Option D: reuse embeddings from existing runs (embedding_lookup_bases)
+# Nested layout (base/source/model.db):
+run_sources(..., embedding_lookup_bases=[Path("/old_run/embeddings")], id_col="epistasis_id")
+
+# Flat layout (base/model_key.db directly, e.g. .../embeddings/nt500_multi.db):
+run_sources(
+    ...,
+    embedding_lookup_bases=[Path("/path1/embeddings"), Path("/path2/embeddings")],
+    embedding_lookup_flat=True,
     id_col="epistasis_id",
 )
 ```

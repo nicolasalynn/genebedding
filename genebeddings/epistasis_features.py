@@ -317,6 +317,7 @@ def _load_residual_from_db(db, epi_id: str) -> Optional[np.ndarray]:
 def compute_cov_inv_from_db(
     db_path: str,
     *,
+    epistasis_ids: Optional[Sequence[str]] = None,
     method: str = "ledoit_wolf",
     ridge: float = 1e-6,
     sample_frac: Optional[float] = None,
@@ -325,13 +326,39 @@ def compute_cov_inv_from_db(
     show_progress: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute covariance + inverse from all epistasis residuals in a DB.
+    Compute covariance + inverse from epistasis residuals in a DB.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to VariantEmbeddingDB containing WT, M1, M2, M12 per epistasis pair.
+    epistasis_ids : sequence of str, optional
+        If provided, use only these epistasis IDs (e.g. "mut1|mut2"). Otherwise
+        use all epistasis IDs found in the DB.
+    method : str
+        "ledoit_wolf" (default), "diag", or "sample" for covariance estimation.
+    ridge : float
+        Ridge added to covariance before inverting (default 1e-6).
+    sample_frac, max_samples, random_state
+        Optional subsampling of (epistasis_ids or DB list) before fitting.
+    show_progress : bool
+        Whether to show a progress bar.
+
+    Returns
+    -------
+    cov : np.ndarray
+        Fitted covariance matrix (d x d).
+    cov_inv : np.ndarray
+        Inverse covariance (d x d), for Mahalanobis: sqrt(r.T @ cov_inv @ r).
     """
     from .genebeddings import VariantEmbeddingDB
 
     rng = random.Random(random_state)
     db = VariantEmbeddingDB(db_path)
-    epi_ids = _list_epistasis_ids_from_db(db)
+    if epistasis_ids is not None:
+        epi_ids = list(epistasis_ids)
+    else:
+        epi_ids = _list_epistasis_ids_from_db(db)
 
     if sample_frac is not None:
         k = max(1, int(len(epi_ids) * sample_frac))
@@ -406,6 +433,7 @@ def compute_cov_inv_from_paths(
 def compute_cov_inv_from_paths_combined(
     paths: Sequence[str],
     *,
+    epistasis_ids: Optional[Sequence[str]] = None,
     method: str = "ledoit_wolf",
     ridge: float = 1e-6,
     sample_frac: Optional[float] = None,
@@ -414,7 +442,8 @@ def compute_cov_inv_from_paths_combined(
     show_progress: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute a single cov/cov_inv from all epistasis residuals across all DBs.
+    Compute a single cov/cov_inv from epistasis residuals across all DBs.
+    If epistasis_ids is provided, use only those IDs (that exist in the DBs).
     """
     from .genebeddings import VariantEmbeddingDB
 
@@ -428,11 +457,17 @@ def compute_cov_inv_from_paths_combined(
         else:
             db_files.append(p)
 
+    epi_ids_restrict: Optional[List[str]] = list(epistasis_ids) if epistasis_ids is not None else None
+
     all_residuals: List[np.ndarray] = []
     # Avoid nested progress bars: show per-DB residual progress only.
     for db_path in db_files:
         db = VariantEmbeddingDB(db_path)
-        epi_ids = _list_epistasis_ids_from_db(db)
+        if epi_ids_restrict is not None:
+            db_all = set(_list_epistasis_ids_from_db(db))
+            epi_ids = [e for e in epi_ids_restrict if e in db_all]
+        else:
+            epi_ids = _list_epistasis_ids_from_db(db)
         if sample_frac is not None:
             k = max(1, int(len(epi_ids) * sample_frac))
             epi_ids = rng.sample(epi_ids, k)

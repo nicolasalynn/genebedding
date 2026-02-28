@@ -792,7 +792,8 @@ def train_prediction_head_realtime(model, df, model_name: str, sequence_length: 
     final_acc = accuracy_score(all_path_labels, all_path_preds) if all_path_labels else 0
     try:
         final_auc = roc_auc_score(all_path_labels, all_path_preds) if len(set(all_path_labels)) > 1 else 0
-    except:
+    except Exception:
+        # e.g. single class in y_true; roc_auc_score undefined
         final_auc = 0
 
     return {
