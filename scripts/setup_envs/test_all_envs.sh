@@ -19,8 +19,9 @@ done
 # Load HF token so NT/AlphaGenome and gated models work when run directly on Lambda
 if [ -f ~/.hf_token ]; then export HF_TOKEN=$(cat ~/.hf_token); export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; fi
 
-# conda init
-source "$(conda info --base)/etc/profile.d/conda.sh"
+# Initialize conda (works in non-interactive shells)
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 # Report file (append each result)
 REPORT_FILE="${REPORT_FILE:-$SCRIPT_DIR/test_all_envs_report.txt}"

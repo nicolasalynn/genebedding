@@ -9,8 +9,10 @@ cd "$REPO_ROOT"
 
 echo "=== DNABERT-2 env: $CONDA_ENV ==="
 
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
 conda create -n "$CONDA_ENV" python=3.10 -y
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
@@ -18,9 +20,10 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 # DNABERT-2 requires transformers==4.29.2 to avoid config_class mismatch
 # See: https://github.com/MAGICS-LAB/DNABERT_2/issues/38
 pip install "transformers==4.29.2" einops
-# Uninstall triton: DNABERT-2's bundled Triton flash-attn is incompatible with modern triton.
+pip install -e .
+# Uninstall triton AFTER -e . (which may re-pull it via torch deps).
+# DNABERT-2's bundled Triton flash-attn is incompatible with modern triton.
 # Without triton, it auto-falls-back to standard PyTorch attention.
 pip uninstall triton -y 2>/dev/null || true
-pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

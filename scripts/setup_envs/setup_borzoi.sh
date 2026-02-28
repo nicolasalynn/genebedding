@@ -9,8 +9,10 @@ cd "$REPO_ROOT"
 
 echo "=== Borzoi env: $CONDA_ENV ==="
 
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
 conda create -n "$CONDA_ENV" python=3.10 -y
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel

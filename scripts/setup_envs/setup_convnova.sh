@@ -6,13 +6,12 @@ CUDA_VERSION="${CUDA_VERSION:-121}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "============================================"
-echo "  ConvNova env: $CONDA_ENV"
-echo "  CUDA: $CUDA_VERSION"
-echo "============================================"
+echo "=== ConvNova env: $CONDA_ENV ==="
+
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 conda create -n "$CONDA_ENV" python=3.10 -y
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
