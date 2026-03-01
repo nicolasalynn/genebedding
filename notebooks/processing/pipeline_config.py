@@ -33,7 +33,7 @@ BATCH_SIZE_BY_TOOL: Dict[str, int] = {
     "mutbert": 32,
     "hyenadna": 8,
     "caduceus": 8,
-    "borzoi": 16,
+    "borzoi": 6,
     "alphagenome": 8,
     "evo2": 16,
     "rinalmo": 16,
