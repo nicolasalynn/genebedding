@@ -26,7 +26,7 @@ pip install torch torchvision torchaudio --index-url "$CUDA_INDEX"
 # transformers <4.46 required: NT v2 remote code uses find_pruneable_heads_and_indices,
 # which was removed in transformers 5.x
 pip install "transformers>=4.40,<4.46"
-pip install seqmat pyarrow
+pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

@@ -31,7 +31,7 @@ if [ ! -d "$CLONE_DIR/.git" ]; then
 fi
 pip install "$CLONE_DIR"
 # Non-editable install so genebeddings is importable
-pip install seqmat scipy scikit-learn pyarrow
+pip install seqmat scipy scikit-learn pyarrow matplotlib pandas tqdm
 pip install .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

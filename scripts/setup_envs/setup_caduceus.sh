@@ -21,7 +21,7 @@ pip install --upgrade pip setuptools wheel
 pip install torch torchvision torchaudio --index-url "$CUDA_INDEX"
 # Caduceus uses tie_weights(recompute_mapping=...) removed in transformers 4.46+
 pip install "transformers>=4.30,<4.46" mamba_ssm
-pip install seqmat pyarrow
+pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

@@ -18,7 +18,7 @@ conda activate "$CONDA_ENV"
 pip install --upgrade pip setuptools wheel
 pip install torch torchvision torchaudio --index-url "$CUDA_INDEX"
 pip install "transformers>=4.30,<4.46"
-pip install seqmat pyarrow
+pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
 echo ""

@@ -24,7 +24,7 @@ pip install "torch>=2.6" torchvision torchaudio --index-url "$CUDA_INDEX"
 pip install "borzoi-pytorch>=0.4"
 # flash-attn from source (adapts to detected CUDA + torch version)
 pip install flash-attn --no-build-isolation
-pip install seqmat pyarrow
+pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"
