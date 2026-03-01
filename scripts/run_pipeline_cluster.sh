@@ -24,6 +24,8 @@
 #   --quick-test           One tool, 20 rows per source; verify GPU and wrappers before full run.
 #   --smoke-test           ALL tools, 5 rows per source; verify every model end-to-end (embed + metrics).
 #   --smoke-test-full      ALL tools, 5 rows per source + ALL fas_exon rows; full splicing validation.
+#   --model-key KEY         Run only this model key (must belong to --env-profile).
+#   --sources SRC [SRC..]  Run only these source names (e.g. okgp_chr12 fas_exon).
 #   --gpus N               Number of GPUs to use for parallel embed (default: auto-detect).
 #   --dry-run              Print commands, do not run.
 #
@@ -40,6 +42,8 @@ SKIP_METRICS=""
 QUICK_TEST=""
 SMOKE_TEST=""
 SMOKE_TEST_FULL=""
+MODEL_KEY=""
+SOURCES_ARGS=""
 DRY_RUN=""
 GPU_OVERRIDE=""
 while [ $# -gt 0 ]; do
@@ -50,6 +54,8 @@ while [ $# -gt 0 ]; do
     --quick-test)       QUICK_TEST=1; shift ;;
     --smoke-test)       SMOKE_TEST=1; shift ;;
     --smoke-test-full)  SMOKE_TEST_FULL=1; shift ;;
+    --model-key)        MODEL_KEY="$2"; shift 2 ;;
+    --sources)          shift; while [ $# -gt 0 ] && [[ "$1" != --* ]]; do SOURCES_ARGS="$SOURCES_ARGS $1"; shift; done ;;
     --gpus)             GPU_OVERRIDE="$2"; shift 2 ;;
     --dry-run)          DRY_RUN=1; shift ;;
     *) echo "Unknown option $1"; exit 1 ;;
@@ -118,6 +124,8 @@ else
   [ -n "$QUICK_TEST" ] && EMBED_EXTRA="--quick-test $EMBED_EXTRA"
   [ -n "$SMOKE_TEST" ] && EMBED_EXTRA="--smoke-test $EMBED_EXTRA"
   [ -n "$SMOKE_TEST_FULL" ] && EMBED_EXTRA="--smoke-test-full $EMBED_EXTRA"
+  [ -n "$MODEL_KEY" ] && EMBED_EXTRA="--model-key $MODEL_KEY $EMBED_EXTRA"
+  [ -n "$SOURCES_ARGS" ] && EMBED_EXTRA="--sources $SOURCES_ARGS $EMBED_EXTRA"
   if [ -n "$ENV_PROFILE" ]; then
     CONDA_NAME=$(env_conda_name "$ENV_PROFILE")
     echo "=== Embed phase: env_profile=$ENV_PROFILE (conda env: $CONDA_NAME) ${QUICK_TEST:+[quick-test]}${SMOKE_TEST:+[smoke-test]}${SMOKE_TEST_FULL:+[smoke-test-full]} ==="

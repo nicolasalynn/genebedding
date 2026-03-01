@@ -99,6 +99,8 @@ def run_embed_phase(
     quick_test: bool = False,
     smoke_test: bool = False,
     smoke_test_full: bool = False,
+    model_key: Optional[str] = None,
+    sources_filter: Optional[list] = None,
     status_path: Optional[Path] = None,
 ) -> None:
     """Run embedding for one env profile (one tool at a time over all sources).
@@ -106,11 +108,21 @@ def run_embed_phase(
     quick_test:      first tool only, 20 rows per source (fast sanity check).
     smoke_test:      ALL tools, 5 rows per source (verify every model end-to-end).
     smoke_test_full: ALL tools, 5 rows per source + ALL rows for fas_exon.
+    model_key:       run only this model key (must belong to env_profile).
+    sources_filter:  run only these source names (e.g. ["okgp_chr12", "fas_exon"]).
     """
     status_path = status_path or _status_path(output_base)
     _write_status(path=status_path, phase="embed", env_profile=env_profile, message=f"embed env={env_profile}")
 
     model_keys = get_model_keys_for_env(env_profile)
+    if model_key:
+        if model_key not in model_keys:
+            raise ValueError(
+                f"Model key {model_key!r} not in env profile {env_profile!r}. "
+                f"Available: {model_keys}"
+            )
+        model_keys = [model_key]
+        logger.info("Filtering to single model key: %s", model_key)
     if quick_test:
         model_keys = model_keys[:1]
         logger.info("Quick-test: running only first tool %r", model_keys[0] if model_keys else None)
@@ -126,6 +138,9 @@ def run_embed_phase(
     if single_path is not None:
         import pandas as pd
         df = pd.read_csv(single_path, sep=None, engine="python")
+        if sources_filter:
+            df = df[df[SOURCE_COL].isin(sources_filter)]
+            logger.info("Filtered to sources %s (%d rows)", sources_filter, len(df))
         if n_rows:
             df = _truncate_df(df, n_rows, SOURCE_COL, full_sources=full_sources)
             if full_sources:
@@ -151,6 +166,9 @@ def run_embed_phase(
     sources = resolve_sources(data_dir)
     if not sources:
         raise ValueError("No sources resolved. Set SOURCES in pipeline_config or use single dataframe.")
+    if sources_filter:
+        sources = [(name, path) for name, path in sources if name in sources_filter]
+        logger.info("Filtered to sources: %s", [s[0] for s in sources])
     if n_rows:
         import pandas as pd
         truncated = []
@@ -263,6 +281,8 @@ def main() -> int:
     parser.add_argument("--quick-test", action="store_true", help="One tool, 20 rows per source; verify GPU and wrappers")
     parser.add_argument("--smoke-test", action="store_true", help="ALL tools, 5 rows per source; verify every model end-to-end")
     parser.add_argument("--smoke-test-full", action="store_true", help="ALL tools, 5 rows per source + ALL fas_exon rows; full splicing validation")
+    parser.add_argument("--model-key", type=str, default=None, help="Run only this model key (must belong to --env-profile)")
+    parser.add_argument("--sources", type=str, nargs="+", default=None, help="Run only these source names (e.g. okgp_chr12 fas_exon)")
     parser.add_argument("--status-file", type=str, default=None, help="Progress JSON path (default: output_base/pipeline_status.json)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -283,6 +303,8 @@ def main() -> int:
             quick_test=args.quick_test,
             smoke_test=args.smoke_test,
             smoke_test_full=args.smoke_test_full,
+            model_key=args.model_key,
+            sources_filter=args.sources,
             status_path=status_path,
         )
     else:
