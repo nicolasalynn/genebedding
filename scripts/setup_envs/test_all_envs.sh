@@ -82,17 +82,19 @@ run_one_test() {
   local display_key="${model_key:-$wrapper_key}"
 
   if [ "$REPORT_PARAMS" = true ]; then
-    # stdout has TSV line: key\tSTATUS\temb_dim\tparams\tcontext_bp
+    # Last line of stdout is our TSV; earlier lines may be model-loading logs (e.g. evo2)
     if [ -n "$stdout_content" ]; then
-      echo "$stdout_content"  # return TSV line
+      echo "$stdout_content" | tail -1
     else
       # No stdout means crash before any output
       printf '%s\tFAIL\tN/A\tN/A\tN/A\n' "$display_key"
     fi
   else
-    # Legacy mode: stdout has "key OK shape=..." or empty, stderr has "key FAIL ..."
-    if echo "$stdout_content" | grep -q "OK"; then
-      echo "OK|${stdout_content}"
+    # Legacy mode: last line of stdout has "key OK shape=..."
+    local last_line
+    last_line=$(echo "$stdout_content" | tail -1)
+    if echo "$last_line" | grep -q "OK"; then
+      echo "OK|${last_line}"
     else
       echo "FAIL|${stderr_content}"
     fi
