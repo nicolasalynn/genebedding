@@ -234,41 +234,25 @@ def _build_model(model_key: str, init_spec: str, spliceai_model_dir: Optional[st
         except Exception as e:
             logger.warning("Evo2 not available: %s", e)
             return None
-    # default
+    # default — import only the one wrapper we need (each has unique deps)
     _defaults = {
-        "convnova": ("ConvNovaWrapper", {}),
-        "mutbert": ("MutBERTWrapper", {}),
-        "hyenadna": ("HyenaDNAWrapper", {}),
-        "caduceus": ("CaduceusWrapper", {}),
-        "borzoi": ("BorzoiWrapper", {}),
-        "rinalmo": ("RiNALMoWrapper", {}),
-        "specieslm": ("SpeciesLMWrapper", {}),
-        "dnabert": ("DNABERTWrapper", {}),
+        "convnova": ("convnova_wrapper", "ConvNovaWrapper", {}),
+        "mutbert": ("mutbert_wrapper", "MutBERTWrapper", {}),
+        "hyenadna": ("hyenadna_wrapper", "HyenaDNAWrapper", {}),
+        "caduceus": ("caduceus_wrapper", "CaduceusWrapper", {}),
+        "borzoi": ("borzoi_wrapper", "BorzoiWrapper", {}),
+        "rinalmo": ("rinalmo_wrapper", "RiNALMoWrapper", {}),
+        "specieslm": ("specieslm_wrapper", "SpeciesLMWrapper", {}),
+        "dnabert": ("dnabert_wrapper", "DNABERTWrapper", {}),
     }
-    cls_name, kwargs = _defaults.get(model_key, (None, None))
-    if cls_name is None:
+    entry = _defaults.get(model_key)
+    if entry is None:
         return None
-    from genebeddings.wrappers import (
-        BorzoiWrapper,
-        CaduceusWrapper,
-        ConvNovaWrapper,
-        DNABERTWrapper,
-        HyenaDNAWrapper,
-        MutBERTWrapper,
-        RiNALMoWrapper,
-        SpeciesLMWrapper,
-    )
-    cls_map = {
-        "ConvNovaWrapper": ConvNovaWrapper,
-        "MutBERTWrapper": MutBERTWrapper,
-        "HyenaDNAWrapper": HyenaDNAWrapper,
-        "CaduceusWrapper": CaduceusWrapper,
-        "BorzoiWrapper": BorzoiWrapper,
-        "RiNALMoWrapper": RiNALMoWrapper,
-        "SpeciesLMWrapper": SpeciesLMWrapper,
-        "DNABERTWrapper": DNABERTWrapper,
-    }
-    return cls_map[cls_name](**kwargs)
+    mod_name, cls_name, kwargs = entry
+    import importlib
+    mod = importlib.import_module(f"genebeddings.wrappers.{mod_name}")
+    cls = getattr(mod, cls_name)
+    return cls(**kwargs)
 
 
 def _load_epistasis_df(path: Union[str, Path], id_col: str = "epistasis_id") -> pd.DataFrame:
