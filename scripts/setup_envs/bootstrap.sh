@@ -9,25 +9,43 @@
 #   # Non-interactive:
 #   bash bootstrap.sh --hf-token hf_abc123... --paper-root ~/data/epistasis_paper
 #
-#   # Clone repo for you (HTTPS with GitHub PAT):
-#   bash bootstrap.sh --hf-token hf_... --clone-repo https://github.com/nicolasalynn/genebedding.git
+#   # Clone repo for you (no SSH keys needed — uses GitHub PAT for HTTPS auth):
+#   bash bootstrap.sh --hf-token hf_... --gh-token ghp_... --clone
+#
+#   # Or clone manually and just bootstrap:
+#   git clone ... ~/genebeddings && cd ~/genebeddings
+#   bash scripts/setup_envs/bootstrap.sh --hf-token hf_...
 #
 # All flags can also be set via env vars:
-#   HF_TOKEN, EPISTASIS_PAPER_ROOT, REPO_URL
+#   HF_TOKEN, GH_TOKEN, EPISTASIS_PAPER_ROOT
 set -e
 
 # ── Parse args ──────────────────────────────────────────────────────
-REPO_URL="${REPO_URL:-}"
+GH_TOKEN="${GH_TOKEN:-}"
 PAPER_ROOT="${EPISTASIS_PAPER_ROOT:-}"
+DO_CLONE=""
+REPO_URL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --hf-token)     HF_TOKEN="$2"; shift 2 ;;
+    --gh-token)     GH_TOKEN="$2"; shift 2 ;;
     --paper-root)   PAPER_ROOT="$2"; shift 2 ;;
-    --clone-repo)   REPO_URL="$2"; shift 2 ;;
+    --clone)        DO_CLONE=1; shift ;;
+    --clone-repo)   DO_CLONE=1; REPO_URL="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+# Default repo URL (with PAT embedded if provided)
+GITHUB_REPO="nicolasalynn/genebedding.git"
+if [ -n "$DO_CLONE" ] && [ -z "$REPO_URL" ]; then
+  if [ -n "$GH_TOKEN" ]; then
+    REPO_URL="https://${GH_TOKEN}@github.com/${GITHUB_REPO}"
+  else
+    REPO_URL="https://github.com/${GITHUB_REPO}"
+  fi
+fi
 
 # ── Prompt for HF token if not provided ─────────────────────────────
 if [ -z "$HF_TOKEN" ]; then
@@ -91,7 +109,7 @@ conda init bash 2>/dev/null || true
 conda config --set auto_activate_base false
 
 # ── 3. Clone repo (optional) ───────────────────────────────────────
-if [ -n "$REPO_URL" ]; then
+if [ -n "$DO_CLONE" ]; then
   echo ""
   echo ">>> [3/7] Cloning repo..."
   CLONE_DEST="$HOME/genebeddings"
@@ -101,10 +119,18 @@ if [ -n "$REPO_URL" ]; then
   else
     git clone "$REPO_URL" "$CLONE_DEST"
   fi
+  # If using a PAT, store credentials so future git pull/push works without re-entering
+  if [ -n "$GH_TOKEN" ]; then
+    git config --global credential.helper store
+    echo "https://${GH_TOKEN}@github.com" > ~/.git-credentials
+    chmod 600 ~/.git-credentials
+    # Set remote to clean URL (without embedded token) now that credentials are stored
+    git -C "$CLONE_DEST" remote set-url origin "https://github.com/${GITHUB_REPO}"
+  fi
   echo "  Repo at: $CLONE_DEST"
 else
   echo ""
-  echo ">>> [3/7] Skipping repo clone (no --clone-repo). Assuming repo already cloned."
+  echo ">>> [3/7] Skipping repo clone (no --clone). Assuming repo already cloned."
 fi
 
 # ── 4. HuggingFace token ───────────────────────────────────────────
@@ -187,7 +213,7 @@ echo "=============================================="
 echo "  Bootstrap done. Next steps:"
 echo "=============================================="
 echo "  source ~/.bashrc"
-if [ -n "$REPO_URL" ]; then
+if [ -n "$DO_CLONE" ]; then
   echo "  cd ~/genebeddings"
 fi
 echo "  # Create all envs + validate (takes 1-2 hrs):"
