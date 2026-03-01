@@ -2679,7 +2679,7 @@ def _model_max_seq_len(model, context: int) -> int:
     the model's theoretical capacity.
     """
     cap = 4 * context
-    for attr in ("max_length", "min_input_len", "max_seq_len"):
+    for attr in ("max_seq_len", "min_input_len", "max_length"):
         val = getattr(model, attr, None)
         if val is not None and isinstance(val, int) and val > 0:
             return min(val, cap)
