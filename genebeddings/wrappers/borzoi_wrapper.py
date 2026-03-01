@@ -21,15 +21,22 @@ Pool = Literal["mean", "cls", "tokens"]
 
 
 
+_ONEHOT_MAP = np.zeros(256, dtype=np.int8)
+_ONEHOT_MAP[ord("A")] = _ONEHOT_MAP[ord("a")] = 0
+_ONEHOT_MAP[ord("C")] = _ONEHOT_MAP[ord("c")] = 1
+_ONEHOT_MAP[ord("G")] = _ONEHOT_MAP[ord("g")] = 2
+_ONEHOT_MAP[ord("T")] = _ONEHOT_MAP[ord("t")] = 3
+_ONEHOT_MAP[ord("N")] = _ONEHOT_MAP[ord("n")] = -1  # N -> all zeros
+
+
 def _dna_to_onehot4(seq: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return (1, 4, L) one-hot tensor in the desired dtype."""
+    """Return (1, 4, L) one-hot tensor in the desired dtype (vectorized)."""
+    indices = _ONEHOT_MAP[np.frombuffer(seq.encode("ascii"), dtype=np.uint8)]
     L = len(seq)
     x = np.zeros((1, 4, L), dtype=np.float32)
-    for i, ch in enumerate(seq.upper()):
-        if   ch == "A": x[0, 0, i] = 1.0
-        elif ch == "C": x[0, 1, i] = 1.0
-        elif ch == "G": x[0, 2, i] = 1.0
-        elif ch == "T": x[0, 3, i] = 1.0
+    mask = indices >= 0
+    positions = np.where(mask)[0]
+    x[0, indices[mask], positions] = 1.0
     return torch.from_numpy(x).to(device=device, dtype=dtype)
 
 
