@@ -89,42 +89,30 @@ DEFAULT_MODEL_KEYS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Environment profiles: run only models that belong to the current environment
+# Environment profiles: built dynamically from pipeline_config.TOOL_TO_ENV
 # ---------------------------------------------------------------------------
-# Models that require the AlphaGenome environment (JAX, etc.). Run ONLY these in that env.
-MODELS_ALPHAGENOME_ENV: List[str] = ["alphagenome"]
+from collections import defaultdict as _defaultdict
+from notebooks.processing.pipeline_config import get_env_for_tool as _get_env_for_tool
 
-# Models that require the Evo2 environment. Run ONLY these in that env.
-MODELS_EVO2_ENV: List[str] = ["evo2"]
+_env_to_models: Dict[str, List[str]] = _defaultdict(list)
+for _k in FULL_MODEL_CONFIG:
+    _env_to_models[_get_env_for_tool(_k)].append(_k)
 
-# All other models (run in the shared "main" environment). Excludes alphagenome and evo2.
-_MODELS_REQUIRING_SPECIAL_ENV = set(MODELS_ALPHAGENOME_ENV) | set(MODELS_EVO2_ENV)
-MODELS_MAIN_ENV: List[str] = [
-    k for k in FULL_MODEL_CONFIG
-    if k not in _MODELS_REQUIRING_SPECIAL_ENV
-]
-
-# Named profiles: use get_model_keys_for_env(profile) or --env-profile in CLI
-ENV_PROFILES: Dict[str, List[str]] = {
-    "alphagenome": MODELS_ALPHAGENOME_ENV,
-    "evo2": MODELS_EVO2_ENV,
-    "main": MODELS_MAIN_ENV,
-    "all": list(FULL_MODEL_CONFIG),
-}
+ENV_PROFILES: Dict[str, List[str]] = dict(_env_to_models)
+ENV_PROFILES["all"] = list(FULL_MODEL_CONFIG)
 
 
 def get_model_keys_for_env(profile: str) -> List[str]:
     """
     Return the list of model keys to run for the given environment profile.
 
-    Use this so the same notebook/script can be run in different conda envs:
-    set ENV_PROFILE to "alphagenome" / "evo2" / "main" / "all" and pass
-    model_keys=get_model_keys_for_env(ENV_PROFILE).
+    Profiles are built dynamically from ``pipeline_config.TOOL_TO_ENV``.
+    Each unique conda env name becomes a profile, plus ``"all"`` runs every model.
 
     Parameters
     ----------
     profile : str
-        One of: "alphagenome", "evo2", "main", "all".
+        A conda env name (e.g. "nt", "borzoi", "evo2") or "all".
 
     Returns
     -------
@@ -446,7 +434,7 @@ def run_sources(
     sources : list of (source_name, path_or_dataframe)
     output_base : path
     model_keys : list of str, optional; which models to run. If None, resolved from env_profile or DEFAULT_MODEL_KEYS.
-    env_profile : str, optional; if model_keys is None, use get_model_keys_for_env(env_profile). One of: "alphagenome", "evo2", "main", "all".
+    env_profile : str, optional; if model_keys is None, use get_model_keys_for_env(env_profile). A conda env name (e.g. "nt", "borzoi", "evo2") or "all".
     splicing_sources : set of str, optional; unused (kept for API compat). SpliceAI runs only for sources in SPLICEAI_SOURCE_NAMES. Ignored when source_model_map is set.
     source_model_map : dict, optional; map source_name -> list of model keys for that source. If a source is missing, model_keys is used. Enables e.g. running SpliceAI only for certain sources or restricting null to a subset of models.
     embedding_lookup_bases : sequence of paths, optional; directories to search for existing embeddings. Layout depends on embedding_lookup_flat (see below).
@@ -1068,8 +1056,7 @@ def main() -> int:
         "--env-profile",
         type=str,
         default=None,
-        choices=list(ENV_PROFILES),
-        help="Run only models for this environment: alphagenome, evo2, main, or all",
+        help="Conda env profile name (e.g. nt, borzoi, spliceai, evo2, alphagenome, all)",
     )
     parser.add_argument("--models", type=str, nargs="*", default=None, metavar="KEY", help="Override: run these model keys (ignored if --env-profile set)")
     parser.add_argument("--id-col", type=str, default="epistasis_id")

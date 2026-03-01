@@ -3,13 +3,13 @@
 Single entry point for the epistasis pipeline.
 
   Phase embed:  Run one env profile (one tool at a time over all sources).
-                Invoke once per conda env: main, evo2, alphagenome.
+                Invoke once per conda env (nt, borzoi, evo2, alphagenome, ...).
   Phase metrics: Compute cov_inv from null, recompute all metrics, save one
                  parquet per tool (sheets). Run once after all embed phases.
 
 Usage:
   # On Lambda: one env at a time (run from repo root)
-  conda activate main && python -m notebooks.processing.run_everything --phase embed --env-profile main
+  conda activate nt && python -m notebooks.processing.run_everything --phase embed --env-profile nt
   conda activate evo2 && python -m notebooks.processing.run_everything --phase embed --env-profile evo2
   conda activate alphagenome && python -m notebooks.processing.run_everything --phase embed --env-profile alphagenome
   python -m notebooks.processing.run_everything --phase metrics
@@ -254,7 +254,8 @@ def run_metrics_phase(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Epistasis pipeline: embed (per env) or metrics (sheets)")
     parser.add_argument("--phase", choices=("embed", "metrics"), required=True)
-    parser.add_argument("--env-profile", type=str, default=None, choices=("main", "evo2", "alphagenome", "all"))
+    parser.add_argument("--env-profile", type=str, default=None,
+                        help="Conda env profile name (e.g. nt, borzoi, spliceai, evo2, alphagenome, all)")
     parser.add_argument("--output", type=str, default=None, help="Output base for DBs (default: embeddings_dir())")
     parser.add_argument("--sheets-dir", type=str, default=None, help="Where to save parquet sheets (default: output/sheets)")
     parser.add_argument("--spliceai-dir", type=str, default=None)

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Run the full epistasis pipeline on a Lambda (or multi-GPU) cluster.
 #
-# Prereqs: clone repo, run all setup_*.sh so conda envs exist (nt, main, evo2, alphagenome, etc.).
+# Prereqs: clone repo, run all setup_*.sh so conda envs exist (one per wrapper).
 # Set EPISTASIS_PAPER_ROOT and data/embeddings paths (or use paper_data_config default).
 #
-# Execution: one tool at a time per env. Phase 1 runs embed for each conda profile (main, evo2, alphagenome).
-# Phase 2 runs metrics once (cov_inv from null, recompute, save one parquet per tool to output/sheets/).
+# Execution: one env at a time (one tool at a time within each). Phase 1 loops 12 conda
+# envs (nt, convnova, mutbert, ..., evo2, alphagenome). Phase 2 runs metrics once.
 #
 # Usage:
 #   cd /path/to/genebeddings
 #   # Optional: verify GPU and wrappers first (one tool, 20 rows per source)
-#   bash scripts/run_pipeline_cluster.sh --quick-test --env-profile main
+#   bash scripts/run_pipeline_cluster.sh --quick-test --env-profile nt
 #   # Full run (or run embed per profile then metrics)
 #   bash scripts/run_pipeline_cluster.sh 2>&1 | tee pipeline.log
 #
@@ -18,7 +18,7 @@
 #   bash scripts/monitor_pipeline.sh
 #
 # Options:
-#   --env-profile PROFILE   Run only this profile's embed phase (main|evo2|alphagenome). Omit to run all.
+#   --env-profile PROFILE   Run only this profile's embed phase. Omit to run all 12.
 #   --phase metrics        Run only the metrics phase (sheets). Default: embed for all profiles then metrics.
 #   --skip-metrics         After embed phases, do not run metrics.
 #   --quick-test           One tool, 20 rows per source; verify GPU and wrappers before full run.
@@ -66,13 +66,11 @@ else
 fi
 if [ -f ~/.hf_token ]; then export HF_TOKEN=$(cat ~/.hf_token); export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN; fi
 
-# Map env profile names to conda env names (setup scripts may use different names)
-env_conda_name() {
-  case "$1" in
-    main) echo "${MAIN_CONDA_ENV:-genebeddings_main}" ;;
-    *)    echo "$1" ;;
-  esac
-}
+# All env profiles (one per wrapper conda env). Profile name = conda env name.
+ALL_PROFILES=(nt convnova mutbert hyenadna caduceus borzoi dnabert rinalmo specieslm spliceai alphagenome evo2)
+
+# env_conda_name: profile name = conda env name (no mapping needed)
+env_conda_name() { echo "$1"; }
 
 # Ensure EPISTASIS_PAPER_ROOT is set (required for output paths)
 if [ -z "$EPISTASIS_PAPER_ROOT" ]; then
@@ -114,7 +112,7 @@ else
     run_cmd python -m notebooks.processing.run_everything --phase embed --env-profile "$ENV_PROFILE" $EMBED_EXTRA
     conda deactivate 2>/dev/null || true
   else
-    for profile in main evo2 alphagenome; do
+    for profile in "${ALL_PROFILES[@]}"; do
       CONDA_NAME=$(env_conda_name "$profile")
       echo "=== Embed phase: env_profile=$profile (conda env: $CONDA_NAME) ${QUICK_TEST:+[quick-test]}${SMOKE_TEST:+[smoke-test]}${SMOKE_TEST_FULL:+[smoke-test-full]} ==="
       if conda activate "$CONDA_NAME" 2>/dev/null; then
@@ -133,7 +131,7 @@ if [ "$PHASE" = "embed" ] && [ -z "$ENV_PROFILE" ]; then
 elif [ -n "$SKIP_METRICS" ]; then
   echo "Skipping metrics phase (--skip-metrics)"
 else
-  CONDA_NAME=$(env_conda_name "main")
+  CONDA_NAME=$(env_conda_name "nt")
   echo "=== Metrics phase: cov_inv + sheets (conda env: $CONDA_NAME) ==="
   conda activate "$CONDA_NAME" || { echo "Env $CONDA_NAME not found for metrics phase"; exit 1; }
   run_cmd python -m notebooks.processing.run_everything --phase metrics

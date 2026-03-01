@@ -36,18 +36,40 @@ BATCH_SIZE_BY_TOOL: Dict[str, int] = {
     "spliceai": 8,
 }
 
-# Tool -> conda env profile (must match process_epistasis.ENV_PROFILES).
-# Used to run one env at a time: activate main, run all main tools; then evo2; then alphagenome.
+# Tool -> conda env name.  Every model must be explicitly mapped.
+# NT variants all share the "nt" conda env.
 TOOL_TO_ENV: Dict[str, str] = {
+    "nt50_3mer": "nt",
+    "nt50_multi": "nt",
+    "nt100_multi": "nt",
+    "nt250_multi": "nt",
+    "nt500_multi": "nt",
+    "nt500_ref": "nt",
+    "nt2500_multi": "nt",
+    "nt2500_okgp": "nt",
+    "convnova": "convnova",
+    "mutbert": "mutbert",
+    "hyenadna": "hyenadna",
+    "caduceus": "caduceus",
+    "borzoi": "borzoi",
+    "dnabert": "dnabert",
+    "rinalmo": "rinalmo",
+    "specieslm": "specieslm",
+    "spliceai": "spliceai",
     "alphagenome": "alphagenome",
     "evo2": "evo2",
 }
-# All other tools use "main".
 
 
 def get_env_for_tool(model_key: str) -> str:
-    """Return env profile name for a model key."""
-    return TOOL_TO_ENV.get(model_key, "main")
+    """Return conda env name for a model key.  Raises on unknown keys."""
+    if model_key not in TOOL_TO_ENV:
+        raise KeyError(
+            f"Unknown model key {model_key!r}. "
+            f"Add it to TOOL_TO_ENV in pipeline_config.py. "
+            f"Known keys: {sorted(TOOL_TO_ENV)}"
+        )
+    return TOOL_TO_ENV[model_key]
 
 
 def get_batch_size(model_key: str, default: Optional[int] = None) -> int:
