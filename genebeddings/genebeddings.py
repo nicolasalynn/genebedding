@@ -2681,12 +2681,21 @@ def _prepare_epistasis_sequences(
     reverse_complement: bool = False,
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
+    max_seq_len: int = 0,
 ) -> tuple[str, str, str, str]:
     """
     Prepare the 4 sequences (WT, M1, M2, M12) for an epistasis pair.
 
     Returns (wt_seq, m1_seq, m2_seq, m12_seq) as raw strings ready for
     ``model.embed()``.  All four sequences are identical length.
+
+    Parameters
+    ----------
+    max_seq_len : int, default 0
+        Maximum allowed sequence length. If > 0 and the resulting sequence
+        would exceed this, raises ValueError (caller skips the pair).
+        A good default is ``4 * context`` — variants farther apart than
+        ``2 * context`` can't meaningfully "see" each other.
     """
     from seqmat import SeqMat
 
@@ -2694,6 +2703,13 @@ def _prepare_epistasis_sequences(
     p_max = max(pos1, pos2)
     start = p_min - context
     end = p_max + context - 1
+    seq_len = end - start + 1
+
+    if max_seq_len > 0 and seq_len > max_seq_len:
+        raise ValueError(
+            f"Variant pair too far apart: distance={p_max - p_min}, "
+            f"seq_len={seq_len} > max_seq_len={max_seq_len}"
+        )
 
     s = SeqMat.from_fasta(genome, f"chr{chrom}", start, end)
     if reverse_complement:
@@ -2726,6 +2742,7 @@ def _embed_epistasis_direct(
     context: int = DEFAULT_CONTEXT,
     genome: str = DEFAULT_GENOME,
     pool: str = "mean",
+    max_seq_len: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute embeddings for epistasis from genomic coordinates.
@@ -2746,6 +2763,7 @@ def _embed_epistasis_direct(
         reverse_complement=reverse_complement,
         context=context,
         genome=genome,
+        max_seq_len=max_seq_len,
     )
 
     # Try batched forward pass (single call, ~4x faster on GPU)
@@ -3268,6 +3286,7 @@ def add_epistasis_metrics(
                         seqs = _prepare_epistasis_sequences(
                             chrom_i, p1_i, r1_i, a1_i, p2_i, r2_i, a2_i,
                             reverse_complement=rev_i, context=context, genome=genome,
+                            max_seq_len=4 * context,
                         )
                         all_seqs.extend(seqs)
                         valid_items.append(item)
@@ -3453,6 +3472,7 @@ def add_epistasis_metrics(
                     context=context,
                     genome=genome,
                     pool=pool,
+                    max_seq_len=4 * context,
                 )
                 # Save all embeddings to database
                 db.store(wt_key, h_wt)
