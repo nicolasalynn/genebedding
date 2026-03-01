@@ -20,10 +20,14 @@ conda create -n "$CONDA_ENV" python=3.10 -y
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
-pip install "torch>=2.6" torchvision torchaudio --index-url "$CUDA_INDEX"
+# Pin torch==2.6.* — flash-attn has pre-built wheels for 2.6, avoiding
+# a 2-hour source build that happens with newer torch versions.
+pip install "torch>=2.6,<2.7" torchvision torchaudio --index-url "$CUDA_INDEX"
 pip install "borzoi-pytorch>=0.4"
-# flash-attn from source (adapts to detected CUDA + torch version)
-pip install flash-attn --no-build-isolation
+# flash-attn: psutil + ninja needed for source builds; --no-build-isolation
+# lets it reuse them. MAX_JOBS limits parallel nvcc to avoid OOM during compile.
+pip install psutil ninja
+MAX_JOBS="${MAX_JOBS:-4}" pip install flash-attn --no-build-isolation
 pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
