@@ -109,6 +109,9 @@ fi
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda init bash 2>/dev/null || true
 conda config --set auto_activate_base false
+# Accept conda channel Terms of Service (required since mid-2025)
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 
 # ── 3. Clone repo (optional) ───────────────────────────────────────
 if [ -n "$DO_CLONE" ]; then
