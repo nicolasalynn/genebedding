@@ -235,6 +235,24 @@ class BorzoiWrapper(BaseWrapper):
 
         return result
 
+    def _find_head(self) -> None:
+        """Locate the final 1x1 Conv1d (output head) once and cache it."""
+        if self._head is not None:
+            return
+        # Single dummy forward pass to learn output channels
+        dummy = torch.zeros(1, 4, self.min_input_len, device=self.device, dtype=self.dtype)
+        with torch.no_grad():
+            y = self.model(dummy)
+        if not isinstance(y, torch.Tensor) or y.ndim != 3:
+            return
+        C = int(y.shape[1])
+        # Find last 1x1 conv with out_channels == C
+        for m in self.model.modules():
+            if isinstance(m, nn.Conv1d):
+                k = m.kernel_size[0] if isinstance(m.kernel_size, tuple) else m.kernel_size
+                if k == 1 and m.out_channels == C:
+                    self._head = m
+
     @torch.no_grad()
     def embed(self, seq: str, *, pool: Pool = "tokens", return_numpy: bool = True) -> Union[np.ndarray, torch.Tensor]:
         """
@@ -246,21 +264,9 @@ class BorzoiWrapper(BaseWrapper):
         """
         x_proc, Lret, sl_out = self._prep(seq)
 
-        # First pass: get output to infer C and locate final 1x1 conv
-        y = self.model(x_proc)  # (1, C, target_len)
-        if not isinstance(y, torch.Tensor) or y.ndim != 3:
-            raise RuntimeError("Unexpected Borzoi output shape.")
-        C = int(y.shape[1])
+        # Locate the output head once (cached after first call)
+        self._find_head()
 
-        # Find last 1x1 conv with out_channels == C
-        self._head = None
-        for m in self.model.modules():
-            if isinstance(m, nn.Conv1d):
-                k = m.kernel_size[0] if isinstance(m.kernel_size, tuple) else m.kernel_size
-                if k == 1 and m.out_channels == C:
-                    self._head = m
-
-        feats: Optional[torch.Tensor] = None
         if self._head is not None:
             self._last_hidden = None
 
@@ -274,10 +280,9 @@ class BorzoiWrapper(BaseWrapper):
                 feats = self._last_hidden  # (1, H, target_len)
             finally:
                 hook.remove()
-
-        if feats is None:
+        else:
             # fallback to final output as "features"
-            feats = y  # (1, C, target_len)
+            feats = self.model(x_proc)  # (1, C, target_len)
 
         feats = feats[0, :, sl_out].transpose(0, 1).contiguous()  # -> (Lret, H)
 
