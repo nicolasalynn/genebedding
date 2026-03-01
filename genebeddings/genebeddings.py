@@ -3283,65 +3283,87 @@ def add_epistasis_metrics(
 
         # Phase 2 — batch compute missing embeddings
         if to_compute:
-            chunk_starts = range(0, len(to_compute), batch_size)
-            if show_progress:
-                chunk_starts = tqdm(
-                    list(chunk_starts),
-                    desc=f"Embedding (batch_size={batch_size})",
-                )
+            from concurrent.futures import ThreadPoolExecutor
 
-            for chunk_start in chunk_starts:
-                chunk = to_compute[chunk_start:chunk_start + batch_size]
-                all_seqs = []
-                valid_items = []
+            _max_sl = _model_max_seq_len(model, context)
 
+            def _prep_chunk(chunk):
+                """Prepare sequences for a chunk (FASTA reads + mutations)."""
+                seqs, items, skipped = [], [], 0
                 for item in chunk:
                     (idx_i, epi_id_i, chrom_i,
                      p1_i, r1_i, a1_i, p2_i, r2_i, a2_i, rev_i) = item
                     try:
-                        seqs = _prepare_epistasis_sequences(
+                        s = _prepare_epistasis_sequences(
                             chrom_i, p1_i, r1_i, a1_i, p2_i, r2_i, a2_i,
                             reverse_complement=rev_i, context=context, genome=genome,
-                            max_seq_len=_model_max_seq_len(model, context),
+                            max_seq_len=_max_sl,
                         )
-                        all_seqs.extend(seqs)
-                        valid_items.append(item)
+                        seqs.extend(s)
+                        items.append(item)
                     except Exception as e:
                         logger.warning("Failed to prepare sequences for %s: %s", epi_id_i, e)
-                        n_skipped += 1
+                        skipped += 1
+                return seqs, items, skipped
 
-                if not all_seqs:
-                    continue
+            chunks = [
+                to_compute[i:i + batch_size]
+                for i in range(0, len(to_compute), batch_size)
+            ]
+            chunk_iter = range(len(chunks))
+            if show_progress:
+                chunk_iter = tqdm(
+                    list(chunk_iter),
+                    desc=f"Embedding (batch_size={batch_size})",
+                )
 
-                # Single forward pass for the entire chunk
-                try:
-                    all_embs = model.embed(all_seqs, pool=pool)
-                except (TypeError, AttributeError):
-                    # Fallback: sequential embedding for models without batch support
-                    all_embs = np.stack([model.embed(s, pool=pool) for s in all_seqs])
+            # Prefetch: prepare batch N+1 on a background thread while GPU runs batch N.
+            # SeqMat FASTA reads release the GIL (C I/O), so this overlaps with GPU compute.
+            with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+                # Submit first chunk prep
+                next_future = prefetch_pool.submit(_prep_chunk, chunks[0])
 
-                for j, item in enumerate(valid_items):
-                    idx_i, epi_id_i = item[0], item[1]
-                    h_wt = all_embs[j * 4]
-                    h_m1 = all_embs[j * 4 + 1]
-                    h_m2 = all_embs[j * 4 + 2]
-                    h_m12 = all_embs[j * 4 + 3]
+                for ci in chunk_iter:
+                    # Get prepped data for current batch
+                    all_seqs, valid_items, chunk_skipped = next_future.result()
+                    n_skipped += chunk_skipped
 
-                    # Cache in DB
-                    wt_key = f"{epi_id_i}{KEY_WT}"
-                    m1_key = f"{epi_id_i}{KEY_M1}"
-                    m2_key = f"{epi_id_i}{KEY_M2}"
-                    m12_key = f"{epi_id_i}{KEY_M12}"
-                    db.store(wt_key, h_wt)
-                    db.store(m1_key, h_m1)
-                    db.store(m2_key, h_m2)
-                    db.store(m12_key, h_m12)
-                    db.store(f"{epi_id_i}{KEY_DELTA1}", h_m1 - h_wt)
-                    db.store(f"{epi_id_i}{KEY_DELTA2}", h_m2 - h_wt)
-                    db.store(f"{epi_id_i}{KEY_DELTA12}", h_m12 - h_wt)
+                    # Submit next batch prep (overlaps with GPU forward pass below)
+                    if ci + 1 < len(chunks):
+                        next_future = prefetch_pool.submit(_prep_chunk, chunks[ci + 1])
 
-                    embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
-                    n_computed += 1
+                    if not all_seqs:
+                        continue
+
+                    # Single forward pass for the entire chunk
+                    try:
+                        all_embs = model.embed(all_seqs, pool=pool)
+                    except (TypeError, AttributeError):
+                        # Fallback: sequential embedding for models without batch support
+                        all_embs = np.stack([model.embed(s, pool=pool) for s in all_seqs])
+
+                    for j, item in enumerate(valid_items):
+                        idx_i, epi_id_i = item[0], item[1]
+                        h_wt = all_embs[j * 4]
+                        h_m1 = all_embs[j * 4 + 1]
+                        h_m2 = all_embs[j * 4 + 2]
+                        h_m12 = all_embs[j * 4 + 3]
+
+                        # Cache in DB
+                        wt_key = f"{epi_id_i}{KEY_WT}"
+                        m1_key = f"{epi_id_i}{KEY_M1}"
+                        m2_key = f"{epi_id_i}{KEY_M2}"
+                        m12_key = f"{epi_id_i}{KEY_M12}"
+                        db.store(wt_key, h_wt)
+                        db.store(m1_key, h_m1)
+                        db.store(m2_key, h_m2)
+                        db.store(m12_key, h_m12)
+                        db.store(f"{epi_id_i}{KEY_DELTA1}", h_m1 - h_wt)
+                        db.store(f"{epi_id_i}{KEY_DELTA2}", h_m2 - h_wt)
+                        db.store(f"{epi_id_i}{KEY_DELTA12}", h_m12 - h_wt)
+
+                        embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
+                        n_computed += 1
 
         # Phase 2b — copy embeddings to duplicate indices
         for epi_id, dup_idxs in _dup_indices.items():

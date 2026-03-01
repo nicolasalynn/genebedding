@@ -260,6 +260,47 @@ class BorzoiWrapper(BaseWrapper):
                 if k == 1 and m.out_channels == C:
                     self._head = m
 
+    def _prep_batch(self, seqs: list) -> tuple:
+        """Encode all sequences into a single (N, 4, L) numpy array and metadata.
+
+        Avoids N individual numpy allocations + N individual GPU transfers.
+        Returns (x_batch_tensor, metadata) where metadata is list of (Lret, sl_out).
+        """
+        N = len(seqs)
+        L = self.min_input_len
+        x_np = np.zeros((N, 4, L), dtype=np.float32)
+        metadata = []
+
+        for i, seq_str in enumerate(seqs):
+            L0 = len(seq_str)
+            if L0 == 0:
+                raise ValueError("Empty sequence.")
+
+            # Pad / crop to min_input_len
+            if L0 < L:
+                pad_total = L - L0
+                pad_left = pad_total // 2
+                seq_proc = ("N" * pad_left) + seq_str + ("N" * (pad_total - pad_left))
+            elif L0 > L:
+                sl_in = _center_slice(L0, L)
+                seq_proc = seq_str[sl_in]
+            else:
+                seq_proc = seq_str
+
+            # Vectorized one-hot directly into batch array (no per-seq allocation)
+            indices = _ONEHOT_MAP[np.frombuffer(seq_proc.encode("ascii"), dtype=np.uint8)]
+            mask = indices >= 0
+            positions = np.where(mask)[0]
+            x_np[i, indices[mask], positions] = 1.0
+
+            Lret = min(L0, self.target_len)
+            sl_out = _center_slice(self.target_len, Lret)
+            metadata.append((Lret, sl_out))
+
+        # Single GPU transfer for entire batch
+        x_batch = torch.from_numpy(x_np).to(device=self.device, dtype=self.dtype)
+        return x_batch, metadata
+
     @torch.no_grad()
     def embed(self, seq, *, pool: Pool = "tokens", return_numpy: bool = True):
         """
@@ -286,10 +327,8 @@ class BorzoiWrapper(BaseWrapper):
         # Locate the output head once (cached after first call)
         self._find_head()
 
-        # Prep all sequences — they all get padded to min_input_len
-        prepped = [self._prep(s) for s in seqs]
-        # Stack into a single tensor: (N, 4, min_input_len)
-        x_batch = torch.cat([p[0] for p in prepped], dim=0)
+        # Batch one-hot encode + single GPU transfer (replaces N individual _prep calls)
+        x_batch, metadata = self._prep_batch(seqs)
 
         if self._head is not None:
             self._last_hidden = None
@@ -310,7 +349,7 @@ class BorzoiWrapper(BaseWrapper):
 
         # Extract per-sequence results
         results = []
-        for i, (_, Lret, sl_out) in enumerate(prepped):
+        for i, (Lret, sl_out) in enumerate(metadata):
             f_i = feats[i, :, sl_out].transpose(0, 1).contiguous()  # (Lret, H)
 
             if pool == "tokens":
