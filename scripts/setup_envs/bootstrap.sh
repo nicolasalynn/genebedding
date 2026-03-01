@@ -10,7 +10,7 @@
 #   bash bootstrap.sh --hf-token hf_abc123... --paper-root ~/data/epistasis_paper
 #
 #   # Clone repo for you (HTTPS with GitHub PAT):
-#   bash bootstrap.sh --hf-token hf_... --clone-repo https://github.com/nicolasalynn/dlm_wrappers.git
+#   bash bootstrap.sh --hf-token hf_... --clone-repo https://github.com/nicolasalynn/genebedding.git
 #
 # All flags can also be set via env vars:
 #   HF_TOKEN, EPISTASIS_PAPER_ROOT, REPO_URL
