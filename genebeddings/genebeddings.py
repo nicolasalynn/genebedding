@@ -2670,6 +2670,22 @@ def _embed_single_variant_direct(
     return h_wt, h_mut, delta
 
 
+def _model_max_seq_len(model, context: int) -> int:
+    """Infer max sequence length from the model, capped at 4*context.
+
+    Uses the model's declared max input length if available and smaller
+    than 4*context.  The 4*context cap ensures variant pairs that are
+    too far apart to meaningfully interact are skipped regardless of
+    the model's theoretical capacity.
+    """
+    cap = 4 * context
+    for attr in ("max_length", "min_input_len", "max_seq_len"):
+        val = getattr(model, attr, None)
+        if val is not None and isinstance(val, int) and val > 0:
+            return min(val, cap)
+    return cap
+
+
 def _prepare_epistasis_sequences(
     chrom: str,
     pos1: int,
@@ -3286,7 +3302,7 @@ def add_epistasis_metrics(
                         seqs = _prepare_epistasis_sequences(
                             chrom_i, p1_i, r1_i, a1_i, p2_i, r2_i, a2_i,
                             reverse_complement=rev_i, context=context, genome=genome,
-                            max_seq_len=4 * context,
+                            max_seq_len=_model_max_seq_len(model, context),
                         )
                         all_seqs.extend(seqs)
                         valid_items.append(item)
@@ -3472,7 +3488,7 @@ def add_epistasis_metrics(
                     context=context,
                     genome=genome,
                     pool=pool,
-                    max_seq_len=4 * context,
+                    max_seq_len=_model_max_seq_len(model, context),
                 )
                 # Save all embeddings to database
                 db.store(wt_key, h_wt)
