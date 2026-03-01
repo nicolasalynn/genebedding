@@ -209,8 +209,18 @@ def run_metrics_phase(
     sheets_dir: Path,
     spliceai_model_dir=None,
     status_path: Optional[Path] = None,
+    model_key: Optional[str] = None,
+    env_profile: Optional[str] = None,
 ) -> None:
-    """Compute cov_inv from null, recompute metrics, save one parquet per tool."""
+    """Compute cov_inv from null, recompute metrics, save one parquet per tool.
+
+    Parameters
+    ----------
+    model_key : str, optional
+        If set, only compute metrics for this model.
+    env_profile : str, optional
+        If set (and model_key is None), only compute metrics for models in this env profile.
+    """
     status_path = status_path or _status_path(output_base)
     _write_status(path=status_path, phase="metrics", message="cov_inv + recompute + sheets")
     import pandas as pd
@@ -236,10 +246,22 @@ def run_metrics_phase(
         logger.warning("No rows with source in COV_INV_SOURCE_NAMES=%s; cov_inv will have no rows.", COV_INV_SOURCE_NAMES)
         df_null = df_full.head(1).copy()
     okgp_sources = [s for s in src.unique() if s in COV_INV_SOURCE_NAMES]
+
+    # Resolve which models to run metrics for
+    if model_key:
+        model_keys_filter = [model_key]
+    elif env_profile:
+        model_keys_filter = get_model_keys_for_env(env_profile)
+    else:
+        model_keys_filter = None  # all models
+
     model_keys = [
         k for k in FULL_MODEL_CONFIG
         if any((output_base / src / f"{k}.db").exists() for src in okgp_sources)
     ]
+    if model_keys_filter:
+        model_keys = [k for k in model_keys if k in model_keys_filter]
+        logger.info("Metrics phase filtered to models: %s", model_keys)
     if not model_keys:
         logger.warning("No model DBs found under output_base for okgp sources %s", okgp_sources)
         return
@@ -308,7 +330,13 @@ def main() -> int:
             status_path=status_path,
         )
     else:
-        run_metrics_phase(output_base, sheets_dir, spliceai_model_dir=args.spliceai_dir, status_path=status_path)
+        run_metrics_phase(
+            output_base, sheets_dir,
+            spliceai_model_dir=args.spliceai_dir,
+            status_path=status_path,
+            model_key=args.model_key,
+            env_profile=args.env_profile,
+        )
 
     return 0
 

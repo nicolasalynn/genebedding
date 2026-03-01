@@ -252,10 +252,18 @@ if [ "$PHASE" = "embed" ] && [ -z "$ENV_PROFILE" ]; then
 elif [ -n "$SKIP_METRICS" ]; then
   echo "Skipping metrics phase (--skip-metrics)"
 else
-  CONDA_NAME=$(env_conda_name "nt")
-  echo "=== Metrics phase: cov_inv + sheets (conda env: $CONDA_NAME) ==="
-  conda activate "$CONDA_NAME" || { echo "Env $CONDA_NAME not found for metrics phase"; exit 1; }
-  run_cmd python -m notebooks.processing.run_everything --phase metrics
+  # Use the env profile's conda env for metrics if running a single profile, else default to nt
+  if [ -n "$ENV_PROFILE" ]; then
+    METRICS_CONDA=$(env_conda_name "$ENV_PROFILE")
+  else
+    METRICS_CONDA=$(env_conda_name "nt")
+  fi
+  METRICS_EXTRA=""
+  [ -n "$MODEL_KEY" ] && METRICS_EXTRA="--model-key $MODEL_KEY $METRICS_EXTRA"
+  [ -n "$ENV_PROFILE" ] && METRICS_EXTRA="--env-profile $ENV_PROFILE $METRICS_EXTRA"
+  echo "=== Metrics phase: cov_inv + sheets (conda env: $METRICS_CONDA) ==="
+  conda activate "$METRICS_CONDA" || { echo "Env $METRICS_CONDA not found for metrics phase"; exit 1; }
+  run_cmd python -m notebooks.processing.run_everything --phase metrics $METRICS_EXTRA
   conda deactivate 2>/dev/null || true
 fi
 
