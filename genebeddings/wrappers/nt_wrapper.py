@@ -45,7 +45,7 @@ NT_MODELS: Dict[str, Tuple[str, bool]] = {
     "nt50_multi": ("InstaDeepAI/nucleotide-transformer-v2-50m-multi-species", True),
     "nt100_multi": ("InstaDeepAI/nucleotide-transformer-v2-100m-multi-species", True),
     "nt250_multi": ("InstaDeepAI/nucleotide-transformer-v2-250m-multi-species", True),
-    "nt500_multi": ("InstaDeepAI/nucleotide-transformer-500m-multi-species", False),
+    "nt500_multi": ("InstaDeepAI/nucleotide-transformer-v2-500m-multi-species", True),
     "nt500_ref": ("InstaDeepAI/nucleotide-transformer-500m-human-ref", False),
     "nt2500_multi": ("InstaDeepAI/nucleotide-transformer-2.5b-multi-species", False),
     "nt2500_okgp": ("InstaDeepAI/nucleotide-transformer-2.5b-1000g", False),
