@@ -2671,14 +2671,14 @@ def _embed_single_variant_direct(
 
 
 def _model_max_seq_len(model, context: int) -> int:
-    """Infer max sequence length from the model, capped at 4*context.
+    """Infer max sequence length from the model, capped at 2*context.
 
     Uses the model's declared max input length if available and smaller
-    than 4*context.  The 4*context cap ensures variant pairs that are
+    than 2*context.  The 2*context cap ensures variant pairs that are
     too far apart to meaningfully interact are skipped regardless of
     the model's theoretical capacity.
     """
-    cap = 4 * context
+    cap = 2 * context
     for attr in ("max_seq_len", "min_input_len", "max_length"):
         val = getattr(model, attr, None)
         if val is not None and isinstance(val, int) and val > 0:
