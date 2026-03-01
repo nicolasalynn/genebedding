@@ -84,8 +84,10 @@ echo "=============================================="
 # ── 1. System packages ─────────────────────────────────────────────
 echo ""
 echo ">>> [1/7] Installing system packages..."
-sudo apt-get update -y
-sudo apt-get install -y \
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+sudo -E apt-get update -y
+sudo -E apt-get install -y \
   build-essential gcc g++ make \
   git git-lfs curl wget tmux \
   libssl-dev libffi-dev zlib1g-dev \
