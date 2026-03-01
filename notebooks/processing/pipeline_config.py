@@ -21,8 +21,14 @@ DEFAULT_BATCH_SIZE = 16
 # Per-tool batch_size (optional). Tools not listed use DEFAULT_BATCH_SIZE.
 # Reduce for large-context or memory-heavy models (borzoi, alphagenome).
 BATCH_SIZE_BY_TOOL: Dict[str, int] = {
+    "nt50_3mer": 4,       # 3mer tokenisation → long token seqs, needs small batch
+    "nt50_multi": 32,
+    "nt100_multi": 32,
+    "nt250_multi": 32,
     "nt500_multi": 32,
+    "nt500_ref": 32,
     "nt2500_multi": 16,
+    "nt2500_okgp": 16,
     "convnova": 24,
     "mutbert": 32,
     "hyenadna": 8,
