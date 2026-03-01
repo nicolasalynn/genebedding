@@ -102,6 +102,7 @@ def run_embed_phase(
     model_key: Optional[str] = None,
     sources_filter: Optional[list] = None,
     status_path: Optional[Path] = None,
+    batch_size_override: Optional[int] = None,
 ) -> None:
     """Run embedding for one env profile (one tool at a time over all sources).
 
@@ -134,6 +135,9 @@ def run_embed_phase(
     full_sources = SMOKE_FULL_SOURCES if smoke_test_full else None
 
     batch_size_by_model = _get_batch_size_by_model(model_keys)
+    if batch_size_override is not None:
+        batch_size_by_model = {k: batch_size_override for k in model_keys}
+        logger.info("Batch size override: %d for all models", batch_size_override)
     single_path = get_single_dataframe_path(data_dir)
     if single_path is not None:
         import pandas as pd
@@ -305,6 +309,7 @@ def main() -> int:
     parser.add_argument("--smoke-test-full", action="store_true", help="ALL tools, 5 rows per source + ALL fas_exon rows; full splicing validation")
     parser.add_argument("--model-key", type=str, default=None, help="Run only this model key (must belong to --env-profile)")
     parser.add_argument("--sources", type=str, nargs="+", default=None, help="Run only these source names (e.g. okgp_chr12 fas_exon)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size (default: per-model config in pipeline_config.py)")
     parser.add_argument("--status-file", type=str, default=None, help="Progress JSON path (default: output_base/pipeline_status.json)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -328,6 +333,7 @@ def main() -> int:
             model_key=args.model_key,
             sources_filter=args.sources,
             status_path=status_path,
+            batch_size_override=args.batch_size,
         )
     else:
         run_metrics_phase(

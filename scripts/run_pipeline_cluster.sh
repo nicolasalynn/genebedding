@@ -46,6 +46,7 @@ MODEL_KEY=""
 SOURCES_ARGS=""
 DRY_RUN=""
 GPU_OVERRIDE=""
+BATCH_SIZE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --env-profile)      ENV_PROFILE="$2"; shift 2 ;;
@@ -57,6 +58,7 @@ while [ $# -gt 0 ]; do
     --model-key)        MODEL_KEY="$2"; shift 2 ;;
     --sources)          shift; while [ $# -gt 0 ] && [[ "$1" != --* ]]; do SOURCES_ARGS="$SOURCES_ARGS $1"; shift; done ;;
     --gpus)             GPU_OVERRIDE="$2"; shift 2 ;;
+    --batch-size)       BATCH_SIZE="$2"; shift 2 ;;
     --dry-run)          DRY_RUN=1; shift ;;
     *) echo "Unknown option $1"; exit 1 ;;
   esac
@@ -125,6 +127,7 @@ else
   [ -n "$SMOKE_TEST" ] && EMBED_EXTRA="--smoke-test $EMBED_EXTRA"
   [ -n "$SMOKE_TEST_FULL" ] && EMBED_EXTRA="--smoke-test-full $EMBED_EXTRA"
   [ -n "$MODEL_KEY" ] && EMBED_EXTRA="--model-key $MODEL_KEY $EMBED_EXTRA"
+  [ -n "$BATCH_SIZE" ] && EMBED_EXTRA="--batch-size $BATCH_SIZE $EMBED_EXTRA"
   [ -n "$SOURCES_ARGS" ] && EMBED_EXTRA="--sources $SOURCES_ARGS $EMBED_EXTRA"
   if [ -n "$ENV_PROFILE" ]; then
     CONDA_NAME=$(env_conda_name "$ENV_PROFILE")
