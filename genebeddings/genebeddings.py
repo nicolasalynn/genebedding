@@ -3211,6 +3211,9 @@ def add_epistasis_metrics(
         # Phase 1 — parse rows, check DB, partition into loaded / to_compute
         embeddings = {}   # idx -> (h_wt, h_m1, h_m2, h_m12)
         to_compute = []   # (idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev)
+        # Track duplicate epi_ids: compute once, copy to all duplicate indices
+        _seen_to_compute = {}  # epi_id -> first idx queued for computation
+        _dup_indices = {}      # epi_id -> [list of extra indices needing the same result]
 
         parse_iter = df.iterrows()
         if show_progress:
@@ -3232,8 +3235,17 @@ def add_epistasis_metrics(
             if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
                 embeddings[idx] = (db.load(wt_key), db.load(m1_key), db.load(m2_key), db.load(m12_key))
                 n_loaded += 1
+            elif epi_id in _seen_to_compute:
+                # Duplicate epi_id already queued for computation — skip model call,
+                # will copy embeddings from the first occurrence after Phase 2.
+                _dup_indices.setdefault(epi_id, []).append(idx)
             else:
+                _seen_to_compute[epi_id] = idx
                 to_compute.append((idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev))
+
+        n_dedup = sum(len(v) for v in _dup_indices.values())
+        if n_dedup:
+            logger.info("Deduplicated %d duplicate epistasis_ids (will copy embeddings after compute)", n_dedup)
 
         # Phase 2 — batch compute missing embeddings
         if to_compute:
@@ -3295,6 +3307,14 @@ def add_epistasis_metrics(
 
                     embeddings[idx_i] = (h_wt, h_m1, h_m2, h_m12)
                     n_computed += 1
+
+        # Phase 2b — copy embeddings to duplicate indices
+        for epi_id, dup_idxs in _dup_indices.items():
+            first_idx = _seen_to_compute[epi_id]
+            if first_idx in embeddings:
+                for dup_idx in dup_idxs:
+                    embeddings[dup_idx] = embeddings[first_idx]
+                    n_loaded += 1
 
         # Phase 2.5 — batched Mahalanobis when cov_inv is set (avoids O(N*d^2) row-by-row loop)
         if cov_inv is not None and embeddings:

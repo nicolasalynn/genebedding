@@ -7,10 +7,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 source "$(conda info --base)/etc/profile.d/conda.sh"
-CUDA_INDEX="https://download.pytorch.org/whl/cu121"
+source "$SCRIPT_DIR/detect_cuda.sh"
+
+# Per-env CUDA indices: some envs need a higher minimum CUDA version
+CUDA_INDEX_DEFAULT="$CUDA_INDEX"
+# NT and evo2 need torch>=2.6 → cu124+
+if [ "$CUDA_VERSION" -ge 124 ]; then
+  CUDA_INDEX_MIN124="$CUDA_INDEX"
+else
+  CUDA_INDEX_MIN124="https://download.pytorch.org/whl/cu124"
+  echo "NOTE: NT/evo2/borzoi need cu124+; using cu124 for those envs (system detected cu${CUDA_VERSION})"
+fi
+# RiNALMo needs torch==2.1.0 → cu121 max
+CUDA_INDEX_RINALMO="https://download.pytorch.org/whl/cu121"
 
 echo "=============================================="
-echo "  Repairing envs (no --skip-setup was run)"
+echo "  Repairing envs (CUDA_VERSION=$CUDA_VERSION)"
 echo "  REPO_ROOT=$REPO_ROOT"
 echo "=============================================="
 if [ ! -f ~/.hf_token ]; then
@@ -34,13 +46,13 @@ run_in() {
 }
 
 # nt: torch>=2.6 required for torch.load CVE-2025-32434
-run_in nt pip install "torch>=2.6" "torchvision" "torchaudio" --index-url "$CUDA_INDEX"
+run_in nt pip install "torch>=2.6" "torchvision" "torchaudio" --index-url "$CUDA_INDEX_MIN124"
 
 # evo2: package missing if env was never set up
 run_in evo2 pip install evo2
 
-# borzoi: torch>=2.5 for wrap_triton
-run_in borzoi pip install "torch>=2.5" --index-url "$CUDA_INDEX"
+# borzoi: torch>=2.6 for wrap_triton
+run_in borzoi pip install "torch>=2.6" --index-url "$CUDA_INDEX_MIN124"
 
 # caduceus: tie_weights(recompute_mapping) removed in transformers 4.46+
 run_in caduceus pip install "transformers>=4.30,<4.46" --force-reinstall
@@ -51,11 +63,11 @@ run_in dnabert pip install "transformers>=4.30,<4.46" --force-reinstall
 # specieslm: transformers
 run_in specieslm pip install "transformers>=4.30,<4.46"
 
-# rinalmo: torch first, then flash-attn (needs --no-build-isolation to see torch), then rinalmo
-run_in rinalmo bash -c 'pip install "torch>=2.0" --index-url "'"$CUDA_INDEX"'"; pip install flash-attn==2.3.2 --no-build-isolation; pip install "git+https://github.com/lbcb-sci/RiNALMo.git"'
+# rinalmo: torch 2.1.0 (cu121 only), then flash-attn, then rinalmo
+run_in rinalmo bash -c 'pip install "torch>=2.0" --index-url "'"$CUDA_INDEX_RINALMO"'"; pip install flash-attn==2.3.2 --no-build-isolation; pip install "git+https://github.com/lbcb-sci/RiNALMo.git"'
 
 # genebeddings_main: full stack in order, then genebeddings
-run_in genebeddings_main bash -c 'cd "'"$REPO_ROOT"'" && pip install "torch>=2.6" --index-url "'"$CUDA_INDEX"'"; pip install "transformers>=4.30,<4.46" omegaconf; pip install flash-attn==2.3.2 --no-build-isolation; pip install "git+https://github.com/lbcb-sci/RiNALMo.git" borzoi-pytorch spliceai-pytorch; pip install -e .'
+run_in genebeddings_main bash -c 'cd "'"$REPO_ROOT"'" && pip install "torch>=2.6" --index-url "'"$CUDA_INDEX_DEFAULT"'"; pip install "transformers>=4.30,<4.46" omegaconf; pip install flash-attn==2.3.2 --no-build-isolation; pip install "git+https://github.com/lbcb-sci/RiNALMo.git" borzoi-pytorch spliceai-pytorch; pip install -e .'
 
 echo ""
 echo "=============================================="

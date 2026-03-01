@@ -7,9 +7,13 @@
 set -e
 CONDA_ENV="${CONDA_ENV:-rinalmo}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
+source "$SCRIPT_DIR/detect_cuda.sh"
+# torch 2.1.0 only has cu118/cu121 wheels; cap to cu121 regardless of driver
+cap_cuda_max 121
 
-echo "=== RiNALMo env: $CONDA_ENV ==="
+echo "=== RiNALMo env: $CONDA_ENV (CUDA_VERSION=$CUDA_VERSION) ==="
 
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -19,7 +23,7 @@ conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
 # torch 2.1 (official RiNALMo requirement; flash-attn 2.3.2 won't compile against newer)
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url "$CUDA_INDEX"
 # RiNALMo from GitHub (no PyPI package)
 pip install "git+https://github.com/lbcb-sci/RiNALMo.git"
 # flash-attn 2.3.2 (pinned; newer versions break RiNALMo's RotaryEmbedding/unpad_input API)
