@@ -31,7 +31,7 @@ BATCH_SIZE_BY_TOOL: Dict[str, int] = {
     "nt2500_okgp": 16,
     "convnova": 24,
     "mutbert": 32,
-    "hyenadna": 8,
+    "hyenadna": 2,
     "caduceus": 8,
     "borzoi": 2,
     "alphagenome": 8,
