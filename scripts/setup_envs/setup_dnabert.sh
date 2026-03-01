@@ -20,6 +20,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 # DNABERT-2 requires transformers==4.29.2 to avoid config_class mismatch
 # See: https://github.com/MAGICS-LAB/DNABERT_2/issues/38
 pip install "transformers==4.29.2" einops
+pip install seqmat pyarrow
 pip install -e .
 # Uninstall triton AFTER -e . (which may re-pull it via torch deps).
 # DNABERT-2's bundled Triton flash-attn is incompatible with modern triton.

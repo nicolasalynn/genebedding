@@ -21,6 +21,7 @@ pip install "torch>=2.6" torchvision torchaudio --index-url https://download.pyt
 pip install "borzoi-pytorch>=0.4"
 # flash-attn pre-built wheel (must match torch version + ABI)
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+pip install seqmat pyarrow
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

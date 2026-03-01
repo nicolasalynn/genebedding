@@ -18,6 +18,7 @@ conda activate "$CONDA_ENV"
 pip install --upgrade pip setuptools wheel
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install openspliceai
+pip install seqmat pyarrow
 pip install -e .
 
 # Download pre-trained human MANE 10000nt model (5 ensemble checkpoints, ~14MB)

@@ -17,6 +17,7 @@ conda activate "$CONDA_ENV"
 pip install --upgrade pip setuptools wheel
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install "transformers>=4.30,<4.46"
+pip install seqmat pyarrow
 pip install -e .
 
 echo ""

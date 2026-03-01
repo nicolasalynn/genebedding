@@ -17,6 +17,7 @@ conda activate "$CONDA_ENV"
 pip install --upgrade pip setuptools wheel
 pip install "torch>=2.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}"
 pip install "transformers>=4.30"
+pip install seqmat pyarrow
 pip install -e .
 
 echo ""

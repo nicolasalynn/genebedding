@@ -20,8 +20,10 @@ pip install --upgrade pip setuptools wheel
 # torch>=2.6 required (CVE-2025-32434 blocks torch.load in older versions)
 # cu121 only has torch 2.5; cu128 has 2.6+ which we need for the torch.load CVE fix
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-# Latest transformers supports safetensors loading natively
-pip install transformers
+# transformers <4.46 required: NT v2 remote code uses find_pruneable_heads_and_indices,
+# which was removed in transformers 5.x
+pip install "transformers>=4.40,<4.46"
+pip install seqmat pyarrow
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"

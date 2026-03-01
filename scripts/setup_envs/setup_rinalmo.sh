@@ -27,6 +27,7 @@ pip install ninja psutil
 pip install flash-attn==2.3.2 --no-build-isolation
 # numpy<2 required (torch 2.1 is incompatible with numpy 2.x)
 pip install "numpy<2"
+pip install seqmat pyarrow
 pip install -e .
 
 echo "Done. Activate with: conda activate $CONDA_ENV"
