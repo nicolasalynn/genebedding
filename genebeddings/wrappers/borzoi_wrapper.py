@@ -254,18 +254,35 @@ class BorzoiWrapper(BaseWrapper):
                     self._head = m
 
     @torch.no_grad()
-    def embed(self, seq: str, *, pool: Pool = "tokens", return_numpy: bool = True) -> Union[np.ndarray, torch.Tensor]:
+    def embed(self, seq, *, pool: Pool = "tokens", return_numpy: bool = True):
         """
         Hidden representations near the output head.
-        Returns:
+
+        Parameters
+        ----------
+        seq : str or list[str]
+            Single sequence or batch of sequences.
+
+        Returns
+        -------
+        Single seq:
           pool='tokens' -> (Lret, H)
           pool='mean'   -> (H,)
           pool='cls'    -> (H,)  (first position)
+        Batch:
+          np.ndarray with shape (N, H) for pool='mean'/'cls',
+          or list of arrays for pool='tokens' (variable Lret).
         """
-        x_proc, Lret, sl_out = self._prep(seq)
+        is_batch = isinstance(seq, (list, tuple))
+        seqs = seq if is_batch else [seq]
 
         # Locate the output head once (cached after first call)
         self._find_head()
+
+        # Prep all sequences — they all get padded to min_input_len
+        prepped = [self._prep(s) for s in seqs]
+        # Stack into a single tensor: (N, 4, min_input_len)
+        x_batch = torch.cat([p[0] for p in prepped], dim=0)
 
         if self._head is not None:
             self._last_hidden = None
@@ -276,27 +293,35 @@ class BorzoiWrapper(BaseWrapper):
 
             hook = self._head.register_forward_hook(hook_fn)
             try:
-                _ = self.model(x_proc)
-                feats = self._last_hidden  # (1, H, target_len)
+                _ = self.model(x_batch)
+                feats = self._last_hidden  # (N, H, target_len)
             finally:
                 hook.remove()
         else:
             # fallback to final output as "features"
-            feats = self.model(x_proc)  # (1, C, target_len)
+            feats = self.model(x_batch)  # (N, C, target_len)
 
-        feats = feats[0, :, sl_out].transpose(0, 1).contiguous()  # -> (Lret, H)
+        # Extract per-sequence results
+        results = []
+        for i, (_, Lret, sl_out) in enumerate(prepped):
+            f_i = feats[i, :, sl_out].transpose(0, 1).contiguous()  # (Lret, H)
 
-        if pool == "tokens":
-            result = feats
-        elif pool == "mean":
-            result = feats.mean(dim=0)
-        elif pool == "cls":
-            result = feats[0]
-        else:
-            raise ValueError("pool must be one of {'tokens','mean','cls'}")
+            if pool == "tokens":
+                r = f_i
+            elif pool == "mean":
+                r = f_i.mean(dim=0)
+            elif pool == "cls":
+                r = f_i[0]
+            else:
+                raise ValueError("pool must be one of {'tokens','mean','cls'}")
 
-        # Convert to numpy if requested
-        if return_numpy:
-            return result.cpu().numpy()
-        else:
-            return result
+            if return_numpy:
+                r = r.cpu().numpy()
+            results.append(r)
+
+        if is_batch:
+            # For fixed-size outputs (mean/cls), stack into (N, H)
+            if pool in ("mean", "cls"):
+                return np.stack(results) if return_numpy else torch.stack(results)
+            return results
+        return results[0]
