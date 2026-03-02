@@ -136,7 +136,6 @@ class NTWrapper(BaseWrapper):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=self.TRUST_REMOTE)
         self.k = self._infer_k_nonoverlap()
         self.max_length = self.tokenizer.model_max_length
-        self.max_seq_len = (self.max_length - 2) * self.k  # max nucleotides
 
         self.mask_id = self.tokenizer.mask_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
