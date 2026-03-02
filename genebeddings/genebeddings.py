@@ -1803,6 +1803,32 @@ class VariantEmbeddingDB:
         ).fetchone()
         return row is not None
 
+    def has_batch(self, mut_ids: list[str]) -> set[str]:
+        """
+        Check which mutation IDs exist in the database (batch).
+
+        Parameters
+        ----------
+        mut_ids : list[str]
+            Mutation identifiers to check.
+
+        Returns
+        -------
+        set[str]
+            The subset of *mut_ids* that exist in the database.
+        """
+        found: set[str] = set()
+        _CHUNK = 900  # stay under SQLite's 999-variable limit
+        for start in range(0, len(mut_ids), _CHUNK):
+            chunk = mut_ids[start : start + _CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT mut_id FROM embeddings WHERE mut_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            found.update(r[0] for r in rows)
+        return found
+
     def store(self, mut_id: str, emb: "TensorLike") -> None:
         """
         Store an embedding for a mutation ID.
@@ -1892,11 +1918,18 @@ class VariantEmbeddingDB:
             Mapping from mut_id to embedding (skips missing IDs).
         """
         result = {}
-        for mut_id in mut_ids:
-            try:
-                result[mut_id] = self.load(mut_id, as_torch=as_torch)
-            except KeyError:
-                logger.warning("Mutation %s not found, skipping", mut_id)
+        _CHUNK = 900  # stay under SQLite's 999-variable limit
+        for start in range(0, len(mut_ids), _CHUNK):
+            chunk = mut_ids[start : start + _CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT mut_id, dim, dtype, data FROM embeddings "
+                f"WHERE mut_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for mut_id, dim, dtype, blob in rows:
+                arr = np.frombuffer(blob, dtype=dtype).reshape(dim).copy()
+                result[mut_id] = torch.from_numpy(arr) if as_torch else arr
         return result
 
     def delete(self, mut_id: str) -> bool:
@@ -3215,9 +3248,11 @@ def add_epistasis_metrics(
         _seen_to_compute = {}  # epi_id -> first idx queued for computation
         _dup_indices = {}      # epi_id -> [list of extra indices needing the same result]
 
+        # Step 1: parse all rows
+        parsed_rows = []  # (idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev)
         parse_iter = df.iterrows()
         if show_progress:
-            parse_iter = tqdm(parse_iter, total=total, desc="Parsing / DB lookup")
+            parse_iter = tqdm(parse_iter, total=total, desc="Parsing rows")
 
         for idx, row in parse_iter:
             epi_id = row[id_col]
@@ -3226,22 +3261,54 @@ def add_epistasis_metrics(
                 n_skipped += 1
                 continue
             chrom, p1, r1, a1, p2, r2, a2, rev = parsed
+            parsed_rows.append((idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev))
 
-            wt_key = f"{epi_id}{KEY_WT}"
-            m1_key = f"{epi_id}{KEY_M1}"
-            m2_key = f"{epi_id}{KEY_M2}"
-            m12_key = f"{epi_id}{KEY_M12}"
+        # Step 2: collect all 4 keys per unique epi_id for batch DB check
+        unique_epi_ids = list(dict.fromkeys(pr[1] for pr in parsed_rows))
+        all_keys = []
+        for eid in unique_epi_ids:
+            all_keys.extend([
+                f"{eid}{KEY_WT}", f"{eid}{KEY_M1}",
+                f"{eid}{KEY_M2}", f"{eid}{KEY_M12}",
+            ])
 
-            if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
-                embeddings[idx] = (db.load(wt_key), db.load(m1_key), db.load(m2_key), db.load(m12_key))
+        # Step 3: batch has — single round-trip (chunked internally)
+        if force:
+            found_keys: set[str] = set()
+        else:
+            found_keys = db.has_batch(all_keys)
+
+        # Determine which epi_ids have all 4 keys cached
+        cached_epi_ids: set[str] = set()
+        keys_to_load: list[str] = []
+        for eid in unique_epi_ids:
+            eid_keys = [
+                f"{eid}{KEY_WT}", f"{eid}{KEY_M1}",
+                f"{eid}{KEY_M2}", f"{eid}{KEY_M12}",
+            ]
+            if all(k in found_keys for k in eid_keys):
+                cached_epi_ids.add(eid)
+                keys_to_load.extend(eid_keys)
+
+        # Step 4: batch load all cached embeddings
+        loaded_embs = db.load_batch(keys_to_load) if keys_to_load else {}
+
+        # Step 5: partition parsed rows into loaded / to_compute
+        for pr in parsed_rows:
+            idx, epi_id = pr[0], pr[1]
+            if epi_id in cached_epi_ids:
+                embeddings[idx] = (
+                    loaded_embs[f"{epi_id}{KEY_WT}"],
+                    loaded_embs[f"{epi_id}{KEY_M1}"],
+                    loaded_embs[f"{epi_id}{KEY_M2}"],
+                    loaded_embs[f"{epi_id}{KEY_M12}"],
+                )
                 n_loaded += 1
             elif epi_id in _seen_to_compute:
-                # Duplicate epi_id already queued for computation — skip model call,
-                # will copy embeddings from the first occurrence after Phase 2.
                 _dup_indices.setdefault(epi_id, []).append(idx)
             else:
                 _seen_to_compute[epi_id] = idx
-                to_compute.append((idx, epi_id, chrom, p1, r1, a1, p2, r2, a2, rev))
+                to_compute.append(pr)
 
         n_dedup = sum(len(v) for v in _dup_indices.values())
         if n_dedup:
@@ -3401,6 +3468,30 @@ def add_epistasis_metrics(
     n_skipped = 0
     total = len(df)
 
+    # Upfront batch DB lookup: collect all keys, check existence, load cached
+    _all_epi_ids = list(dict.fromkeys(df[id_col].astype(str)))
+    _all_keys: list[str] = []
+    for _eid in _all_epi_ids:
+        _all_keys.extend([
+            f"{_eid}{KEY_WT}", f"{_eid}{KEY_M1}",
+            f"{_eid}{KEY_M2}", f"{_eid}{KEY_M12}",
+        ])
+    if force:
+        _found_keys: set[str] = set()
+    else:
+        _found_keys = db.has_batch(_all_keys)
+    _cached_epi_ids: set[str] = set()
+    _keys_to_load: list[str] = []
+    for _eid in _all_epi_ids:
+        _eid_keys = [
+            f"{_eid}{KEY_WT}", f"{_eid}{KEY_M1}",
+            f"{_eid}{KEY_M2}", f"{_eid}{KEY_M12}",
+        ]
+        if all(k in _found_keys for k in _eid_keys):
+            _cached_epi_ids.add(_eid)
+            _keys_to_load.extend(_eid_keys)
+    _preloaded = db.load_batch(_keys_to_load) if _keys_to_load else {}
+
     iterator = df.iterrows()
     if show_progress:
         iterator = tqdm(iterator, total=total, desc="Epistasis metrics")
@@ -3444,18 +3535,18 @@ def add_epistasis_metrics(
         else:
             rev = reverse_complement
 
-        # Check if embeddings exist
+        # Check pre-loaded cache
         wt_key = f"{epi_id}{KEY_WT}"
         m1_key = f"{epi_id}{KEY_M1}"
         m2_key = f"{epi_id}{KEY_M2}"
         m12_key = f"{epi_id}{KEY_M12}"
 
-        if not force and db.has(wt_key) and db.has(m1_key) and db.has(m2_key) and db.has(m12_key):
-            # Load existing embeddings
-            h_wt = db.load(wt_key)
-            h_m1 = db.load(m1_key)
-            h_m2 = db.load(m2_key)
-            h_m12 = db.load(m12_key)
+        if epi_id in _cached_epi_ids:
+            # Load from batch-preloaded embeddings
+            h_wt = _preloaded[wt_key]
+            h_m1 = _preloaded[m1_key]
+            h_m2 = _preloaded[m2_key]
+            h_m12 = _preloaded[m12_key]
             n_loaded += 1
         elif model is not None:
             # Compute and save embeddings

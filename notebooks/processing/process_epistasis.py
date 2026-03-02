@@ -162,6 +162,8 @@ def _copy_embeddings_from_lookup_dbs(
     """
     from genebeddings import VariantEmbeddingDB
 
+    _REQUIRED_SUFFIXES = (KEY_WT, KEY_M1, KEY_M2, KEY_M12)
+
     epi_ids = df[id_col].dropna().astype(str).unique().tolist()
     n_copied = 0
     for base in embedding_lookup_bases:
@@ -178,34 +180,52 @@ def _copy_embeddings_from_lookup_dbs(
             logger.warning("Could not open lookup DB %s: %s", candidate_path, e)
             continue
         try:
-            for epi_id in epi_ids:
-                wt_key = epi_id + KEY_WT
-                if target_db.has(wt_key):
-                    continue
-                m1_key = epi_id + KEY_M1
-                m2_key = epi_id + KEY_M2
-                m12_key = epi_id + KEY_M12
-                if not (
-                    candidate_db.has(wt_key)
-                    and candidate_db.has(m1_key)
-                    and candidate_db.has(m2_key)
-                    and candidate_db.has(m12_key)
-                ):
-                    continue
-                h_wt = np.asarray(candidate_db.load(wt_key, as_torch=False), dtype=np.float32)
-                h_m1 = np.asarray(candidate_db.load(m1_key, as_torch=False), dtype=np.float32)
-                h_m2 = np.asarray(candidate_db.load(m2_key, as_torch=False), dtype=np.float32)
-                h_m12 = np.asarray(candidate_db.load(m12_key, as_torch=False), dtype=np.float32)
-                target_db.store(wt_key, h_wt)
-                target_db.store(m1_key, h_m1)
-                target_db.store(m2_key, h_m2)
-                target_db.store(m12_key, h_m12)
-                for suf in _EPI_KEYS_OPTIONAL:
-                    key = epi_id + suf
-                    if candidate_db.has(key):
-                        arr = np.asarray(candidate_db.load(key, as_torch=False), dtype=np.float32)
-                        target_db.store(key, arr)
+            # 1. Which epi_ids are already in target? (batch check on wt_key)
+            wt_keys = [eid + KEY_WT for eid in epi_ids]
+            already_in_target = target_db.has_batch(wt_keys)
+            remaining = [eid for eid in epi_ids if (eid + KEY_WT) not in already_in_target]
+            if not remaining:
+                continue
+
+            # 2. Which remaining epi_ids have all 4 required keys in candidate?
+            all_candidate_keys = []
+            for eid in remaining:
+                for suf in _REQUIRED_SUFFIXES:
+                    all_candidate_keys.append(eid + suf)
+            found_in_candidate = candidate_db.has_batch(all_candidate_keys)
+
+            copyable = [
+                eid for eid in remaining
+                if all((eid + suf) in found_in_candidate for suf in _REQUIRED_SUFFIXES)
+            ]
+            if not copyable:
+                continue
+
+            # 3. Batch load required keys from candidate
+            keys_to_load = []
+            for eid in copyable:
+                for suf in _REQUIRED_SUFFIXES:
+                    keys_to_load.append(eid + suf)
+            loaded = candidate_db.load_batch(keys_to_load, as_torch=False)
+
+            # 4. Store into target
+            for eid in copyable:
+                for suf in _REQUIRED_SUFFIXES:
+                    key = eid + suf
+                    target_db.store(key, np.asarray(loaded[key], dtype=np.float32))
                 n_copied += 1
+
+            # 5. Optional delta keys — batch has + load from candidate
+            opt_keys = []
+            for eid in copyable:
+                for suf in _EPI_KEYS_OPTIONAL:
+                    opt_keys.append(eid + suf)
+            found_opt = candidate_db.has_batch(opt_keys)
+            opt_to_load = [k for k in opt_keys if k in found_opt]
+            if opt_to_load:
+                loaded_opt = candidate_db.load_batch(opt_to_load, as_torch=False)
+                for key, arr in loaded_opt.items():
+                    target_db.store(key, np.asarray(arr, dtype=np.float32))
         finally:
             candidate_db.close()
     return n_copied
