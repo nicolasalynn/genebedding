@@ -3574,6 +3574,12 @@ def add_epistasis_metrics(
                 db.store(f"{epi_id}{KEY_DELTA1}", h_m1 - h_wt)
                 db.store(f"{epi_id}{KEY_DELTA2}", h_m2 - h_wt)
                 db.store(f"{epi_id}{KEY_DELTA12}", h_m12 - h_wt)
+                # Update preloaded cache so duplicates don't recompute
+                _cached_epi_ids.add(epi_id)
+                _preloaded[wt_key] = h_wt
+                _preloaded[m1_key] = h_m1
+                _preloaded[m2_key] = h_m2
+                _preloaded[m12_key] = h_m12
                 n_computed += 1
             except Exception as e:
                 logger.warning("Failed to embed %s: %s", epi_id, e)
