@@ -150,6 +150,7 @@ def _copy_embeddings_from_lookup_dbs(
     model_key: str,
     embedding_lookup_bases: Sequence[Union[str, Path]],
     embedding_lookup_flat: bool = False,
+    show_progress: bool = True,
 ) -> int:
     """
     Search existing DBs for each epistasis_id in df; if found, copy WT/M1/M2/M12
@@ -161,6 +162,7 @@ def _copy_embeddings_from_lookup_dbs(
     .db files directly inside).
     """
     from genebeddings import VariantEmbeddingDB
+    from tqdm.auto import tqdm
 
     _REQUIRED_SUFFIXES = (KEY_WT, KEY_M1, KEY_M2, KEY_M12)
 
@@ -208,24 +210,33 @@ def _copy_embeddings_from_lookup_dbs(
                     keys_to_load.append(eid + suf)
             loaded = candidate_db.load_batch(keys_to_load, as_torch=False)
 
-            # 4. Store into target
-            for eid in copyable:
-                for suf in _REQUIRED_SUFFIXES:
-                    key = eid + suf
-                    target_db.store(key, np.asarray(loaded[key], dtype=np.float32))
-                n_copied += 1
+            # 4. Store into target in a single transaction (much faster than per-row commits)
+            conn = target_db.conn
+            conn.execute("BEGIN")
+            try:
+                it = tqdm(copyable, desc=f"Copying {source_name}/{model_key}", disable=not show_progress)
+                for eid in it:
+                    for suf in _REQUIRED_SUFFIXES:
+                        key = eid + suf
+                        target_db.store(key, np.asarray(loaded[key], dtype=np.float32))
+                    n_copied += 1
 
-            # 5. Optional delta keys — batch has + load from candidate
-            opt_keys = []
-            for eid in copyable:
-                for suf in _EPI_KEYS_OPTIONAL:
-                    opt_keys.append(eid + suf)
-            found_opt = candidate_db.has_batch(opt_keys)
-            opt_to_load = [k for k in opt_keys if k in found_opt]
-            if opt_to_load:
-                loaded_opt = candidate_db.load_batch(opt_to_load, as_torch=False)
-                for key, arr in loaded_opt.items():
-                    target_db.store(key, np.asarray(arr, dtype=np.float32))
+                # 5. Optional delta keys — batch has + load from candidate
+                opt_keys = []
+                for eid in copyable:
+                    for suf in _EPI_KEYS_OPTIONAL:
+                        opt_keys.append(eid + suf)
+                found_opt = candidate_db.has_batch(opt_keys)
+                opt_to_load = [k for k in opt_keys if k in found_opt]
+                if opt_to_load:
+                    loaded_opt = candidate_db.load_batch(opt_to_load, as_torch=False)
+                    for key, arr in loaded_opt.items():
+                        target_db.store(key, np.asarray(arr, dtype=np.float32))
+
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         finally:
             candidate_db.close()
     return n_copied
@@ -544,6 +555,7 @@ def run_sources(
                     n_looked_up = _copy_embeddings_from_lookup_dbs(
                         df, id_col, db, source_name, model_key, embedding_lookup_bases,
                         embedding_lookup_flat=embedding_lookup_flat,
+                        show_progress=show_progress,
                     )
                     if n_looked_up:
                         logger.info(
@@ -713,6 +725,7 @@ def run_sources_by_tool(
                     _copy_embeddings_from_lookup_dbs(
                         df, id_col, db, source_name, model_key, embedding_lookup_bases,
                         embedding_lookup_flat=embedding_lookup_flat,
+                        show_progress=show_progress,
                     )
                 annotated = add_epistasis_metrics(
                     df,
