@@ -928,6 +928,111 @@ def compute_cov_inv(
     return result
 
 
+def compute_cov_inv_by_distance(
+    output_base: Union[str, Path],
+    source_df: pd.DataFrame,
+    bin_edges: Sequence[float] = (0, 1_000, 10_000, 100_000, float("inf")),
+    bin_labels: Sequence[str] = ("0-1kb", "1-10kb", "10-100kb", "100kb+"),
+    source_col: str = "source",
+    id_col: str = "epistasis_id",
+    model_keys: Optional[Sequence[str]] = None,
+    method: str = "ledoit_wolf",
+    min_pairs_per_bin: int = 50,
+    show_progress: bool = True,
+) -> Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray]]]:
+    """
+    Compute cov and cov_inv separately for distance bins of variant pairs.
+
+    Nearby variant pairs share more sequence context in model receptive fields,
+    so the null residual distribution likely varies by distance. This function
+    bins pairs by ``abs(pos2 - pos1)`` and calls :func:`compute_cov_inv` once
+    per bin (plus a global fit over all pairs).
+
+    Parameters
+    ----------
+    output_base : path
+        Base directory (output_base/source_name/model_key.db).
+    source_df : pandas.DataFrame
+        Must contain *source_col* and *id_col*.
+    bin_edges : sequence of float
+        Edges for ``pd.cut``. Default: (0, 1k, 10k, 100k, inf).
+    bin_labels : sequence of str
+        Labels for each bin (len must equal len(bin_edges) - 1).
+    source_col, id_col : str
+        Column names in *source_df*.
+    model_keys : list of str, optional
+        Which models to compute. Default: all in FULL_MODEL_CONFIG.
+    method : str, default "ledoit_wolf"
+        Covariance estimator.
+    min_pairs_per_bin : int, default 50
+        Bins with fewer pairs are skipped (they fall back to global).
+    show_progress : bool, default True
+
+    Returns
+    -------
+    dict
+        ``{"global": {model: (cov, cov_inv)}, "0-1kb": {...}, ...}``
+    """
+    from genebeddings.genebeddings import parse_epistasis_id
+
+    if source_col not in source_df.columns or id_col not in source_df.columns:
+        raise ValueError(f"source_df must have columns {source_col!r} and {id_col!r}")
+
+    # -- parse distances for all unique epi_ids --
+    all_ids = source_df[id_col].dropna().astype(str).unique().tolist()
+    id_to_dist: Dict[str, float] = {}
+    for eid in all_ids:
+        try:
+            (_, pos1, _, _, _), (_, pos2, _, _, _) = parse_epistasis_id(eid)
+            id_to_dist[eid] = abs(pos2 - pos1)
+        except Exception:
+            logger.debug("Could not parse distance for %r, skipping", eid)
+
+    dist_series = pd.Series(id_to_dist, name="distance")
+    bin_ser = pd.cut(dist_series, bins=list(bin_edges), labels=list(bin_labels), right=False)
+
+    # group epi_ids by bin
+    bin_to_ids: Dict[str, List[str]] = {}
+    for label in bin_labels:
+        ids_in_bin = bin_ser[bin_ser == label].index.tolist()
+        if len(ids_in_bin) >= min_pairs_per_bin:
+            bin_to_ids[label] = ids_in_bin
+        else:
+            logger.info(
+                "Distance bin %r has %d pairs (< %d), skipping",
+                label, len(ids_in_bin), min_pairs_per_bin,
+            )
+
+    # -- compute global cov_inv (all pairs, no distance filter) --
+    result: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray]]] = {}
+    logger.info("Computing global cov_inv from %d pairs", len(all_ids))
+    result["global"] = compute_cov_inv(
+        output_base,
+        source_df=source_df,
+        source_col=source_col,
+        id_col=id_col,
+        model_keys=model_keys,
+        method=method,
+        show_progress=show_progress,
+    )
+
+    # -- per-bin cov_inv --
+    for label, bin_ids in bin_to_ids.items():
+        logger.info("Computing cov_inv for bin %r (%d pairs)", label, len(bin_ids))
+        result[label] = compute_cov_inv(
+            output_base,
+            source_df=source_df,
+            source_col=source_col,
+            id_col=id_col,
+            epistasis_ids=bin_ids,
+            model_keys=model_keys,
+            method=method,
+            show_progress=show_progress,
+        )
+
+    return result
+
+
 def recompute_metrics_with_cov_inv(
     output_base: Union[str, Path],
     df: pd.DataFrame,
@@ -1040,6 +1145,160 @@ def recompute_metrics_with_cov_inv(
         if parts:
             result[model_key] = pd.concat(parts, axis=0).sort_index()
             logger.info("Recomputed metrics for model %r: %d rows", model_key, len(result[model_key]))
+
+    return result
+
+
+def recompute_metrics_by_distance(
+    output_base: Union[str, Path],
+    df: pd.DataFrame,
+    cov_inv_by_dist: Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray]]],
+    bin_edges: Sequence[float] = (0, 1_000, 10_000, 100_000, float("inf")),
+    bin_labels: Sequence[str] = ("0-1kb", "1-10kb", "10-100kb", "100kb+"),
+    source_col: str = "source",
+    id_col: str = "epistasis_id",
+    model_keys: Optional[Sequence[str]] = None,
+    show_progress: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Recompute epistasis metrics using distance-binned cov_inv matrices.
+
+    Each row is assigned to a distance bin based on ``abs(pos2 - pos1)``.
+    The bin-specific ``cov_inv`` (from :func:`compute_cov_inv_by_distance`) is
+    used for Mahalanobis metrics. Rows whose bin has no dedicated ``cov_inv``
+    (too few pairs) fall back to the ``"global"`` entry.
+
+    No model is loaded — embeddings are read from existing DBs (``model=None``).
+
+    Parameters
+    ----------
+    output_base : path
+        Base directory (output_base/source_name/model_key.db).
+    df : pandas.DataFrame
+        Full table with *id_col* and *source_col*.
+    cov_inv_by_dist : dict
+        Output of :func:`compute_cov_inv_by_distance`.
+        ``{"global": {model: (cov, cov_inv)}, "0-1kb": {...}, ...}``
+    bin_edges, bin_labels : sequences
+        Must match those used when creating *cov_inv_by_dist*.
+    source_col, id_col : str
+        Column names in *df*.
+    model_keys : list of str, optional
+        Which models to recompute for. Default: keys of ``cov_inv_by_dist["global"]``.
+    show_progress : bool, default True
+
+    Returns
+    -------
+    dict
+        ``{model_key: annotated_df}`` where each DataFrame has a
+        ``distance_bin`` column and all standard metric columns.
+    """
+    from genebeddings import VariantEmbeddingDB
+    from genebeddings.genebeddings import add_epistasis_metrics, parse_epistasis_id
+
+    output_base = Path(output_base)
+    if source_col not in df.columns or id_col not in df.columns:
+        raise ValueError(f"df must have columns {source_col!r} and {id_col!r}")
+
+    global_cov_inv = cov_inv_by_dist.get("global", {})
+    model_keys = model_keys or list(global_cov_inv)
+
+    # -- assign each row a distance bin --
+    def _get_distance(eid: str) -> float:
+        try:
+            (_, pos1, _, _, _), (_, pos2, _, _, _) = parse_epistasis_id(eid)
+            return abs(pos2 - pos1)
+        except Exception:
+            return float("nan")
+
+    distances = df[id_col].astype(str).map(_get_distance)
+    bin_col = pd.cut(distances, bins=list(bin_edges), labels=list(bin_labels), right=False)
+    df = df.copy()
+    df["distance_bin"] = bin_col
+
+    sources = df[source_col].dropna().astype(str).unique().tolist()
+    result: Dict[str, pd.DataFrame] = {}
+
+    for model_key in model_keys:
+        if model_key not in FULL_MODEL_CONFIG:
+            logger.warning("Unknown model key %r, skipping", model_key)
+            continue
+        context, _init_spec = FULL_MODEL_CONFIG[model_key]
+
+        parts: List[pd.DataFrame] = []
+        for source_name in sources:
+            db_path = output_base / source_name / f"{model_key}.db"
+            if not db_path.exists():
+                logger.warning("DB not found for %s / %s, skipping source", source_name, model_key)
+                continue
+
+            df_s = df.loc[df[source_col].astype(str) == source_name].copy()
+            if len(df_s) == 0:
+                continue
+
+            db = VariantEmbeddingDB(str(db_path))
+            try:
+                bin_parts: List[pd.DataFrame] = []
+                for label in bin_labels:
+                    df_bin = df_s.loc[df_s["distance_bin"] == label]
+                    if len(df_bin) == 0:
+                        continue
+
+                    # pick bin-specific cov_inv; fall back to global
+                    if label in cov_inv_by_dist and model_key in cov_inv_by_dist[label]:
+                        _cov, cov_inv = cov_inv_by_dist[label][model_key]
+                    elif model_key in global_cov_inv:
+                        _cov, cov_inv = global_cov_inv[model_key]
+                        logger.debug(
+                            "Bin %r: no cov_inv for %r, using global", label, model_key,
+                        )
+                    else:
+                        logger.warning(
+                            "No cov_inv (bin or global) for %r, skipping", model_key,
+                        )
+                        continue
+
+                    annotated_bin = add_epistasis_metrics(
+                        df_bin,
+                        db,
+                        model=None,
+                        id_col=id_col,
+                        context=context,
+                        cov_inv=cov_inv,
+                        force=False,
+                        batch_size=1,
+                        show_progress=show_progress,
+                    )
+                    bin_parts.append(annotated_bin)
+
+                # rows with NaN distance_bin (unparseable) — use global
+                df_nan = df_s.loc[df_s["distance_bin"].isna()]
+                if len(df_nan) > 0 and model_key in global_cov_inv:
+                    _cov, cov_inv = global_cov_inv[model_key]
+                    annotated_nan = add_epistasis_metrics(
+                        df_nan,
+                        db,
+                        model=None,
+                        id_col=id_col,
+                        context=context,
+                        cov_inv=cov_inv,
+                        force=False,
+                        batch_size=1,
+                        show_progress=show_progress,
+                    )
+                    bin_parts.append(annotated_nan)
+
+                if bin_parts:
+                    parts.append(pd.concat(bin_parts, axis=0))
+            finally:
+                db.close()
+
+        if parts:
+            result[model_key] = pd.concat(parts, axis=0).sort_index()
+            logger.info(
+                "Recomputed distance-binned metrics for %r: %d rows",
+                model_key, len(result[model_key]),
+            )
 
     return result
 
