@@ -18,9 +18,17 @@ conda create -n "$CONDA_ENV" python=3.10 -y
 conda activate "$CONDA_ENV"
 
 pip install --upgrade pip setuptools wheel
-pip install torch torchvision torchaudio --index-url "$CUDA_INDEX"
+
+# mamba_ssm compiles CUDA kernels → needs nvcc + matching toolkit
+conda install -y -c "nvidia/label/cuda-12.1.1" cuda-toolkit
+
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url "$CUDA_INDEX"
+
 # Caduceus uses tie_weights(recompute_mapping=...) removed in transformers 4.46+
-pip install "transformers>=4.30,<4.46" mamba_ssm
+pip install "transformers>=4.30,<4.46"
+
+# Build mamba_ssm with the installed torch (not pip's isolated env torch)
+pip install mamba_ssm --no-build-isolation
 pip install seqmat pyarrow scipy scikit-learn matplotlib pandas tqdm
 pip install -e .
 
