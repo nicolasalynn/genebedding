@@ -142,6 +142,27 @@ from genebeddings.genebeddings import (
 _EPI_KEYS_OPTIONAL = (KEY_DELTA1, KEY_DELTA2, KEY_DELTA12)
 
 
+def _normalize_epi_id(epi_id: str) -> str:
+    """Replace the gene-name field in each mutation part with ``_``.
+
+    ``KRAS:12:100000:A:G|KRAS:12:100001:T:C``
+    and ``GENE:12:100000:A:G|GENE:12:100001:T:C``
+    both become ``_:12:100000:A:G|_:12:100001:T:C``.
+
+    Only the *bare* epistasis id is normalised (no ``|WT`` / ``|M1`` suffix).
+    """
+    parts = epi_id.split("|")
+    out = []
+    for p in parts:
+        fields = p.split(":")
+        if len(fields) >= 5:          # GENE:CHROM:POS:REF:ALT[:STRAND]
+            fields[0] = "_"
+            out.append(":".join(fields))
+        else:
+            out.append(p)             # safety: leave unrecognised parts as-is
+    return "|".join(out)
+
+
 def _copy_embeddings_from_lookup_dbs(
     df: pd.DataFrame,
     id_col: str,
@@ -189,26 +210,59 @@ def _copy_embeddings_from_lookup_dbs(
             if not remaining:
                 continue
 
-            # 2. Which remaining epi_ids have all 4 required keys in candidate?
+            # 2. Which remaining epi_ids have all 4 required keys in candidate? (exact match)
             all_candidate_keys = []
             for eid in remaining:
                 for suf in _REQUIRED_SUFFIXES:
                     all_candidate_keys.append(eid + suf)
             found_in_candidate = candidate_db.has_batch(all_candidate_keys)
 
-            copyable = [
+            copyable_exact = [
                 eid for eid in remaining
                 if all((eid + suf) in found_in_candidate for suf in _REQUIRED_SUFFIXES)
             ]
+
+            # 2b. For IDs not found exactly, try normalized matching
+            #     (handles gene-name mismatches like GENE vs KRAS)
+            not_found_exact = [eid for eid in remaining if eid not in set(copyable_exact)]
+            # input_eid -> candidate_eid mapping for normalized matches
+            norm_map: dict[str, str] = {}
+            if not_found_exact:
+                # Build normalised→candidate mapping from candidate DB's WT keys
+                all_cand_wt = candidate_db.conn.execute(
+                    "SELECT mut_id FROM embeddings WHERE mut_id LIKE '%|WT'"
+                ).fetchall()
+                norm_to_cand: dict[str, str] = {}
+                for (cand_key,) in all_cand_wt:
+                    cand_eid = cand_key[: -len(KEY_WT)]  # strip |WT suffix
+                    norm_to_cand[_normalize_epi_id(cand_eid)] = cand_eid
+                for eid in not_found_exact:
+                    nk = _normalize_epi_id(eid)
+                    if nk in norm_to_cand:
+                        cand_eid = norm_to_cand[nk]
+                        # Verify all 4 required keys exist in candidate
+                        check_keys = [cand_eid + suf for suf in _REQUIRED_SUFFIXES]
+                        if candidate_db.has_batch(check_keys) == set(check_keys):
+                            norm_map[eid] = cand_eid
+
+            # Combine: exact matches + normalised matches
+            copyable = copyable_exact + list(norm_map.keys())
             if not copyable:
                 continue
 
             # 3. Batch load required keys from candidate
             keys_to_load = []
             for eid in copyable:
+                cand_eid = norm_map.get(eid, eid)
                 for suf in _REQUIRED_SUFFIXES:
-                    keys_to_load.append(eid + suf)
+                    keys_to_load.append(cand_eid + suf)
             loaded = candidate_db.load_batch(keys_to_load, as_torch=False)
+
+            if norm_map:
+                logger.info(
+                    "Normalised gene-name lookup matched %d extra IDs in %s",
+                    len(norm_map), candidate_path.name,
+                )
 
             # 4. Store into target in a single transaction (much faster than per-row commits)
             conn = target_db.conn
@@ -216,22 +270,27 @@ def _copy_embeddings_from_lookup_dbs(
             try:
                 it = tqdm(copyable, desc=f"Copying {source_name}/{model_key}", disable=not show_progress)
                 for eid in it:
+                    cand_eid = norm_map.get(eid, eid)
                     for suf in _REQUIRED_SUFFIXES:
-                        key = eid + suf
-                        target_db.store(key, np.asarray(loaded[key], dtype=np.float32))
+                        src_key = cand_eid + suf
+                        target_db.store(eid + suf, np.asarray(loaded[src_key], dtype=np.float32))
                     n_copied += 1
 
                 # 5. Optional delta keys — batch has + load from candidate
                 opt_keys = []
+                opt_key_map: dict[str, str] = {}  # target_key -> candidate_key
                 for eid in copyable:
+                    cand_eid = norm_map.get(eid, eid)
                     for suf in _EPI_KEYS_OPTIONAL:
-                        opt_keys.append(eid + suf)
-                found_opt = candidate_db.has_batch(opt_keys)
-                opt_to_load = [k for k in opt_keys if k in found_opt]
+                        opt_key_map[eid + suf] = cand_eid + suf
+                cand_opt_keys = list(opt_key_map.values())
+                found_opt = candidate_db.has_batch(cand_opt_keys)
+                opt_to_load = [k for k in cand_opt_keys if k in found_opt]
                 if opt_to_load:
                     loaded_opt = candidate_db.load_batch(opt_to_load, as_torch=False)
-                    for key, arr in loaded_opt.items():
-                        target_db.store(key, np.asarray(arr, dtype=np.float32))
+                    for tgt_key, cand_key in opt_key_map.items():
+                        if cand_key in loaded_opt:
+                            target_db.store(tgt_key, np.asarray(loaded_opt[cand_key], dtype=np.float32))
 
                 conn.execute("COMMIT")
             except Exception:
