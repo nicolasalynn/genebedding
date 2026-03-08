@@ -143,11 +143,14 @@ _EPI_KEYS_OPTIONAL = (KEY_DELTA1, KEY_DELTA2, KEY_DELTA12)
 
 
 def _normalize_epi_id(epi_id: str) -> str:
-    """Replace the gene-name field in each mutation part with ``_``.
+    """Canonicalise a mutation part to ``_:CHROM:POS:REF:ALT``.
 
-    ``KRAS:12:100000:A:G|KRAS:12:100001:T:C``
-    and ``GENE:12:100000:A:G|GENE:12:100001:T:C``
-    both become ``_:12:100000:A:G|_:12:100001:T:C``.
+    Strips the gene-name field and the optional strand suffix so that
+    all of the following normalise to ``_:12:100000:A:G|_:12:100001:T:C``::
+
+        KRAS:12:100000:A:G|KRAS:12:100001:T:C        (real gene, no strand)
+        GENE:12:100000:A:G|GENE:12:100001:T:C        (placeholder, no strand)
+        GENE:12:100000:A:G:P|GENE:12:100001:T:C:P    (placeholder + strand)
 
     Only the *bare* epistasis id is normalised (no ``|WT`` / ``|M1`` suffix).
     """
@@ -155,9 +158,10 @@ def _normalize_epi_id(epi_id: str) -> str:
     out = []
     for p in parts:
         fields = p.split(":")
-        if len(fields) >= 5:          # GENE:CHROM:POS:REF:ALT[:STRAND]
-            fields[0] = "_"
-            out.append(":".join(fields))
+        if len(fields) == 6:          # GENE:CHROM:POS:REF:ALT:STRAND
+            out.append(":".join(["_"] + fields[1:5]))
+        elif len(fields) == 5:        # GENE:CHROM:POS:REF:ALT
+            out.append(":".join(["_"] + fields[1:5]))
         else:
             out.append(p)             # safety: leave unrecognised parts as-is
     return "|".join(out)
