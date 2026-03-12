@@ -4294,6 +4294,7 @@ def compute_logodds_dependency_map(
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     store_details: bool = False,
+    **model_kwargs,
 ) -> DependencyMapResult:
     """
     Compute a dependency map using masked-language-model log-odds.
@@ -4347,6 +4348,10 @@ def compute_logodds_dependency_map(
         If True, store per-pair baseline and mutant distributions in
         ``result.details``. Useful for inspection but memory-intensive
         for large position sets. Default: False.
+    **model_kwargs
+        Extra keyword arguments passed through to every
+        ``model.predict_nucleotides()`` call (e.g. ``species_proxy``
+        for SpeciesLM).
 
     Returns
     -------
@@ -4406,7 +4411,7 @@ def compute_logodds_dependency_map(
 
     # ---- Step 1: baseline distributions (one batched call) ----
     baseline_dicts = model.predict_nucleotides(
-        sequence, positions=pos_list, return_dict=True
+        sequence, positions=pos_list, return_dict=True, **model_kwargs
     )
     # baseline_dicts: list of N dicts  [{'A': p, 'C': p, 'G': p, 'T': p}, ...]
     baseline_matrix = np.array(
@@ -4447,7 +4452,7 @@ def compute_logodds_dependency_map(
 
             # Get distributions at ALL target positions in one call
             mut_dicts = model.predict_nucleotides(
-                mutated_seq, positions=pos_list, return_dict=True
+                mutated_seq, positions=pos_list, return_dict=True, **model_kwargs
             )
             mut_matrix = np.array(
                 [[d[nt] for nt in nucs] for d in mut_dicts]
@@ -4522,7 +4527,7 @@ def compute_logodds_dependency_map(
     )
 
 
-def _detect_base_token_offset(model, sequence: str) -> int:
+def _detect_base_token_offset(model, sequence: str, **model_kwargs) -> int:
     """
     Detect the token index of the first base in ``pool='tokens'`` output.
 
@@ -4535,8 +4540,8 @@ def _detect_base_token_offset(model, sequence: str) -> int:
     alt = "C" if sequence[0] != "C" else "A"
     seq_probe = alt + sequence[1:]
 
-    tokens_orig = model.embed(sequence, pool="tokens", return_numpy=False)
-    tokens_probe = model.embed(seq_probe, pool="tokens", return_numpy=False)
+    tokens_orig = model.embed(sequence, pool="tokens", return_numpy=False, **model_kwargs)
+    tokens_probe = model.embed(seq_probe, pool="tokens", return_numpy=False, **model_kwargs)
 
     tokens_orig = torch.as_tensor(tokens_orig).float()
     tokens_probe = torch.as_tensor(tokens_probe).float()
@@ -4558,6 +4563,7 @@ def compute_embedding_perturbation_map(
     symmetrize: bool = True,
     show_progress: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    **model_kwargs,
 ) -> DependencyMapResult:
     """
     Compute a dependency map by measuring embedding perturbation at each token.
@@ -4623,6 +4629,9 @@ def compute_embedding_perturbation_map(
         Show tqdm progress bar. Default: False.
     progress_callback : callable, optional
         Called with ``(current_step, total_steps, description)``.
+    **model_kwargs
+        Extra keyword arguments passed through to every
+        ``model.embed()`` call (e.g. ``species_proxy`` for SpeciesLM).
 
     Returns
     -------
@@ -4689,8 +4698,8 @@ def compute_embedding_perturbation_map(
     )
 
     # ---- Detect base-token offset and get baseline embeddings ----
-    offset = _detect_base_token_offset(model, sequence)
-    tokens_wt = model.embed(sequence, pool="tokens", return_numpy=False)
+    offset = _detect_base_token_offset(model, sequence, **model_kwargs)
+    tokens_wt = model.embed(sequence, pool="tokens", return_numpy=False, **model_kwargs)
     tokens_wt = torch.as_tensor(tokens_wt).float()  # (T, H)
 
     # Map sequence positions to token indices
@@ -4734,7 +4743,7 @@ def compute_embedding_perturbation_map(
             step_count += 1
 
             mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
-            tokens_mut = model.embed(mutated_seq, pool="tokens", return_numpy=False)
+            tokens_mut = model.embed(mutated_seq, pool="tokens", return_numpy=False, **model_kwargs)
             tokens_mut = torch.as_tensor(tokens_mut).float()  # (T, H)
 
             # Extract mutated token embeddings at target positions
