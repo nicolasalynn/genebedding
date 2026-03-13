@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModelForMaskedLM, BertForMaskedLM
 
 # Support both package import and direct sys.path import
 try:
@@ -15,6 +15,28 @@ except ImportError:
     from base_wrapper import BaseWrapper
 
 NUCS = ("A", "C", "G", "T")
+
+# ---------------------------------------------------------------------------
+# Model presets from Tomaz Da Silva, Karollus, Hingerl et al. (2025)
+# "Nucleotide dependency analysis of genomic language models detects
+#  functional elements" — Nature Genetics
+# ---------------------------------------------------------------------------
+PRESETS: Dict[str, dict] = {
+    "fungi": {
+        "model_id": "johahi/specieslm-fungi-upstream-k1",
+        "kmer_size": 1,
+        "default_species_proxy": "kazachstania_africana_cbs_2517_gca_000304475",
+        "trust_remote_code": False,      # plain BertForMaskedLM
+        "max_position_embeddings": 1024,  # from model config
+    },
+    "metazoa": {
+        "model_id": "johahi/specieslm-metazoa-upstream-k6",
+        "kmer_size": 6,
+        "default_species_proxy": "homo_sapiens",
+        "trust_remote_code": True,        # RotaryBertForMaskedLM
+        "max_position_embeddings": 8192,  # from model config
+    },
+}
 
 
 def _is_dna_kmer(s: str, k: int) -> bool:
@@ -25,31 +47,97 @@ class SpeciesLMWrapper(BaseWrapper):
     """
     SpeciesLM wrapper with standardized API.
 
+    Supports two model variants from the dependency-map paper:
+      * **fungi**   — ``johahi/specieslm-fungi-upstream-k1`` (k=1, character-level)
+      * **metazoa** — ``johahi/specieslm-metazoa-upstream-k6`` (k=6, stride-1 6-mers)
+
+    Use ``preset='fungi'`` (default) or ``preset='metazoa'`` to select the
+    model variant.  The fungi model trains on ~806 fungal species and
+    generalises surprisingly well to human sequences.  The metazoa model
+    uses 6-mer tokenisation and is trained on metazoan genomes.
+
     Standardized API: embed(), predict_nucleotides()
     Legacy method: acgt_probs() (same as predict_nucleotides but returns full array)
 
     Notes
     -----
-    * Tokenization is whitespace-separated 6-mers with stride=1.
-    * For A/C/G/T probabilities, we mask k=6 consecutive tokens per nucleotide position,
-      run the MLM once per batch slice, softmax over vocab, then fold k-mer token
-      probabilities into per-base probabilities via a precomputed filter tensor.
+    * For k=1 the tokenization is space-separated single nucleotides.
+    * For k=6 the tokenization is whitespace-separated 6-mers with stride=1.
+    * For A/C/G/T probabilities, we mask k consecutive tokens per nucleotide
+      position, run the MLM once per batch slice, softmax over vocab, then fold
+      k-mer token probabilities into per-base probabilities via a precomputed
+      filter tensor.  For k=1 this degenerates to simple per-token masking.
     """
 
     def __init__(
         self,
-        model_id: str = "gagneurlab/SpeciesLM",
-        revision: str = "downstream_species_lm",
+        preset: Optional[str] = "fungi",
+        model_id: Optional[str] = None,
         device: Optional[str] = None,
         dtype: torch.dtype = torch.float32,
-        kmer_size: int = 6,
+        kmer_size: Optional[int] = None,
+        default_species_proxy: Optional[str] = None,
     ):
         super().__init__()
-        self.k = int(kmer_size)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
-        self.model = AutoModelForMaskedLM.from_pretrained(
-            model_id, revision=revision, torch_dtype=dtype
+
+        # ---- resolve configuration from preset and/or explicit args ----
+        cfg: dict = {}
+        if preset is not None:
+            if preset not in PRESETS:
+                raise ValueError(
+                    f"Unknown preset {preset!r}. Choose from {list(PRESETS.keys())}."
+                )
+            cfg = dict(PRESETS[preset])
+
+        # Explicit arguments override preset values
+        if model_id is not None:
+            cfg["model_id"] = model_id
+        if kmer_size is not None:
+            cfg["kmer_size"] = kmer_size
+        if default_species_proxy is not None:
+            cfg["default_species_proxy"] = default_species_proxy
+
+        # Ensure we have the minimum required settings
+        if "model_id" not in cfg:
+            raise ValueError(
+                "Either provide a preset or an explicit model_id."
+            )
+        if "kmer_size" not in cfg:
+            # Try to auto-detect from model name
+            mid = cfg["model_id"].lower()
+            if "-k1" in mid:
+                cfg["kmer_size"] = 1
+            elif "-k6" in mid:
+                cfg["kmer_size"] = 6
+            else:
+                raise ValueError(
+                    "Cannot auto-detect kmer_size from model_id; "
+                    "please specify kmer_size explicitly."
+                )
+
+        self.k = int(cfg["kmer_size"])
+        self.default_species_proxy = cfg.get("default_species_proxy")
+        trust_remote_code = cfg.get("trust_remote_code", True)
+
+        # ---- load tokenizer and model ----
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg["model_id"], trust_remote_code=trust_remote_code
         )
+
+        if trust_remote_code:
+            # Metazoa uses RotaryBertForMaskedLM — needs AutoModel + trust_remote_code
+            self.model = AutoModelForMaskedLM.from_pretrained(
+                cfg["model_id"],
+                trust_remote_code=True,
+                torch_dtype=dtype,
+            )
+        else:
+            # Fungi is plain BertForMaskedLM
+            self.model = BertForMaskedLM.from_pretrained(
+                cfg["model_id"],
+                torch_dtype=dtype,
+            )
+
         if device is None:
             device = (
                 "cuda"
@@ -63,7 +151,6 @@ class SpeciesLMWrapper(BaseWrapper):
         # IDs
         self.mask_id = self.tokenizer.mask_token_id
         if self.mask_id is None:
-            # SpeciesLM should define one; fall back to [MASK] lookup if needed.
             try:
                 self.mask_id = self.tokenizer.convert_tokens_to_ids("[MASK]")
             except Exception as _:
@@ -86,14 +173,19 @@ class SpeciesLMWrapper(BaseWrapper):
         *,
         add_special_tokens: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """Tokenize as stride-1 k-mers with optional species prefix token/string."""
+        """Tokenize as stride-1 k-mers (or single characters for k=1)
+        with optional species prefix token/string."""
         seq = seq.upper()
-        # build "A C G T A ..." of stride-1 6-mers
+
         def kmers_stride1(s: str, k: int) -> List[str]:
             return [s[i : i + k] for i in range(0, len(s) - k + 1)]
 
         toks = " ".join(kmers_stride1(seq, self.k))
-        text = (species_proxy + " " + toks) if species_proxy else toks
+
+        # Use default species proxy if none given
+        sp = species_proxy if species_proxy is not None else self.default_species_proxy
+        text = (sp + " " + toks) if sp else toks
+
         enc = self.tokenizer(
             text,
             add_special_tokens=add_special_tokens,
@@ -171,10 +263,10 @@ class SpeciesLMWrapper(BaseWrapper):
         self._prb_filter = torch.from_numpy(prb_filter).to(self.device)
 
 
-    # --- add these helpers inside SpeciesLMWrapper --------------------------------
-    
+    # --- helpers ---------------------------------------------------------------
+
     def _max_model_tokens(self) -> int:
-        # fallbacks across configs/tokenizers; SpeciesLM uses 512
+        # fallbacks across configs/tokenizers
         m = getattr(self.model.config, "max_position_embeddings", None)
         t = getattr(self.tokenizer, "model_max_length", None)
         # HF uses very large default for unknown; clamp to config if available
@@ -185,14 +277,14 @@ class SpeciesLMWrapper(BaseWrapper):
         if t is None or t > m:
             return int(m)
         return int(min(m, t))
-    
+
     def _window_nt_len(self) -> int:
         # leave a small margin for specials/species tokenization overhead
         max_tok = self._max_model_tokens()
         safety = 16
         kmer_budget = max(32, max_tok - safety)       # number of k-mer tokens per window
         return int(kmer_budget + self.k - 1)          # nucleotides per window
-    
+
     def _iter_seq_windows(self, seq: str):
         """Yield (start_nt, end_nt) half-open windows with overlap k-1."""
         L = len(seq)
@@ -205,7 +297,7 @@ class SpeciesLMWrapper(BaseWrapper):
             if e == L:
                 break
             s += step
-    
+
     # --- standardized API methods -------------------------------------------------
 
     @torch.no_grad()
@@ -262,7 +354,7 @@ class SpeciesLMWrapper(BaseWrapper):
             else:
                 rep = out.hidden_states[layers] if isinstance(layers, int) \
                       else torch.stack(out.hidden_states[layers[0]:layers[1]], 0).mean(0)
-                
+
             rep = rep[0]
             if pool == "mean":
                 mask = enc["attention_mask"][0].unsqueeze(-1)
@@ -274,32 +366,32 @@ class SpeciesLMWrapper(BaseWrapper):
             else:
                 raise ValueError("pool must be 'mean'|'cls'|'tokens'")
             return outv.detach().cpu().numpy() if return_numpy else outv
-    
+
         # Chunked path
         if pool == "tokens":
             # total number of stride-1 k-mer tokens across full sequence
             n_total = max(0, len(seq) - self.k + 1)
             if n_total == 0:
                 return np.zeros((0, self.model.config.hidden_size), dtype=np.float32)
-        
+
             # accumulate on CPU to keep GPU mem low
             H = int(getattr(self.model.config, "hidden_size", getattr(self.model.config, "d_model", 768)))
             sum_emb = torch.zeros((n_total, H), dtype=torch.float32)
             cnt = torch.zeros((n_total, 1), dtype=torch.float32)
-        
+
             for s, e in self._iter_seq_windows(seq):
                 enc = self._tokenize_seq(seq[s:e], species_proxy, add_special_tokens=True)
                 enc = {k: v.to(self.device) for k, v in enc.items()}
                 out = self.model(**enc, output_hidden_states=True)
-        
+
                 rep = out.last_hidden_state if (hasattr(out, "last_hidden_state") and out.last_hidden_state is not None) \
                       else out.hidden_states[-1]
                 rep = rep[0]  # (T_window, H)
-        
+
                 # figure out how many non-kmer specials flank the k-mer block in this window
                 left_special  = self._count_specials(enc["input_ids"][0], where="left")
                 right_special = self._count_specials(enc["input_ids"][0], where="right")
-        
+
                 # token embeddings for actual k-mers in this window
                 rep_core = rep[left_special : rep.shape[0] - right_special]      # (T_core, H)
                 # should correspond to k-mer starts covering seq[s:e]
@@ -309,16 +401,16 @@ class SpeciesLMWrapper(BaseWrapper):
                 # Align: token index 0 in this window corresponds to global token index `s`
                 rep_core = rep_core[:n_tok]                                      # (n_tok, H)
                 g0, g1 = s, s + n_tok                                            # global token slice
-        
+
                 # accumulate (CPU)
                 rc = rep_core.detach().cpu()
                 sum_emb[g0:g1] += rc
                 cnt[g0:g1]    += 1.0
-        
+
             out_tokens = sum_emb / torch.clamp_min(cnt, 1.0)
             return out_tokens.numpy() if return_numpy else out_tokens
-        
-            
+
+        # Chunked mean/cls path
         agg = None
         weight_sum = 0.0
         for s, e in self._iter_seq_windows(seq):
@@ -346,46 +438,45 @@ class SpeciesLMWrapper(BaseWrapper):
             weight_sum += w
         outv = agg / max(weight_sum, 1.0)
         return outv.detach().cpu().numpy() if return_numpy else outv
-    
+
     # --- modify acgt_probs() to chunk + stitch ------------------------------------
-        
+
     @torch.no_grad()
-    def acgt_probs(self, seq: str, species_proxy: Optional[str], *, pred_batch_size: int = 128) -> np.ndarray:
+    def acgt_probs(self, seq: str, species_proxy: Optional[str] = None, *, pred_batch_size: int = 128) -> np.ndarray:
         L = len(seq)
         if L == 0:
             return np.zeros((0, 4), dtype=np.float32)
-    
+
         probs_sum = np.zeros((L, 4), dtype=np.float32)
         probs_cnt = np.zeros((L,), dtype=np.float32)
         k = self.k
         kmers_cols = self._gather_vocab_cols  # (Nkmer,)
-    
+
         for s, e in self._iter_seq_windows(seq):
             # tokenize this window
             enc = self._tokenize_seq(seq[s:e], species_proxy, add_special_tokens=True)
             input_ids = enc["input_ids"][0].to(self.device)         # (T,)
             attn = enc["attention_mask"][0].to(self.device)         # (T,)
-    
+
             # count specials flanking the k-mer block
             left_special  = self._count_specials(input_ids, where="left")
             right_special = self._count_specials(input_ids, where="right")
-    
+
             Lw = e - s                                  # bases in this window
             T = int(input_ids.shape[0])
             Ltok = T - left_special - right_special     # k-mer tokens
-    
+
             if Ltok <= 0:
                 continue
-    
+
             # Build masked inputs: one row per base position in the window
-            # More efficient: create all rows at once, then mask in-place
             masked_inputs = input_ids.unsqueeze(0).expand(Lw, -1).clone()  # (Lw, T)
             for p in range(Lw):
                 t_min = max(0, p - (k - 1))
                 t_max = min(p, Ltok - 1)
                 if t_min <= t_max:
                     masked_inputs[p, t_min + left_special:t_max + left_special + 1] = self.mask_id
-    
+
             # forward in batches; fold k-mer probs -> base probs
             window_probs = np.zeros((Lw, 4), dtype=np.float32)
             for b in range(0, masked_inputs.shape[0], pred_batch_size):
@@ -395,7 +486,7 @@ class SpeciesLMWrapper(BaseWrapper):
                 kept   = logits[:, left_special: logits.shape[1] - right_special, :]  # (B, Ltok, V)
                 gathered = kept.index_select(-1, kmers_cols)                     # (B, Ltok, Nkmer)
                 km_probs = torch.softmax(gathered, dim=-1)                       # (B, Ltok, Nk)
-    
+
                 B = km_probs.shape[0]
                 for i in range(B):
                     p = b + i
@@ -413,10 +504,10 @@ class SpeciesLMWrapper(BaseWrapper):
                         prb_accum += sel[j] @ self._prb_filter[o]               # (Nk) @ (Nk,4) -> (4,)
                     prb = prb_accum / (prb_accum.sum() + 1e-9)
                     window_probs[p] = prb.detach().cpu().numpy()
-    
+
             # stitch this window back into full-length arrays
             probs_sum[s:e] += window_probs.astype(np.float32)
             probs_cnt[s:e] += 1.0
-    
+
         probs = probs_sum / np.maximum(probs_cnt[:, None], 1.0)
         return probs.astype(np.float32)
