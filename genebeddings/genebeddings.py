@@ -4724,7 +4724,24 @@ def _detect_base_token_offset(model, sequence: str, **model_kwargs) -> int:
     tokens_probe = torch.as_tensor(tokens_probe).float()
 
     diffs = torch.norm(tokens_orig - tokens_probe, dim=-1)  # (T,)
+    T = tokens_orig.shape[0]
+    n = len(sequence)
+    k = getattr(model, "k", 1)
+    n_tokens_needed = n // k
+
     offset = int(torch.argmax(diffs).item())
+
+    # Validate: offset + n_tokens_needed must fit within T.
+    # On short sequences, attention can cause EOS/padding tokens to shift
+    # more than the mutated base, giving a spurious large offset.
+    if offset + n_tokens_needed > T:
+        # Restrict search to plausible offsets (first few tokens: BOS, CLS, etc.)
+        max_plausible = T - n_tokens_needed
+        if max_plausible < 0:
+            max_plausible = 0
+        diffs_restricted = diffs[: max_plausible + 1]
+        offset = int(torch.argmax(diffs_restricted).item())
+
     return offset
 
 
