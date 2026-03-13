@@ -4527,6 +4527,183 @@ def compute_logodds_dependency_map(
     )
 
 
+def compute_nucleotide_dependency_map(
+    model,
+    sequence: str,
+    positions: Optional[list[int]] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    step: int = 1,
+    symmetrize: bool = True,
+    eps: float = 1e-10,
+    show_progress: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    **model_kwargs,
+) -> DependencyMapResult:
+    """
+    Compute a dependency map using the logit-based scoring from Tomaz Da Silva
+    et al. 2025 (Nature Genetics).
+
+    Unlike ``compute_logodds_dependency_map`` which masks each target position,
+    this method feeds the full (unmasked) mutated sequence through the model
+    and reads out predicted probabilities at **all** positions.  The scoring
+    formula is:
+
+        score(i, j) = max over mutations at i of
+                       max over nucleotides n of
+                       |log2(P_mut(j,n)) - log2(1 - P_mut(j,n))
+                        - log2(P_ref(j,n)) + log2(1 - P_ref(j,n))|
+
+    This is the difference of logits (log-odds) between the mutant and
+    reference sequences, which the paper shows recovers tRNA secondary
+    structure from SpeciesLM, RiNALMo, and other models.
+
+    Parameters
+    ----------
+    model : object
+        Model wrapper with a ``predict_nucleotides(seq, positions,
+        return_dict=True)`` method.
+    sequence : str
+        Reference DNA/RNA sequence.
+    positions : list[int], optional
+        0-indexed positions to analyse. If None, uses *start*/*end*/*step*.
+    symmetrize : bool, optional
+        If True (default), return ``max(D(i,j), D(j,i))``.
+    eps : float, optional
+        Small constant added to probabilities before log to avoid log(0).
+    show_progress : bool, optional
+        Show a tqdm progress bar.
+    **model_kwargs
+        Extra keyword arguments passed through to every
+        ``model.predict_nucleotides()`` call (e.g. ``species_proxy``
+        for SpeciesLM).
+
+    Returns
+    -------
+    DependencyMapResult
+    """
+    if not hasattr(model, "predict_nucleotides"):
+        raise TypeError(
+            f"Model {type(model).__name__} does not have a predict_nucleotides "
+            "method."
+        )
+
+    # ---- Determine positions ----
+    if positions is not None:
+        pos_array = np.array(sorted(positions))
+    else:
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(sequence)
+        pos_array = np.arange(start, end, step)
+
+    n = len(pos_array)
+    if n < 2:
+        raise ValueError("Need at least 2 positions for a dependency map")
+
+    pos_list = pos_array.tolist()
+
+    for p in pos_list:
+        if p < 0 or p >= len(sequence):
+            raise ValueError(
+                f"Position {p} out of bounds for sequence length {len(sequence)}"
+            )
+
+    nucs = ["A", "C", "G", "T"]
+
+    logger.info(
+        "Computing nucleotide dependency map: %d positions (%d model calls)",
+        n, 1 + 3 * n,
+    )
+
+    # ---- Step 1: reference probabilities (one call, NO masking) ----
+    ref_dicts = model.predict_nucleotides(
+        sequence, positions=pos_list, return_dict=True, **model_kwargs
+    )
+    ref_matrix = np.array(
+        [[d[nt] for nt in nucs] for d in ref_dicts]
+    )  # (N, 4)
+
+    # ---- Step 2: perturb each position, read all targets ----
+    D_raw = np.full((n, n), np.nan)
+
+    total_steps = 3 * n
+    step_count = 0
+
+    iterator = range(n)
+    if show_progress:
+        iterator = tqdm(iterator, total=n, desc="Nucleotide dependency map")
+
+    for i_idx in iterator:
+        pos_i = int(pos_array[i_idx])
+        ref_i = sequence[pos_i]
+        alts_i = [nt for nt in nucs if nt != ref_i]
+
+        max_logit_diff_per_j = np.zeros(n)
+
+        for alt in alts_i:
+            if progress_callback:
+                progress_callback(
+                    step_count, total_steps,
+                    f"pos {pos_i}: {ref_i}>{alt}",
+                )
+            step_count += 1
+
+            mutated_seq = sequence[:pos_i] + alt + sequence[pos_i + 1:]
+
+            mut_dicts = model.predict_nucleotides(
+                mutated_seq, positions=pos_list, return_dict=True, **model_kwargs
+            )
+            mut_matrix = np.array(
+                [[d[nt] for nt in nucs] for d in mut_dicts]
+            )  # (N, 4)
+
+            # Add epsilon and renormalize (as in the paper)
+            ref_p = ref_matrix + eps
+            ref_p = ref_p / ref_p.sum(axis=1, keepdims=True)
+            mut_p = mut_matrix + eps
+            mut_p = mut_p / mut_p.sum(axis=1, keepdims=True)
+
+            # Logit-based scoring: log2(p) - log2(1-p)
+            logit_ref = np.log2(ref_p) - np.log2(1.0 - ref_p)
+            logit_mut = np.log2(mut_p) - np.log2(1.0 - mut_p)
+
+            # Difference of logits
+            logit_diff = logit_mut - logit_ref  # (N, 4)
+
+            # Max absolute logit difference across the 4 nucleotides at each target
+            max_abs = np.max(np.abs(logit_diff), axis=1)  # (N,)
+
+            # Keep running max across the 3 mutations at i
+            max_logit_diff_per_j = np.maximum(max_logit_diff_per_j, max_abs)
+
+        D_raw[i_idx, :] = max_logit_diff_per_j
+        D_raw[i_idx, i_idx] = 0.0  # zero diagonal
+
+    # ---- Step 3: symmetrise ----
+    if symmetrize:
+        matrix = np.fmax(D_raw, D_raw.T)
+    else:
+        matrix = D_raw
+
+    np.fill_diagonal(matrix, 0.0)
+
+    logger.info(
+        "Nucleotide dependency map complete: %d positions, %d model calls",
+        n, 1 + 3 * n,
+    )
+
+    return DependencyMapResult(
+        positions=pos_array,
+        matrix=matrix,
+        aggregation="max" if symmetrize else "max_asymmetric",
+        metric="logit_dependency",
+        sequence=sequence,
+        details={"D_asymmetric": D_raw.copy()},
+    )
+
+
 def _detect_base_token_offset(model, sequence: str, **model_kwargs) -> int:
     """
     Detect the token index of the first base in ``pool='tokens'`` output.

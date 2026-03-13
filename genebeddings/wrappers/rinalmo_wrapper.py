@@ -55,8 +55,11 @@ class RiNALMoWrapper(BaseWrapper):
         self.k = 1
 
         # vocab helpers (RiNALMo provides an alphabet)
-        self.tok_to_id: Dict[str,int] = getattr(self.alphabet, "tok_to_idx", {})
-        self.id_to_tok: Dict[int,str] = getattr(self.alphabet, "idx_to_tok", {})
+        # RiNALMo uses "tkn" not "tok" in attribute names
+        self.tok_to_id: Dict[str,int] = getattr(self.alphabet, "tkn_to_idx",
+                                          getattr(self.alphabet, "tok_to_idx", {}))
+        self.id_to_tok: Dict[int,str] = getattr(self.alphabet, "idx_to_tkn",
+                                          getattr(self.alphabet, "idx_to_tok", {}))
 
         self.pad_id = self._discover_pad_id()
         self.mask_id = self._discover_mask_id(allow_none=True)
@@ -305,7 +308,7 @@ class RiNALMoWrapper(BaseWrapper):
         raise RuntimeError("Could not extract RiNALMo logits; LM head not exposed?")
 
     def _discover_pad_id(self) -> Optional[int]:
-        for attr in ("PAD_ID","pad_id","pad"):
+        for attr in ("pad_idx","PAD_ID","pad_id","pad"):
             v = getattr(self.alphabet, attr, None)
             if isinstance(v, int):
                 return v
@@ -315,7 +318,7 @@ class RiNALMoWrapper(BaseWrapper):
         return None
 
     def _discover_mask_id(self, allow_none: bool=False) -> Optional[int]:
-        for attr in ("MASK_ID","mask_id","mask"):
+        for attr in ("mask_idx","MASK_ID","mask_id","mask"):
             v = getattr(self.alphabet, attr, None)
             if isinstance(v, int):
                 return v
