@@ -423,6 +423,12 @@ class EpistasisMetrics:
         Log ratio of observed to expected magnitude:
         log((||v12_obs|| + eps) / (||v12_exp|| + eps)).
         0 = additive, negative = sub-additive, positive = super-additive.
+    cos_obs_exp : float
+        Cosine similarity between v12_obs and v12_exp.
+        1 = same direction (additive), <1 = angular deviation.
+    cos_dist_obs_exp : float
+        Cosine distance (1 - cosine similarity) between v12_obs and v12_exp.
+        0 = perfectly additive direction, higher = more angular epistasis.
     """
 
     len_WT_M1: float
@@ -435,6 +441,8 @@ class EpistasisMetrics:
     cos_exp_to_obs: float
     magnitude_ratio: float
     log_magnitude_ratio: float
+    cos_obs_exp: float
+    cos_dist_obs_exp: float
 
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary for compatibility."""
@@ -449,6 +457,8 @@ class EpistasisMetrics:
             "cos_exp_to_obs": self.cos_exp_to_obs,
             "magnitude_ratio": self.magnitude_ratio,
             "log_magnitude_ratio": self.log_magnitude_ratio,
+            "cos_obs_exp": self.cos_obs_exp,
+            "cos_dist_obs_exp": self.cos_dist_obs_exp,
         }
 
 
@@ -1089,6 +1099,10 @@ class EpistasisGeometry(_GeometryBase):
         magnitude_ratio = a12 / (a12_exp + self.eps)
         log_magnitude_ratio = math.log((a12 + self.eps) / (a12_exp + self.eps))
 
+        # Cosine similarity/distance between observed and expected double-mutant effects
+        cos_obs_exp = _cosine(v12, v12_exp)
+        cos_dist_obs_exp = 1.0 - cos_obs_exp
+
         self._cached_metrics = EpistasisMetrics(
             len_WT_M1=a1,
             len_WT_M2=a2,
@@ -1100,6 +1114,8 @@ class EpistasisGeometry(_GeometryBase):
             cos_exp_to_obs=cos_exp_to_obs,
             magnitude_ratio=magnitude_ratio,
             log_magnitude_ratio=log_magnitude_ratio,
+            cos_obs_exp=cos_obs_exp,
+            cos_dist_obs_exp=cos_dist_obs_exp,
         )
 
         return self._cached_metrics
@@ -3147,6 +3163,8 @@ def add_epistasis_metrics(
         "cos_exp_to_obs",  # Direction indicator: -1=toward WT, +1=away from WT
         "magnitude_ratio",     # Ratio of observed to expected effect
         "log_magnitude_ratio", # Log ratio of observed to expected effect
+        "cos_obs_exp",         # Cosine similarity between observed and expected
+        "cos_dist_obs_exp",    # Cosine distance between observed and expected
     ]
     if cov_inv is not None:
         metric_cols.append("epi_mahal")
