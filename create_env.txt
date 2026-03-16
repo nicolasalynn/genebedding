@@ -1,3 +1,0 @@
-conda create --name dlms --file conda-spec.txt
-conda activate dlms
-pip install -r pip-requirements.txt

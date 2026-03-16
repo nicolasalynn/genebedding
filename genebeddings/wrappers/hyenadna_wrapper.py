@@ -6,9 +6,12 @@
 # not transformers. Models are loaded from HuggingFace LongSafari org.
 
 import json
+import logging
 import os
 import re
 import subprocess
+
+logger = logging.getLogger(__name__)
 from typing import Dict, Optional, List, Union, Literal
 
 import numpy as np
@@ -229,7 +232,7 @@ class HyenaDNAWrapper(BaseWrapper):
             hf_url = f'https://huggingface.co/LongSafari/{model_name}'
             os.makedirs(self.cache_dir, exist_ok=True)
 
-            print(f"Downloading HyenaDNA model from {hf_url}...")
+            logger.info("Downloading HyenaDNA model from %s...", hf_url)
             command = f'cd {self.cache_dir} && git lfs install && git clone {hf_url}'
             result = subprocess.run(command, shell=True, capture_output=True, text=True)
             if result.returncode != 0:
@@ -282,7 +285,7 @@ class HyenaDNAWrapper(BaseWrapper):
         )
         model.load_state_dict(state_dict)
 
-        print(f"Loaded HyenaDNA model: {model_name}")
+        logger.info("Loaded HyenaDNA model: %s", model_name)
         return model
 
     def __repr__(self) -> str:

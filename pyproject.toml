@@ -25,7 +25,7 @@ nt = ["transformers>=4.30"]
 dnabert = ["transformers>=4.30"]
 caduceus = ["transformers>=4.30"]
 specieslm = ["transformers>=4.30"]
-genomenet = ["transformers>=4.30"]
+
 rinalmo = ["rinalmo"]
 splicebert = ["transformers>=4.30"]
 
@@ -45,9 +45,6 @@ alphagenome = [
 
 # CNN models
 spliceai = ["spliceai-pytorch"]
-
-# MSA models
-gpn-msa = ["gpn"]
 
 # Specialized models
 mutbert = ["transformers>=4.30"]

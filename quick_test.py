@@ -52,7 +52,7 @@ def test_wrapper_imports():
         'ConvNovaWrapper',
         'DNABERTWrapper',
         'Evo2Wrapper',
-        'GPNMSAWrapper',
+
         'HyenaDNAWrapper',
         'MutBERTWrapper',
         'NTWrapper',
@@ -88,7 +88,7 @@ def test_wrapper_inheritance():
         'ConvNovaWrapper',
         'DNABERTWrapper',
         'Evo2Wrapper',
-        'GPNMSAWrapper',
+
         'HyenaDNAWrapper',
         'MutBERTWrapper',
         'NTWrapper',

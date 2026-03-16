@@ -41,7 +41,7 @@ __all__ = [
     "ConvNovaWrapper",
     "DNABERTWrapper",
     "Evo2Wrapper",
-    "GPNMSAWrapper",
+
     "HyenaDNAWrapper",
     "MutBERTWrapper",
     "NTWrapper",
@@ -63,7 +63,7 @@ _WRAPPER_MODULES = {
     "ConvNovaWrapper": "convnova_wrapper",
     "DNABERTWrapper": "dnabert_wrapper",
     "Evo2Wrapper": "evo2_wrapper",
-    "GPNMSAWrapper": "gpn_msa_wrapper",
+
     "HyenaDNAWrapper": "hyenadna_wrapper",
     "MutBERTWrapper": "mutbert_wrapper",
     "NTWrapper": "nt_wrapper",

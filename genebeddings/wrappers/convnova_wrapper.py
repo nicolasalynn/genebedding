@@ -604,18 +604,7 @@ if __name__ == "__main__":
 
     seq = "ACGT" * 256
 
-    # Test embedding
-    E = model.embed(seq, pool="tokens")          # (L, H)
-    print(f"Token embeddings shape: {E.shape}")
-
-    # Test logits
-    logits = model.logits_for_seq(seq)           # (L, 5)
-    print(f"Logits shape: {logits.shape}")
-
-    # Test position-specific prediction
-    pos_vec = model.get_position_base_logits(seq=seq, token_index=100)  # (5,)
-    print(f"Position logits shape: {pos_vec.shape}")
-
-
-
+    E = model.embed(seq, pool="tokens")
+    logits = model.logits_for_seq(seq)
+    pos_vec = model.get_position_base_logits(seq=seq, token_index=100)
 
