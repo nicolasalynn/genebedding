@@ -17,6 +17,11 @@ Directory layout:
       fas_analysis/, kras/, mst1r_analysis/, mrna_folding/, ...
         {model_key}.db
         {model_key}_annotated.parquet
+      clinvar/               # ClinVar single-variant DBs (process_clinvar)
+        {model_key}.db
+        {model_key}_annotated.parquet
+      sheets/
+        clinvar_metrics_{model_key}.parquet
 """
 
 import os

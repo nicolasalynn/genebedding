@@ -120,6 +120,17 @@ SOURCE_MODEL_MAP: Optional[Dict[str, Sequence[str]]] = None
 SOURCE_COL = "source"
 ID_COL = "epistasis_id"
 
+# ---------------------------------------------------------------------------
+# ClinVar single-variant pipeline config
+# ---------------------------------------------------------------------------
+# Bundled ClinVar variants file (individual mutations, not epistasis pairs).
+# Format: source, label, mut_id (GENE:CHROM:POS:REF:ALT[:STRAND])
+# Embeddings stored under: {embeddings_dir()}/clinvar/{model_key}.db
+CLINVAR_ID_COL = "mut_id"
+CLINVAR_SOURCE_NAME = "clinvar"
+_BUNDLED_CLINVAR_PATH = Path(__file__).resolve().parent / "data" / "clinvar_variants.tsv"
+BUNDLED_CLINVAR_PATH: Path = _BUNDLED_CLINVAR_PATH
+
 # Source names exactly as they appear in the data file (from all_pairs_combined.tsv).
 # Rows with source in COV_INV_SOURCE_NAMES are used to fit cov_inv (Mahalanobis background).
 COV_INV_SOURCE_NAMES: List[str] = ["okgp_chr12"]
