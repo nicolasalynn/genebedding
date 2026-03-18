@@ -101,7 +101,16 @@ def cmd_generate(args):
 
     from seqmat import SeqMat
 
+    BASES = list("ACGT")
+
+    # Mutation regime: for each window, generate WT + variants with 1..max_muts mutations
+    max_muts = args.max_mutations
+    variants_per_window = args.variants_per_window
+    logger.info("Mutation regime: up to %d mutations, %d variants per window",
+                max_muts, variants_per_window)
+
     i = n_existing
+    window_idx = i // (1 + variants_per_window)  # approximate resume
     failures = 0
     while i < args.n_sequences:
         chrom_idx = rng.choice(len(chroms), p=chrom_weights)
@@ -114,18 +123,71 @@ def cmd_generate(args):
             if seq.count("N") > args.seq_length * 0.1:
                 continue
 
-            emb = teacher.embed(seq, pool="mean", return_numpy=True)
-            tokens = np.array([token_map.get(c, 4) for c in seq], dtype=np.int8)
+            # ---- Wild-type embedding ----
+            emb_wt = teacher.embed(seq, pool="mean", return_numpy=True)
+            tokens_wt = np.array([token_map.get(c, 4) for c in seq], dtype=np.int8)
 
             np.savez(cache_dir / f"s_{i:07d}.npz",
-                     tokens=tokens,
-                     embedding=emb.astype(np.float32),
-                     seq_len=np.int32(len(seq)))
-
+                     tokens=tokens_wt,
+                     embedding=emb_wt.astype(np.float32),
+                     seq_len=np.int32(len(seq)),
+                     n_mutations=np.int32(0),
+                     window_id=np.int32(window_idx))
             i += 1
+
+            # ---- Mutant embeddings ----
+            # For each variant: pick random number of mutations (1..max_muts),
+            # at random positions, with random alt alleles.
+            # This teaches the student to model the full perturbation landscape:
+            # single mutations, double mutations, and higher-order combinations.
+            seq_list = list(seq)
+            valid_positions = [p for p in range(len(seq)) if seq[p] in BASES]
+
+            for v in range(variants_per_window):
+                if i >= args.n_sequences:
+                    break
+
+                # Random number of mutations: geometric distribution favoring fewer
+                # P(k) ∝ 0.5^k, so singles are most common, higher-order are rarer
+                n_muts = min(
+                    rng.geometric(p=0.4),  # mean ~2.5 mutations
+                    max_muts,
+                    len(valid_positions),
+                )
+
+                # Pick random positions
+                mut_positions = rng.choice(valid_positions, size=n_muts, replace=False)
+                mut_positions.sort()
+
+                # Apply mutations
+                mut_seq = seq_list.copy()
+                mut_info = []
+                for pos in mut_positions:
+                    ref = mut_seq[pos]
+                    alt = rng.choice([b for b in BASES if b != ref])
+                    mut_seq[pos] = alt
+                    mut_info.append((int(pos), ref, alt))
+
+                mut_str = "".join(mut_seq)
+                emb_mut = teacher.embed(mut_str, pool="mean", return_numpy=True)
+                tokens_mut = np.array([token_map.get(c, 4) for c in mut_str], dtype=np.int8)
+
+                # Store mutation positions as array for potential use in training
+                mut_positions_arr = np.array([m[0] for m in mut_info], dtype=np.int32)
+
+                np.savez(cache_dir / f"s_{i:07d}.npz",
+                         tokens=tokens_mut,
+                         embedding=emb_mut.astype(np.float32),
+                         seq_len=np.int32(len(mut_str)),
+                         n_mutations=np.int32(n_muts),
+                         mutation_positions=mut_positions_arr,
+                         window_id=np.int32(window_idx))
+                i += 1
+
+            window_idx += 1
             failures = 0
             if i % 1000 == 0:
-                logger.info("  %d/%d cached", i, args.n_sequences)
+                logger.info("  %d/%d cached (%d windows)", i, args.n_sequences, window_idx)
 
         except Exception as e:
             failures += 1
@@ -337,8 +399,13 @@ def main():
     gen.add_argument("--teacher", required=True)
     gen.add_argument("--fasta", required=True)
     gen.add_argument("--cache-dir", required=True)
-    gen.add_argument("--n-sequences", type=int, default=500_000)
-    gen.add_argument("--seq-length", type=int, default=8192)
+    gen.add_argument("--n-sequences", type=int, default=500_000,
+                     help="Total sequences (WT + all variants)")
+    gen.add_argument("--seq-length", type=int, default=15_000)
+    gen.add_argument("--max-mutations", type=int, default=10,
+                     help="Max mutations per variant (actual count drawn from geometric dist)")
+    gen.add_argument("--variants-per-window", type=int, default=6,
+                     help="Number of mutant variants per WT window (so 1 WT + N variants per window)")
     gen.add_argument("--seed", type=int, default=42)
 
     # Train
