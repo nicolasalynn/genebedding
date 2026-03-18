@@ -322,12 +322,11 @@ def _build_model(model_key: str, init_spec: str, spliceai_model_dir: Optional[st
                 "SpliceAI/OpenSpliceAI model_dir required. Set OPENSPLICEAI_MODEL_DIR or pass spliceai_model_dir."
             )
         return SpliceAIWrapper(model="10k", model_dir=model_dir)
-    if init_spec == "ntv3_100m":
+    if init_spec in ("ntv3_100m", "ntv3_650m"):
+        import torch as _torch
         from genebeddings.wrappers import NTv3Wrapper
-        return NTv3Wrapper(model="100m-pre", dtype=torch.bfloat16)
-    if init_spec == "ntv3_650m":
-        from genebeddings.wrappers import NTv3Wrapper
-        return NTv3Wrapper(model="650m-pre", dtype=torch.bfloat16)
+        model_name = "100m-pre" if init_spec == "ntv3_100m" else "650m-pre"
+        return NTv3Wrapper(model=model_name, dtype=_torch.bfloat16)
     if init_spec == "evo2":
         try:
             from genebeddings.wrappers import Evo2Wrapper
