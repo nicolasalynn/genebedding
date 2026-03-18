@@ -77,7 +77,8 @@ FULL_MODEL_CONFIG: Dict[str, Tuple[int, str]] = {
     "evo2": (4_000, "evo2"),
     "spliceai": (10_000, "spliceai"),
     "dnabert": (512, "default"),
-    "ntv3_100m": (4_000, "ntv3_100m"),  # 100M model fits on A100; 650M OOMs
+    "ntv3_100m": (4_000, "ntv3_100m"),  # 100M pre-trained
+    "ntv3_100m_post": (4_000, "ntv3_100m_post"),  # 100M post-trained (track-informed embeddings)
 }
 
 # Default subset for quick runs (override with model_keys= or env_profile=)
@@ -327,6 +328,10 @@ def _build_model(model_key: str, init_spec: str, spliceai_model_dir: Optional[st
         from genebeddings.wrappers import NTv3Wrapper
         model_name = "100m-pre" if init_spec == "ntv3_100m" else "650m-pre"
         return NTv3Wrapper(model=model_name, dtype=_torch.float32)
+    if init_spec == "ntv3_100m_post":
+        import torch as _torch
+        from genebeddings.wrappers import NTv3PostWrapper
+        return NTv3PostWrapper(model="100m-post", dtype=_torch.float32)
     if init_spec == "evo2":
         try:
             from genebeddings.wrappers import Evo2Wrapper
