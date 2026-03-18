@@ -1,273 +1,225 @@
 """
-Distill any genebeddings teacher model into a JAX student.
+Online distillation: stream teacher (PyTorch) → student (JAX).
 
-The teacher can be any PyTorch model in our wrapper system. Teacher
-inference runs in PyTorch, embeddings are cached to disk, then a JAX
-student is trained to match them.
+No caching — teacher and student run simultaneously. Teacher produces
+full token-level embeddings (B, L, D), student learns to match them.
 
-Student architecture: convolutional U-Net in Haiku (same family as
-NTv3/AlphaGenome). Configurable depth, width, and whether to include
-transformer layers in the bottleneck.
+Mutation-aware: each batch contains a genomic window + variants with
+1-5 mutations. The student must learn how the teacher's token-level
+representations change under perturbation.
 
 Usage:
-    # Step 1: Cache teacher embeddings (PyTorch, GPU)
-    python -m scripts.distillation.distill_jax generate \
+    python -m scripts.distillation.distill_jax \
         --teacher borzoi \
         --fasta /path/to/hg38.fa \
-        --cache-dir /path/to/cache \
-        --n-sequences 500000 \
-        --seq-length 8192
-
-    # Step 2: Train JAX student (JAX, GPU/TPU)
-    python -m scripts.distillation.distill_jax train \
-        --cache-dir /path/to/cache \
         --output-dir /path/to/student \
+        --hf-repo nicolasalynn/distilled-borzoi \
+        --seq-length 15000 \
         --hidden-dim 256 \
-        --n-downsamples 5 \
-        --n-transformer-layers 4 \
-        --epochs 30 \
-        --batch-size 64
+        --epochs 30
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+BASES = list("ACGT")
+
 
 # =========================================================================
-# Step 1: Generate teacher embeddings (PyTorch side)
+# Sequence sampler — generates WT + mutant batches from reference FASTA
 # =========================================================================
-def cmd_generate(args):
-    """Cache teacher embeddings to disk using PyTorch wrappers."""
-    import torch
+class GenomicWindowSampler:
+    """Sample random genomic windows + mutant variants from a FASTA."""
 
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, fasta_path, seq_length, max_mutations=5,
+                 variants_per_window=6, seed=42):
+        import pysam
+        self.seq_length = seq_length
+        self.max_mutations = max_mutations
+        self.variants_per_window = variants_per_window
+        self.rng = np.random.RandomState(seed)
+        self.token_map = {c: i for i, c in enumerate("ACGTN")}
 
-    # Check existing
-    existing = sorted(cache_dir.glob("*.npz"))
-    n_existing = len(existing)
-    if n_existing >= args.n_sequences:
-        logger.info("Already cached %d embeddings, skipping.", n_existing)
-        return
+        fasta = pysam.FastaFile(fasta_path)
+        self.chroms = [(name, length) for name, length in
+                       zip(fasta.references, fasta.lengths)
+                       if name.startswith("chr") and name[3:].isdigit()
+                       and length > seq_length * 2]
+        weights = np.array([l for _, l in self.chroms], dtype=float)
+        self.chrom_weights = weights / weights.sum()
+        self.fasta_path = fasta_path
+        fasta.close()
 
-    # Load teacher
-    root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root))
-    from notebooks.processing.process_epistasis import FULL_MODEL_CONFIG, _build_model
+    def _tokenize(self, seq):
+        return np.array([self.token_map.get(c, 4) for c in seq], dtype=np.int32)
 
-    if args.teacher not in FULL_MODEL_CONFIG:
-        raise ValueError(f"Unknown teacher: {args.teacher}. "
-                         f"Available: {sorted(FULL_MODEL_CONFIG.keys())}")
+    def sample_batch(self, batch_size):
+        """Sample batch_size windows, each with WT + variants.
 
-    _, init_spec = FULL_MODEL_CONFIG[args.teacher]
-    teacher = _build_model(args.teacher, init_spec)
-    if teacher is None:
-        raise RuntimeError(f"Failed to load teacher: {args.teacher}")
+        Returns:
+            tokens: (B * (1 + V), L) int32 — all sequences tokenized
+            n_per_window: int — 1 + variants_per_window
+            seq_lengths: (B * (1 + V),) int32
+        """
+        from seqmat import SeqMat
 
-    # Sample genomic windows
-    import pysam
-    fasta = pysam.FastaFile(args.fasta)
-    chroms = [(name, length) for name, length in
-              zip(fasta.references, fasta.lengths)
-              if name.startswith("chr") and name[3:].isdigit() and length > args.seq_length * 2]
-    chrom_weights = np.array([l for _, l in chroms], dtype=float)
-    chrom_weights /= chrom_weights.sum()
-    fasta.close()
+        all_tokens = []
+        all_lengths = []
+        n_per = 1 + self.variants_per_window
 
-    rng = np.random.RandomState(args.seed)
-    token_map = {c: i for i, c in enumerate("ACGTN")}
+        for _ in range(batch_size):
+            # Sample window
+            for _attempt in range(20):
+                ci = self.rng.choice(len(self.chroms), p=self.chrom_weights)
+                chrom_name, chrom_len = self.chroms[ci]
+                start = self.rng.randint(0, chrom_len - self.seq_length)
+                try:
+                    sm = SeqMat.from_fasta("hg38", chrom_name,
+                                           start, start + self.seq_length - 1)
+                    seq = sm.seq.upper()
+                    if seq.count("N") < self.seq_length * 0.1:
+                        break
+                except Exception:
+                    continue
+            else:
+                # Fallback: random sequence
+                seq = "".join(self.rng.choice(BASES, size=self.seq_length))
 
-    # Save metadata on first run
-    meta_path = cache_dir / "metadata.npz"
-    if not meta_path.exists():
-        # Get embed dim from a test sequence
-        test_seq = "ACGT" * (args.seq_length // 4)
-        test_emb = teacher.embed(test_seq, pool="mean", return_numpy=True)
-        np.savez(meta_path,
-                 teacher=args.teacher,
-                 embed_dim=test_emb.shape[0],
-                 seq_length=args.seq_length,
-                 pool="mean")
-        logger.info("Teacher %s: embed_dim=%d", args.teacher, test_emb.shape[0])
+            valid_pos = [p for p in range(len(seq)) if seq[p] in BASES]
 
-    from seqmat import SeqMat
+            # WT
+            all_tokens.append(self._tokenize(seq))
+            all_lengths.append(len(seq))
 
-    BASES = list("ACGT")
-
-    # Mutation regime: for each window, generate WT + variants with 1..max_muts mutations
-    max_muts = args.max_mutations
-    variants_per_window = args.variants_per_window
-    logger.info("Mutation regime: up to %d mutations, %d variants per window",
-                max_muts, variants_per_window)
-
-    i = n_existing
-    window_idx = i // (1 + variants_per_window)  # approximate resume
-    failures = 0
-    while i < args.n_sequences:
-        chrom_idx = rng.choice(len(chroms), p=chrom_weights)
-        chrom_name, chrom_len = chroms[chrom_idx]
-        start = rng.randint(0, chrom_len - args.seq_length)
-
-        try:
-            sm = SeqMat.from_fasta("hg38", chrom_name, start, start + args.seq_length - 1)
-            seq = sm.seq.upper()
-            if seq.count("N") > args.seq_length * 0.1:
-                continue
-
-            # ---- Wild-type embedding ----
-            emb_wt = teacher.embed(seq, pool="mean", return_numpy=True)
-            tokens_wt = np.array([token_map.get(c, 4) for c in seq], dtype=np.int8)
-
-            np.savez(cache_dir / f"s_{i:07d}.npz",
-                     tokens=tokens_wt,
-                     embedding=emb_wt.astype(np.float32),
-                     seq_len=np.int32(len(seq)),
-                     n_mutations=np.int32(0),
-                     window_id=np.int32(window_idx))
-            i += 1
-
-            # ---- Mutant embeddings ----
-            # For each variant: pick random number of mutations (1..max_muts),
-            # at random positions, with random alt alleles.
-            # This teaches the student to model the full perturbation landscape:
-            # single mutations, double mutations, and higher-order combinations.
+            # Variants
             seq_list = list(seq)
-            valid_positions = [p for p in range(len(seq)) if seq[p] in BASES]
-
-            for v in range(variants_per_window):
-                if i >= args.n_sequences:
-                    break
-
-                # Random number of mutations: geometric distribution favoring fewer
-                # P(k) ∝ 0.5^k, so singles are most common, higher-order are rarer
+            for _ in range(self.variants_per_window):
                 n_muts = min(
-                    rng.geometric(p=0.4),  # mean ~2.5 mutations
-                    max_muts,
-                    len(valid_positions),
+                    self.rng.geometric(p=0.4),
+                    self.max_mutations,
+                    len(valid_pos),
                 )
-
-                # Pick random positions
-                mut_positions = rng.choice(valid_positions, size=n_muts, replace=False)
-                mut_positions.sort()
-
-                # Apply mutations
+                positions = self.rng.choice(valid_pos, size=n_muts, replace=False)
                 mut_seq = seq_list.copy()
-                mut_info = []
-                for pos in mut_positions:
+                for pos in positions:
                     ref = mut_seq[pos]
-                    alt = rng.choice([b for b in BASES if b != ref])
+                    alt = self.rng.choice([b for b in BASES if b != ref])
                     mut_seq[pos] = alt
-                    mut_info.append((int(pos), ref, alt))
+                all_tokens.append(self._tokenize("".join(mut_seq)))
+                all_lengths.append(len(seq))
 
-                mut_str = "".join(mut_seq)
-                emb_mut = teacher.embed(mut_str, pool="mean", return_numpy=True)
-                tokens_mut = np.array([token_map.get(c, 4) for c in mut_str], dtype=np.int8)
-
-                # Store mutation positions as array for potential use in training
-                mut_positions_arr = np.array([m[0] for m in mut_info], dtype=np.int32)
-
-                np.savez(cache_dir / f"s_{i:07d}.npz",
-                         tokens=tokens_mut,
-                         embedding=emb_mut.astype(np.float32),
-                         seq_len=np.int32(len(mut_str)),
-                         n_mutations=np.int32(n_muts),
-                         mutation_positions=mut_positions_arr,
-                         window_id=np.int32(window_idx))
-                i += 1
-
-            window_idx += 1
-            failures = 0
-            if i % 1000 == 0:
-                logger.info("  %d/%d cached (%d windows)", i, args.n_sequences, window_idx)
-
-        except Exception as e:
-            failures += 1
-            if failures > 100:
-                logger.error("Too many failures, aborting.")
-                break
-            continue
-
-    logger.info("Done: %d embeddings cached to %s", i, cache_dir)
+        tokens = np.stack(all_tokens)  # (B * n_per, L)
+        lengths = np.array(all_lengths, dtype=np.int32)
+        return tokens, n_per, lengths
 
 
 # =========================================================================
-# Step 2: JAX student model (Haiku)
+# Teacher wrapper — extracts full token embeddings via PyTorch
 # =========================================================================
-def cmd_train(args):
-    """Train JAX student to match cached teacher embeddings."""
+class TeacherExtractor:
+    """Run teacher model, return full token-level hidden states as numpy."""
+
+    def __init__(self, teacher_key):
+        import torch
+        root = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(root))
+        from notebooks.processing.process_epistasis import FULL_MODEL_CONFIG, _build_model
+
+        if teacher_key not in FULL_MODEL_CONFIG:
+            raise ValueError(f"Unknown teacher: {teacher_key}")
+
+        _, init_spec = FULL_MODEL_CONFIG[teacher_key]
+        self.model = _build_model(teacher_key, init_spec)
+        if self.model is None:
+            raise RuntimeError(f"Failed to load: {teacher_key}")
+
+        self.teacher_key = teacher_key
+
+        # Get embedding dimension
+        test_emb = self.model.embed("ACGT" * 100, pool="tokens", return_numpy=True)
+        self.embed_dim = test_emb.shape[-1]
+        logger.info("Teacher %s: embed_dim=%d", teacher_key, self.embed_dim)
+
+    def get_token_embeddings(self, sequences, seq_lengths):
+        """Get full token embeddings for a batch of sequences.
+
+        Args:
+            sequences: list of str or (B, L) token array
+            seq_lengths: (B,) actual lengths
+
+        Returns:
+            embeddings: (B, max_L, D) numpy float32
+        """
+        import torch
+
+        if isinstance(sequences, np.ndarray):
+            # Convert token IDs back to sequences
+            id_to_char = {0: "A", 1: "C", 2: "G", 3: "T", 4: "N"}
+            str_seqs = []
+            for i in range(len(sequences)):
+                L = int(seq_lengths[i])
+                chars = [id_to_char.get(int(t), "N") for t in sequences[i, :L]]
+                str_seqs.append("".join(chars))
+        else:
+            str_seqs = sequences
+
+        # Run teacher one sequence at a time (safest for variable architectures)
+        all_embs = []
+        max_L = max(seq_lengths)
+        for seq in str_seqs:
+            emb = self.model.embed(seq, pool="tokens", return_numpy=True)
+            # emb shape: (L_tokens, D) — may differ from input length for k-mer models
+            if emb.ndim == 1:
+                emb = emb[np.newaxis, :]  # (1, D)
+            # Pad to max_L
+            if emb.shape[0] < max_L:
+                pad = np.zeros((max_L - emb.shape[0], emb.shape[-1]), dtype=np.float32)
+                emb = np.concatenate([emb, pad], axis=0)
+            elif emb.shape[0] > max_L:
+                emb = emb[:max_L]
+            all_embs.append(emb)
+
+        return np.stack(all_embs).astype(np.float32)  # (B, max_L, D)
+
+
+# =========================================================================
+# JAX Student model
+# =========================================================================
+def build_student(hidden_dim, n_downsamples, n_transformer_layers, embed_dim,
+                  seq_length):
+    """Build Haiku student model that outputs (B, L, embed_dim) token embeddings."""
     import jax
     import jax.numpy as jnp
     import haiku as hk
-    import optax
-
-    cache_dir = Path(args.cache_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load metadata
-    meta = np.load(cache_dir / "metadata.npz")
-    embed_dim = int(meta["embed_dim"])
-    seq_length = int(meta["seq_length"])
-    teacher_name = str(meta["teacher"])
-    logger.info("Teacher: %s, embed_dim=%d, seq_length=%d",
-                teacher_name, embed_dim, seq_length)
-
-    # Load all cached embeddings into memory
-    files = sorted(cache_dir.glob("s_*.npz"))
-    logger.info("Loading %d cached samples...", len(files))
-
-    all_tokens = []
-    all_embeddings = []
-    for f in files:
-        data = np.load(f)
-        all_tokens.append(data["tokens"])
-        all_embeddings.append(data["embedding"])
-
-    all_tokens = np.stack(all_tokens)        # (N, L)
-    all_embeddings = np.stack(all_embeddings)  # (N, D)
-    n_samples = len(all_tokens)
-    logger.info("Loaded %d samples: tokens %s, embeddings %s",
-                n_samples, all_tokens.shape, all_embeddings.shape)
-
-    # -------------------------------------------------------------------
-    # Student model definition (Haiku)
-    # -------------------------------------------------------------------
-    hidden_dim = args.hidden_dim
-    n_down = args.n_downsamples
-    n_transformer = args.n_transformer_layers
 
     def student_fn(tokens):
-        """tokens: (B, L) int -> embedding: (B, embed_dim)"""
         B, L = tokens.shape
 
-        # Token embedding
         x = hk.Embed(vocab_size=5, embed_dim=hidden_dim)(tokens)  # (B, L, H)
 
-        # Downsampling conv tower with skip connections
+        # Downsample tower
         skips = []
-        for i in range(n_down):
+        for i in range(n_downsamples):
             x = hk.Conv1D(hidden_dim, kernel_shape=7, padding="SAME",
                           name=f"down_conv_{i}")(x)
             x = jax.nn.gelu(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
                              name=f"down_ln_{i}")(x)
             skips.append(x)
-            # Downsample by 2 via strided conv
             x = hk.Conv1D(hidden_dim, kernel_shape=2, stride=2, padding="VALID",
                           name=f"down_stride_{i}")(x)
 
-        # Bottleneck: optional transformer layers
-        for i in range(n_transformer):
-            # Self-attention
+        # Transformer bottleneck
+        for i in range(n_transformer_layers):
             residual = x
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
                              name=f"attn_ln_{i}")(x)
@@ -279,7 +231,6 @@ def cmd_train(args):
             )(x, x, x)
             x = x + residual
 
-            # FFN
             residual = x
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
                              name=f"ffn_ln_{i}")(x)
@@ -288,14 +239,11 @@ def cmd_train(args):
             x = hk.Linear(hidden_dim, name=f"ffn_down_{i}")(x)
             x = x + residual
 
-        # Upsampling conv tower
-        for i in range(n_down - 1, -1, -1):
-            # Upsample by 2 via repeat
+        # Upsample tower
+        for i in range(n_downsamples - 1, -1, -1):
             x = jnp.repeat(x, 2, axis=1)
-            # Trim to match skip size
             skip = skips[i]
             x = x[:, :skip.shape[1], :]
-            # Add skip connection
             x = x + skip
             x = hk.Conv1D(hidden_dim, kernel_shape=7, padding="SAME",
                           name=f"up_conv_{i}")(x)
@@ -303,255 +251,246 @@ def cmd_train(args):
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
                              name=f"up_ln_{i}")(x)
 
-        # Mean pool -> projection
-        x = jnp.mean(x, axis=1)  # (B, H)
-        x = hk.Linear(embed_dim, name="projection")(x)
+        # Project to teacher's embedding dim — FULL token-level output
+        x = hk.Linear(embed_dim, name="projection")(x)  # (B, L, D)
         return x
 
-    # -------------------------------------------------------------------
-    # Init
-    # -------------------------------------------------------------------
-    model = hk.without_apply_rng(hk.transform(student_fn))
+    return hk.without_apply_rng(hk.transform(student_fn))
+
+
+# =========================================================================
+# Training
+# =========================================================================
+def train(args):
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Teacher
+    teacher = TeacherExtractor(args.teacher)
+    embed_dim = teacher.embed_dim
+
+    # Sampler
+    sampler = GenomicWindowSampler(
+        args.fasta, args.seq_length,
+        max_mutations=args.max_mutations,
+        variants_per_window=args.variants_per_window,
+        seed=args.seed,
+    )
+
+    # Student
+    model = build_student(
+        args.hidden_dim, args.n_downsamples,
+        args.n_transformer_layers, embed_dim, args.seq_length,
+    )
 
     rng_key = jax.random.PRNGKey(args.seed)
-    dummy_tokens = jnp.zeros((1, seq_length), dtype=jnp.int32)
-    params = model.init(rng_key, dummy_tokens)
+    # Pad seq_length to multiple of 2^n_downsamples
+    pad_mult = 2 ** args.n_downsamples
+    padded_len = ((args.seq_length + pad_mult - 1) // pad_mult) * pad_mult
+    dummy = jnp.zeros((1, padded_len), dtype=jnp.int32)
+    params = model.init(rng_key, dummy)
 
     n_params = sum(x.size for x in jax.tree.leaves(params))
-    logger.info("Student: %d parameters (%.1fM)", n_params, n_params / 1e6)
+    logger.info("Student: %d params (%.1fM), teacher embed_dim=%d",
+                n_params, n_params / 1e6, embed_dim)
 
     # Optimizer
-    steps_per_epoch = n_samples // args.batch_size
+    steps_per_epoch = args.steps_per_epoch
     total_steps = args.epochs * steps_per_epoch
-    schedule = optax.cosine_decay_schedule(
-        init_value=args.lr,
-        decay_steps=total_steps,
-    )
+    schedule = optax.cosine_decay_schedule(init_value=args.lr, decay_steps=total_steps)
     optimizer = optax.adamw(learning_rate=schedule, weight_decay=0.01)
     opt_state = optimizer.init(params)
 
-    # -------------------------------------------------------------------
-    # HuggingFace Hub setup
-    # -------------------------------------------------------------------
-    hf_repo = getattr(args, "hf_repo", None)
+    # HuggingFace setup
     hf_api = None
-    if hf_repo:
+    if args.hf_repo:
         try:
             from huggingface_hub import HfApi, create_repo
             hf_api = HfApi()
-            create_repo(hf_repo, exist_ok=True, repo_type="model")
-            logger.info("HuggingFace repo: %s", hf_repo)
+            create_repo(args.hf_repo, exist_ok=True, repo_type="model")
 
-            # Push initial model card
-            model_card = f"""---
-tags:
-  - genomics
-  - distillation
-  - jax
-  - dna-language-model
+            card = f"""---
+tags: [genomics, distillation, jax, dna-language-model]
 license: apache-2.0
 ---
-
-# Distilled Genomic Foundation Model
-
-Distilled from **{teacher_name}** using genebeddings distillation framework.
-
-## Architecture
-- **Type**: U-Net (conv downsample + transformer bottleneck + conv upsample)
-- **Parameters**: {n_params:,} ({n_params/1e6:.1f}M)
-- **Hidden dim**: {hidden_dim}
-- **Downsamples**: {n_down} (sequence compressed {2**n_down}x)
-- **Transformer layers**: {n_transformer}
-- **Input**: DNA sequence up to {seq_length:,} bp
-- **Output**: {embed_dim}-dim embedding (mean-pooled)
-
-## Training
-- **Teacher**: {teacher_name}
-- **Framework**: JAX/Haiku
-- **Data**: {n_samples:,} sequences (WT + mutant variants from hg38)
-- **Loss**: MSE on teacher embeddings
-- **Mutation-aware**: trained on WT, single, double, and multi-mutant sequences
-
-## Usage
-```python
-# Load and use (requires JAX + Haiku)
-import jax, haiku as hk, numpy as np
-params = np.load("best_params.npz")
-config = np.load("config.npz")
-```
+# Distilled {args.teacher}
+- **Student**: {n_params:,} params ({n_params/1e6:.1f}M) U-Net (Haiku/JAX)
+- **Teacher**: {args.teacher} ({embed_dim}d embeddings)
+- **Training**: Online distillation on full token-level embeddings
+- **Data**: Streaming from hg38, WT + 1-{args.max_mutations} mutation variants
+- **Context**: {args.seq_length:,} bp
 """
             card_path = output_dir / "README.md"
-            card_path.write_text(model_card)
-            hf_api.upload_file(
-                path_or_fileobj=str(card_path),
-                path_in_repo="README.md",
-                repo_id=hf_repo,
-                commit_message="Initial model card",
-            )
+            card_path.write_text(card)
+            hf_api.upload_file(path_or_fileobj=str(card_path),
+                               path_in_repo="README.md", repo_id=args.hf_repo,
+                               commit_message="Init")
+            logger.info("HF repo: %s", args.hf_repo)
         except Exception as e:
-            logger.warning("HuggingFace Hub setup failed: %s. Training without HF.", e)
+            logger.warning("HF setup failed: %s", e)
             hf_api = None
 
-    # -------------------------------------------------------------------
-    # Training
-    # -------------------------------------------------------------------
+    # JIT training step
     @jax.jit
-    def train_step(params, opt_state, batch_tokens, batch_targets):
+    def train_step(params, opt_state, student_tokens, teacher_embs, mask):
         def loss_fn(params):
-            pred = model.apply(params, batch_tokens)
-            return jnp.mean((pred - batch_targets) ** 2)
+            pred = model.apply(params, student_tokens)  # (B, L, D)
+            # MSE only on non-padded positions
+            diff = (pred - teacher_embs) ** 2  # (B, L, D)
+            # mask: (B, L) — 1 for real, 0 for pad
+            diff = diff * mask[:, :, None]
+            return diff.sum() / (mask.sum() * embed_dim + 1e-10)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-        updates, opt_state_new = optimizer.update(grads, opt_state, params)
-        params_new = optax.apply_updates(params, updates)
-        return params_new, opt_state_new, loss
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss
 
-    rng = np.random.RandomState(args.seed)
+    # Training loop
+    log_entries = []
     best_loss = float("inf")
     global_step = 0
 
     for epoch in range(args.epochs):
-        perm = rng.permutation(n_samples)
         total_loss = 0.0
-        n_batches = 0
+        n_steps = 0
 
-        for start in range(0, n_samples - args.batch_size, args.batch_size):
-            idx = perm[start:start + args.batch_size]
-            batch_tok = jnp.array(all_tokens[idx], dtype=jnp.int32)
-            batch_emb = jnp.array(all_embeddings[idx], dtype=jnp.float32)
+        for step in range(steps_per_epoch):
+            # Sample batch
+            tokens_np, n_per, lengths = sampler.sample_batch(args.batch_size)
+            # tokens_np: (B * n_per, L)
 
-            params, opt_state, loss = train_step(params, opt_state, batch_tok, batch_emb)
+            # Teacher forward (PyTorch)
+            teacher_embs_np = teacher.get_token_embeddings(tokens_np, lengths)
+            # teacher_embs_np: (B * n_per, L_teacher, D)
+
+            # Pad student input to padded_len
+            B_total = tokens_np.shape[0]
+            if tokens_np.shape[1] < padded_len:
+                pad_width = padded_len - tokens_np.shape[1]
+                tokens_np = np.pad(tokens_np, ((0, 0), (0, pad_width)),
+                                   constant_values=4)  # pad with N token
+
+            # Match teacher embedding length to padded_len
+            L_teacher = teacher_embs_np.shape[1]
+            if L_teacher < padded_len:
+                pad_emb = np.zeros((B_total, padded_len - L_teacher, embed_dim),
+                                   dtype=np.float32)
+                teacher_embs_np = np.concatenate([teacher_embs_np, pad_emb], axis=1)
+            elif L_teacher > padded_len:
+                teacher_embs_np = teacher_embs_np[:, :padded_len, :]
+
+            # Mask: 1 for real positions, 0 for padding
+            mask_np = np.zeros((B_total, padded_len), dtype=np.float32)
+            for i in range(B_total):
+                real_len = min(int(lengths[i]), padded_len)
+                # Also limited by teacher token count
+                real_len = min(real_len, L_teacher)
+                mask_np[i, :real_len] = 1.0
+
+            # To JAX
+            tokens_jax = jnp.array(tokens_np, dtype=jnp.int32)
+            teacher_jax = jnp.array(teacher_embs_np, dtype=jnp.float32)
+            mask_jax = jnp.array(mask_np, dtype=jnp.float32)
+
+            params, opt_state, loss = train_step(
+                params, opt_state, tokens_jax, teacher_jax, mask_jax)
+
             total_loss += float(loss)
-            n_batches += 1
+            n_steps += 1
             global_step += 1
 
-        avg_loss = total_loss / max(n_batches, 1)
+        avg_loss = total_loss / max(n_steps, 1)
         lr_now = float(schedule(global_step))
-        logger.info("Epoch %d/%d: loss=%.6f, lr=%.2e, step=%d",
-                     epoch + 1, args.epochs, avg_loss, lr_now, global_step)
-
-        # Save best
         is_best = avg_loss < best_loss
         if is_best:
             best_loss = avg_loss
 
-        # Always save latest; save best separately
+        logger.info("Epoch %d/%d: loss=%.6f, lr=%.2e, step=%d%s",
+                     epoch + 1, args.epochs, avg_loss, lr_now, global_step,
+                     " *best*" if is_best else "")
+
+        # Save checkpoints
         for tag in (["latest"] + (["best"] if is_best else [])):
-            flat_params = {
-                f"{'/'.join(str(k) for k in path)}": np.array(leaf)
-                for path, leaf in jax.tree_util.tree_leaves_with_path(params)
-            }
-            np.savez(output_dir / f"{tag}_params.npz", **flat_params)
+            flat = {f"{'/'.join(str(k) for k in p)}": np.array(v)
+                    for p, v in jax.tree_util.tree_leaves_with_path(params)}
+            np.savez(output_dir / f"{tag}_params.npz", **flat)
 
-        # Save config (always update with latest stats)
         np.savez(output_dir / "config.npz",
-                 teacher=teacher_name,
-                 embed_dim=embed_dim,
-                 seq_length=seq_length,
-                 hidden_dim=hidden_dim,
-                 n_downsamples=n_down,
-                 n_transformer_layers=n_transformer,
-                 n_params=n_params,
-                 best_loss=best_loss,
-                 last_epoch=epoch + 1,
-                 last_loss=avg_loss,
-                 total_steps=global_step)
+                 teacher=args.teacher, embed_dim=embed_dim,
+                 seq_length=args.seq_length, padded_len=padded_len,
+                 hidden_dim=args.hidden_dim,
+                 n_downsamples=args.n_downsamples,
+                 n_transformer_layers=args.n_transformer_layers,
+                 n_params=n_params, best_loss=best_loss,
+                 last_epoch=epoch + 1, total_steps=global_step)
 
-        # Push to HuggingFace
-        if hf_api and hf_repo:
+        log_entries.append({
+            "epoch": epoch + 1, "loss": avg_loss,
+            "best_loss": best_loss, "lr": lr_now, "step": global_step,
+        })
+        log_path = output_dir / "training_log.json"
+        log_path.write_text(json.dumps(log_entries, indent=2))
+
+        # Push to HF
+        if hf_api and args.hf_repo:
             try:
-                # Upload checkpoint
-                files_to_upload = [
-                    (str(output_dir / "latest_params.npz"), "latest_params.npz"),
-                    (str(output_dir / "config.npz"), "config.npz"),
+                files = [
+                    ("latest_params.npz", "latest_params.npz"),
+                    ("config.npz", "config.npz"),
+                    ("training_log.json", "training_log.json"),
                 ]
                 if is_best:
-                    files_to_upload.append(
-                        (str(output_dir / "best_params.npz"), "best_params.npz"))
-
-                for local, remote in files_to_upload:
+                    files.append(("best_params.npz", "best_params.npz"))
+                for local, remote in files:
                     hf_api.upload_file(
-                        path_or_fileobj=local,
-                        path_in_repo=remote,
-                        repo_id=hf_repo,
+                        path_or_fileobj=str(output_dir / local),
+                        path_in_repo=remote, repo_id=args.hf_repo,
                         commit_message=f"Epoch {epoch+1}: loss={avg_loss:.6f}"
                                        f"{' (best)' if is_best else ''}",
                     )
-
-                # Push training log as JSON
-                import json
-                log_path = output_dir / "training_log.json"
-                log_entries = []
-                if log_path.exists():
-                    log_entries = json.loads(log_path.read_text())
-                log_entries.append({
-                    "epoch": epoch + 1,
-                    "loss": avg_loss,
-                    "best_loss": best_loss,
-                    "lr": lr_now,
-                    "step": global_step,
-                })
-                log_path.write_text(json.dumps(log_entries, indent=2))
-                hf_api.upload_file(
-                    path_or_fileobj=str(log_path),
-                    path_in_repo="training_log.json",
-                    repo_id=hf_repo,
-                    commit_message=f"Training log epoch {epoch+1}",
-                )
-
-                logger.info("  Pushed to HuggingFace: %s", hf_repo)
+                logger.info("  → pushed to HF")
             except Exception as e:
                 logger.warning("  HF push failed: %s", e)
 
-    logger.info("Training complete. Best loss: %.6f", best_loss)
-    logger.info("Saved to %s", output_dir)
-    if hf_repo:
-        logger.info("HuggingFace: https://huggingface.co/%s", hf_repo)
+    logger.info("Done. Best loss: %.6f", best_loss)
+    if args.hf_repo:
+        logger.info("https://huggingface.co/%s", args.hf_repo)
 
 
 # =========================================================================
 # CLI
 # =========================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Distill genebeddings model to JAX student")
-    subparsers = parser.add_subparsers(dest="command")
-
-    # Generate
-    gen = subparsers.add_parser("generate", help="Cache teacher embeddings")
-    gen.add_argument("--teacher", required=True)
-    gen.add_argument("--fasta", required=True)
-    gen.add_argument("--cache-dir", required=True)
-    gen.add_argument("--n-sequences", type=int, default=500_000,
-                     help="Total sequences (WT + all variants)")
-    gen.add_argument("--seq-length", type=int, default=15_000)
-    gen.add_argument("--max-mutations", type=int, default=10,
-                     help="Max mutations per variant (actual count drawn from geometric dist)")
-    gen.add_argument("--variants-per-window", type=int, default=6,
-                     help="Number of mutant variants per WT window (so 1 WT + N variants per window)")
-    gen.add_argument("--seed", type=int, default=42)
-
-    # Train
-    tr = subparsers.add_parser("train", help="Train JAX student")
-    tr.add_argument("--cache-dir", required=True)
-    tr.add_argument("--output-dir", required=True)
-    tr.add_argument("--hidden-dim", type=int, default=256)
-    tr.add_argument("--n-downsamples", type=int, default=5)
-    tr.add_argument("--n-transformer-layers", type=int, default=4)
-    tr.add_argument("--epochs", type=int, default=30)
-    tr.add_argument("--batch-size", type=int, default=64)
-    tr.add_argument("--lr", type=float, default=1e-3)
-    tr.add_argument("--seed", type=int, default=42)
-    tr.add_argument("--hf-repo", default=None,
-                    help="HuggingFace repo ID to push checkpoints (e.g. nicolasalynn/distilled-borzoi)")
+    parser = argparse.ArgumentParser(
+        description="Online distillation: any PyTorch teacher → JAX student")
+    parser.add_argument("--teacher", required=True,
+                        help="Teacher model key (e.g. borzoi, ntv3_100m_post)")
+    parser.add_argument("--fasta", required=True,
+                        help="Reference FASTA (e.g. hg38.fa)")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--seq-length", type=int, default=15_000)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--n-downsamples", type=int, default=5)
+    parser.add_argument("--n-transformer-layers", type=int, default=4)
+    parser.add_argument("--max-mutations", type=int, default=5)
+    parser.add_argument("--variants-per-window", type=int, default=6)
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Windows per batch (total seqs = batch_size * (1+variants))")
+    parser.add_argument("--steps-per-epoch", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--hf-repo", default=None,
+                        help="HuggingFace repo for progress tracking")
 
     args = parser.parse_args()
-    if args.command == "generate":
-        cmd_generate(args)
-    elif args.command == "train":
-        cmd_train(args)
-    else:
-        parser.print_help()
+    train(args)
 
 
 if __name__ == "__main__":
