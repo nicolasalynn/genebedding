@@ -46,6 +46,9 @@ alphagenome = [
 # CNN models
 spliceai = ["spliceai-pytorch"]
 
+# NTv3 (U-Net architecture, requires newer transformers)
+ntv3 = ["transformers>=4.55.0"]
+
 # Specialized models
 mutbert = ["transformers>=4.30"]
 conformer = ["transformers>=4.30"]
