@@ -298,6 +298,46 @@ def train(args):
     logger.info("Student: %d params (%.1fM), teacher embed_dim=%d",
                 n_params, n_params / 1e6, embed_dim)
 
+    # -------------------------------------------------------------------
+    # Load covariance weighting (if available)
+    # -------------------------------------------------------------------
+    # The null covariance tells us which dimensions carry signal vs noise.
+    # We use the diagonal of cov_inv as per-dimension weights:
+    # high cov_inv diagonal = low null variance = signal dimension = upweight
+    dim_weights = None
+    cov_inv_path = args.cov_inv
+    if cov_inv_path is None:
+        # Try auto-detect from embeddings_dir
+        root = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(root))
+        try:
+            from notebooks.paper_data_config import embeddings_dir
+            auto_path = embeddings_dir() / "cache" / f"{args.teacher}_cov_inv.npz"
+            if auto_path.exists():
+                cov_inv_path = str(auto_path)
+                logger.info("Auto-detected cov_inv: %s", auto_path)
+        except Exception:
+            pass
+
+    if cov_inv_path and os.path.exists(cov_inv_path):
+        cov_data = np.load(cov_inv_path)
+        cov_inv = cov_data["cov_inv"]  # (D, D)
+        # Use diagonal as per-dimension importance weight
+        # High diagonal = low null variance in this dim = important for signal
+        raw_weights = np.diag(cov_inv).astype(np.float32)
+        # Normalize so mean weight = 1 (doesn't change loss scale)
+        raw_weights = raw_weights / (raw_weights.mean() + 1e-10)
+        # Clip extremes to avoid instability
+        raw_weights = np.clip(raw_weights, 0.01, 100.0)
+        dim_weights = jnp.array(raw_weights)  # (D,)
+        logger.info("Covariance weighting: %d dims, weight range [%.2f, %.2f], "
+                     "effective dims (>1.0): %d",
+                     len(raw_weights), raw_weights.min(), raw_weights.max(),
+                     (raw_weights > 1.0).sum())
+    else:
+        logger.info("No covariance weighting — using uniform MSE. "
+                     "Pass --cov-inv to enable.")
+
     # Optimizer
     steps_per_epoch = args.steps_per_epoch
     total_steps = args.epochs * steps_per_epoch
@@ -334,15 +374,22 @@ license: apache-2.0
             logger.warning("HF setup failed: %s", e)
             hf_api = None
 
-    # JIT training step
+    # JIT training step — covariance-weighted MSE
+    _dim_weights = dim_weights  # capture for JIT closure
+
     @jax.jit
     def train_step(params, opt_state, student_tokens, teacher_embs, mask):
         def loss_fn(params):
             pred = model.apply(params, student_tokens)  # (B, L, D)
-            # MSE only on non-padded positions
             diff = (pred - teacher_embs) ** 2  # (B, L, D)
-            # mask: (B, L) — 1 for real, 0 for pad
-            diff = diff * mask[:, :, None]
+
+            # Apply covariance weighting per dimension
+            # Upweights dimensions where null has low variance (signal dims)
+            if _dim_weights is not None:
+                diff = diff * _dim_weights[None, None, :]  # (B, L, D) * (1, 1, D)
+
+            # Mask out padding positions
+            diff = diff * mask[:, :, None]  # (B, L, 1)
             return diff.sum() / (mask.sum() * embed_dim + 1e-10)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -486,6 +533,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cov-inv", default=None,
+                        help="Path to null cov_inv .npz (auto-detected if not set). "
+                             "Used to weight loss: signal dimensions get higher weight.")
     parser.add_argument("--hf-repo", default=None,
                         help="HuggingFace repo for progress tracking")
 
