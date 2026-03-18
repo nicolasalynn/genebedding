@@ -296,6 +296,7 @@ def build_student(hidden_dim, n_downsamples, n_transformer_layers, embed_dim,
                 num_heads=max(1, hidden_dim // 64),
                 key_size=64,
                 model_size=hidden_dim,
+                w_init=hk.initializers.VarianceScaling(1.0, "fan_avg", "uniform"),
                 name=f"mha_{i}",
             )(x, x, x)
             x = x + residual
