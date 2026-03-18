@@ -77,7 +77,7 @@ FULL_MODEL_CONFIG: Dict[str, Tuple[int, str]] = {
     "evo2": (4_000, "evo2"),
     "spliceai": (10_000, "spliceai"),
     "dnabert": (512, "default"),
-    "ntv3_650m": (4_000, "ntv3"),  # 8kb total (4kb each side); OOMs at larger contexts
+    "ntv3_100m": (4_000, "ntv3_100m"),  # 100M model fits on A100; 650M OOMs
 }
 
 # Default subset for quick runs (override with model_keys= or env_profile=)
@@ -322,7 +322,10 @@ def _build_model(model_key: str, init_spec: str, spliceai_model_dir: Optional[st
                 "SpliceAI/OpenSpliceAI model_dir required. Set OPENSPLICEAI_MODEL_DIR or pass spliceai_model_dir."
             )
         return SpliceAIWrapper(model="10k", model_dir=model_dir)
-    if init_spec == "ntv3":
+    if init_spec == "ntv3_100m":
+        from genebeddings.wrappers import NTv3Wrapper
+        return NTv3Wrapper(model="100m-pre", dtype=torch.bfloat16)
+    if init_spec == "ntv3_650m":
         from genebeddings.wrappers import NTv3Wrapper
         return NTv3Wrapper(model="650m-pre", dtype=torch.bfloat16)
     if init_spec == "evo2":
