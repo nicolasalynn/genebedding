@@ -321,12 +321,76 @@ def cmd_train(args):
     logger.info("Student: %d parameters (%.1fM)", n_params, n_params / 1e6)
 
     # Optimizer
+    steps_per_epoch = n_samples // args.batch_size
+    total_steps = args.epochs * steps_per_epoch
     schedule = optax.cosine_decay_schedule(
         init_value=args.lr,
-        decay_steps=args.epochs * (n_samples // args.batch_size),
+        decay_steps=total_steps,
     )
     optimizer = optax.adamw(learning_rate=schedule, weight_decay=0.01)
     opt_state = optimizer.init(params)
+
+    # -------------------------------------------------------------------
+    # HuggingFace Hub setup
+    # -------------------------------------------------------------------
+    hf_repo = getattr(args, "hf_repo", None)
+    hf_api = None
+    if hf_repo:
+        try:
+            from huggingface_hub import HfApi, create_repo
+            hf_api = HfApi()
+            create_repo(hf_repo, exist_ok=True, repo_type="model")
+            logger.info("HuggingFace repo: %s", hf_repo)
+
+            # Push initial model card
+            model_card = f"""---
+tags:
+  - genomics
+  - distillation
+  - jax
+  - dna-language-model
+license: apache-2.0
+---
+
+# Distilled Genomic Foundation Model
+
+Distilled from **{teacher_name}** using genebeddings distillation framework.
+
+## Architecture
+- **Type**: U-Net (conv downsample + transformer bottleneck + conv upsample)
+- **Parameters**: {n_params:,} ({n_params/1e6:.1f}M)
+- **Hidden dim**: {hidden_dim}
+- **Downsamples**: {n_down} (sequence compressed {2**n_down}x)
+- **Transformer layers**: {n_transformer}
+- **Input**: DNA sequence up to {seq_length:,} bp
+- **Output**: {embed_dim}-dim embedding (mean-pooled)
+
+## Training
+- **Teacher**: {teacher_name}
+- **Framework**: JAX/Haiku
+- **Data**: {n_samples:,} sequences (WT + mutant variants from hg38)
+- **Loss**: MSE on teacher embeddings
+- **Mutation-aware**: trained on WT, single, double, and multi-mutant sequences
+
+## Usage
+```python
+# Load and use (requires JAX + Haiku)
+import jax, haiku as hk, numpy as np
+params = np.load("best_params.npz")
+config = np.load("config.npz")
+```
+"""
+            card_path = output_dir / "README.md"
+            card_path.write_text(model_card)
+            hf_api.upload_file(
+                path_or_fileobj=str(card_path),
+                path_in_repo="README.md",
+                repo_id=hf_repo,
+                commit_message="Initial model card",
+            )
+        except Exception as e:
+            logger.warning("HuggingFace Hub setup failed: %s. Training without HF.", e)
+            hf_api = None
 
     # -------------------------------------------------------------------
     # Training
@@ -345,9 +409,9 @@ def cmd_train(args):
 
     rng = np.random.RandomState(args.seed)
     best_loss = float("inf")
+    global_step = 0
 
     for epoch in range(args.epochs):
-        # Shuffle
         perm = rng.permutation(n_samples)
         total_loss = 0.0
         n_batches = 0
@@ -360,31 +424,90 @@ def cmd_train(args):
             params, opt_state, loss = train_step(params, opt_state, batch_tok, batch_emb)
             total_loss += float(loss)
             n_batches += 1
+            global_step += 1
 
         avg_loss = total_loss / max(n_batches, 1)
-        logger.info("Epoch %d/%d: loss=%.6f", epoch + 1, args.epochs, avg_loss)
+        lr_now = float(schedule(global_step))
+        logger.info("Epoch %d/%d: loss=%.6f, lr=%.2e, step=%d",
+                     epoch + 1, args.epochs, avg_loss, lr_now, global_step)
 
-        if avg_loss < best_loss:
+        # Save best
+        is_best = avg_loss < best_loss
+        if is_best:
             best_loss = avg_loss
-            # Save params
+
+        # Always save latest; save best separately
+        for tag in (["latest"] + (["best"] if is_best else [])):
             flat_params = {
                 f"{'/'.join(str(k) for k in path)}": np.array(leaf)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(params)
             }
-            np.savez(output_dir / "best_params.npz", **flat_params)
-            # Save config
-            np.savez(output_dir / "config.npz",
-                     teacher=teacher_name,
-                     embed_dim=embed_dim,
-                     seq_length=seq_length,
-                     hidden_dim=hidden_dim,
-                     n_downsamples=n_down,
-                     n_transformer_layers=n_transformer,
-                     n_params=n_params,
-                     best_loss=best_loss)
+            np.savez(output_dir / f"{tag}_params.npz", **flat_params)
+
+        # Save config (always update with latest stats)
+        np.savez(output_dir / "config.npz",
+                 teacher=teacher_name,
+                 embed_dim=embed_dim,
+                 seq_length=seq_length,
+                 hidden_dim=hidden_dim,
+                 n_downsamples=n_down,
+                 n_transformer_layers=n_transformer,
+                 n_params=n_params,
+                 best_loss=best_loss,
+                 last_epoch=epoch + 1,
+                 last_loss=avg_loss,
+                 total_steps=global_step)
+
+        # Push to HuggingFace
+        if hf_api and hf_repo:
+            try:
+                # Upload checkpoint
+                files_to_upload = [
+                    (str(output_dir / "latest_params.npz"), "latest_params.npz"),
+                    (str(output_dir / "config.npz"), "config.npz"),
+                ]
+                if is_best:
+                    files_to_upload.append(
+                        (str(output_dir / "best_params.npz"), "best_params.npz"))
+
+                for local, remote in files_to_upload:
+                    hf_api.upload_file(
+                        path_or_fileobj=local,
+                        path_in_repo=remote,
+                        repo_id=hf_repo,
+                        commit_message=f"Epoch {epoch+1}: loss={avg_loss:.6f}"
+                                       f"{' (best)' if is_best else ''}",
+                    )
+
+                # Push training log as JSON
+                import json
+                log_path = output_dir / "training_log.json"
+                log_entries = []
+                if log_path.exists():
+                    log_entries = json.loads(log_path.read_text())
+                log_entries.append({
+                    "epoch": epoch + 1,
+                    "loss": avg_loss,
+                    "best_loss": best_loss,
+                    "lr": lr_now,
+                    "step": global_step,
+                })
+                log_path.write_text(json.dumps(log_entries, indent=2))
+                hf_api.upload_file(
+                    path_or_fileobj=str(log_path),
+                    path_in_repo="training_log.json",
+                    repo_id=hf_repo,
+                    commit_message=f"Training log epoch {epoch+1}",
+                )
+
+                logger.info("  Pushed to HuggingFace: %s", hf_repo)
+            except Exception as e:
+                logger.warning("  HF push failed: %s", e)
 
     logger.info("Training complete. Best loss: %.6f", best_loss)
     logger.info("Saved to %s", output_dir)
+    if hf_repo:
+        logger.info("HuggingFace: https://huggingface.co/%s", hf_repo)
 
 
 # =========================================================================
@@ -419,6 +542,8 @@ def main():
     tr.add_argument("--batch-size", type=int, default=64)
     tr.add_argument("--lr", type=float, default=1e-3)
     tr.add_argument("--seed", type=int, default=42)
+    tr.add_argument("--hf-repo", default=None,
+                    help="HuggingFace repo ID to push checkpoints (e.g. nicolasalynn/distilled-borzoi)")
 
     args = parser.parse_args()
     if args.command == "generate":
