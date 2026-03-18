@@ -527,8 +527,56 @@ license: apache-2.0
         if is_best:
             best_loss = avg_loss
 
-        logger.info("Epoch %d/%d: loss=%.6f, lr=%.2e, step=%d%s",
+        # -----------------------------------------------------------
+        # Validation: does the student preserve perturbation structure?
+        # Sample a few WT+mutant pairs, check if student's delta
+        # correlates with teacher's delta (mean-pooled).
+        # -----------------------------------------------------------
+        val_corrs = []
+        try:
+            for _v in range(10):  # 10 validation windows
+                val_tokens, val_nper, val_lens = sampler.sample_batch(1)
+                val_teacher = teacher.get_token_embeddings(val_tokens, val_lens)
+
+                # Pad for student
+                vB = val_tokens.shape[0]
+                if val_tokens.shape[1] < padded_len:
+                    val_tokens = np.pad(val_tokens,
+                        ((0, 0), (0, padded_len - val_tokens.shape[1])),
+                        constant_values=4)
+                val_student = np.array(
+                    model.apply(params, jnp.array(val_tokens, dtype=jnp.int32)))
+
+                # Mean-pool both (over real positions only)
+                L_real = min(int(val_lens[0]), val_teacher.shape[1], val_student.shape[1])
+                t_pooled = val_teacher[:, :L_real, :].mean(axis=1)  # (N, D)
+                s_pooled = val_student[:, :L_real, :].mean(axis=1)  # (N, D)
+
+                # WT is first sequence, rest are mutants
+                t_wt = t_pooled[0]
+                s_wt = s_pooled[0]
+
+                for j in range(1, len(t_pooled)):
+                    t_delta = t_pooled[j] - t_wt  # teacher perturbation
+                    s_delta = s_pooled[j] - s_wt  # student perturbation
+                    # Correlation between teacher and student deltas
+                    t_flat = t_delta.flatten()
+                    s_flat = s_delta.flatten()
+                    denom = (np.linalg.norm(t_flat) * np.linalg.norm(s_flat) + 1e-20)
+                    corr = float(np.dot(t_flat, s_flat) / denom)
+                    val_corrs.append(corr)
+
+            mean_corr = np.mean(val_corrs)
+            median_corr = np.median(val_corrs)
+        except Exception as e:
+            mean_corr = float("nan")
+            median_corr = float("nan")
+            logger.warning("Validation failed: %s", e)
+
+        logger.info("Epoch %d/%d: loss=%.6f, lr=%.2e, step=%d, "
+                     "delta_corr=%.3f (median=%.3f)%s",
                      epoch + 1, args.epochs, avg_loss, lr_now, global_step,
+                     mean_corr, median_corr,
                      " *best*" if is_best else "")
 
         # Save checkpoints
@@ -549,6 +597,8 @@ license: apache-2.0
         log_entries.append({
             "epoch": epoch + 1, "loss": avg_loss,
             "best_loss": best_loss, "lr": lr_now, "step": global_step,
+            "delta_corr_mean": float(mean_corr),
+            "delta_corr_median": float(median_corr),
         })
         log_path = output_dir / "training_log.json"
         log_path.write_text(json.dumps(log_entries, indent=2))
@@ -592,8 +642,8 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seq-length", type=int, default=15_000)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--n-downsamples", type=int, default=5)
-    parser.add_argument("--n-transformer-layers", type=int, default=4)
+    parser.add_argument("--n-downsamples", type=int, default=3)
+    parser.add_argument("--n-transformer-layers", type=int, default=8)
     parser.add_argument("--max-mutations", type=int, default=5)
     parser.add_argument("--n-focal-positions", type=int, default=5,
                         help="Focal positions per window for structured mutations")
