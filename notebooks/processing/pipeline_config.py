@@ -64,6 +64,7 @@ TOOL_TO_ENV: Dict[str, str] = {
     "spliceai": "spliceai",
     "alphagenome": "alphagenome",
     "evo2": "evo2",
+    "ntv3_650m": "ntv3",
 }
 
 
