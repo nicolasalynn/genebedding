@@ -141,6 +141,12 @@ class NTv3Wrapper(BaseWrapper):
         self._vocab = self.tokenizer.get_vocab()
         self._base_ids = {b: self._vocab.get(b) for b in BASES if b in self._vocab}
 
+        # Cache the token mapping to avoid slow added_tokens_encoder rebuild
+        # NTv3's tokenizer rebuilds this dict on every call, which is O(vocab) per token
+        self._char_to_id = {c: self._vocab[c] for c in "ACGTN" if c in self._vocab}
+        pad_tok = self.tokenizer.pad_token
+        self._pad_id = self._vocab.get(pad_tok, 0) if pad_tok else 0
+
     def __repr__(self) -> str:
         return (f"NTv3Wrapper(model='{self.model_name}', device={self.device}, "
                 f"max_length={self.max_length:,})")
@@ -152,34 +158,35 @@ class NTv3Wrapper(BaseWrapper):
             return length
         return length + PAD_MULTIPLE - remainder
 
+    def _fast_tokenize(self, seq: str, padded_len: int) -> List[int]:
+        """Fast character-level tokenization bypassing slow HF tokenizer."""
+        ids = [self._char_to_id.get(c, self._char_to_id.get("N", 0)) for c in seq.upper()]
+        # Pad to padded_len
+        if len(ids) < padded_len:
+            ids.extend([self._pad_id] * (padded_len - len(ids)))
+        elif len(ids) > padded_len:
+            ids = ids[:padded_len]
+        return ids
+
     def _tokenize(self, seq: str) -> dict:
         """Tokenize a sequence, padding to multiple of 128."""
         padded_len = self._pad_length(len(seq))
-        enc = self.tokenizer(
-            seq,
-            add_special_tokens=False,
-            padding="max_length",
-            max_length=padded_len,
-            pad_to_multiple_of=PAD_MULTIPLE,
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {k: v.to(self.device) for k, v in enc.items()}
+        ids = self._fast_tokenize(seq, padded_len)
+        input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
+        attention_mask = torch.ones_like(input_ids)
+        attention_mask[0, len(seq):] = 0
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     def _tokenize_batch(self, seqs: List[str]) -> dict:
         """Tokenize a batch of sequences, padding to same length (multiple of 128)."""
         max_len = max(len(s) for s in seqs)
         padded_len = self._pad_length(max_len)
-        enc = self.tokenizer(
-            seqs,
-            add_special_tokens=False,
-            padding="max_length",
-            max_length=padded_len,
-            pad_to_multiple_of=PAD_MULTIPLE,
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {k: v.to(self.device) for k, v in enc.items()}
+        batch_ids = [self._fast_tokenize(s, padded_len) for s in seqs]
+        input_ids = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
+        attention_mask = torch.ones_like(input_ids)
+        for i, s in enumerate(seqs):
+            attention_mask[i, len(s):] = 0
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     @torch.no_grad()
     def embed(
