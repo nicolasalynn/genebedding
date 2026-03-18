@@ -38,14 +38,27 @@ BASES = list("ACGT")
 # Sequence sampler — generates WT + mutant batches from reference FASTA
 # =========================================================================
 class GenomicWindowSampler:
-    """Sample random genomic windows + mutant variants from a FASTA."""
+    """Sample genomic windows with structured epistasis-aware mutations.
 
-    def __init__(self, fasta_path, seq_length, max_mutations=5,
-                 variants_per_window=6, seed=42):
+    For each window, generates:
+      1. WT (reference)
+      2. Singles: each focal position mutated alone (all 3 alt alleles)
+      3. Doubles: pairs at controlled distances (1, 5, 20, 100, 500bp)
+      4. Higher-order: 3-5 mutations at focal positions
+
+    This teaches the student that embedding(double) ≠ embedding(single1) +
+    embedding(single2) - embedding(WT), which is exactly epistasis.
+    """
+
+    # Distances at which to sample double-mutation pairs
+    PAIR_DISTANCES = [1, 2, 5, 10, 20, 50, 100, 500]
+
+    def __init__(self, fasta_path, seq_length, n_focal_positions=5,
+                 max_mutations=5, seed=42):
         import pysam
         self.seq_length = seq_length
+        self.n_focal = n_focal_positions
         self.max_mutations = max_mutations
-        self.variants_per_window = variants_per_window
         self.rng = np.random.RandomState(seed)
         self.token_map = {c: i for i, c in enumerate("ACGTN")}
 
@@ -56,28 +69,36 @@ class GenomicWindowSampler:
                        and length > seq_length * 2]
         weights = np.array([l for _, l in self.chroms], dtype=float)
         self.chrom_weights = weights / weights.sum()
-        self.fasta_path = fasta_path
         fasta.close()
 
     def _tokenize(self, seq):
         return np.array([self.token_map.get(c, 4) for c in seq], dtype=np.int32)
 
+    def _mutate(self, seq_list, positions_and_alts):
+        """Apply mutations to a sequence list. Returns new list."""
+        out = seq_list.copy()
+        for pos, alt in positions_and_alts:
+            out[pos] = alt
+        return out
+
+    def _random_alt(self, ref):
+        return self.rng.choice([b for b in BASES if b != ref])
+
     def sample_batch(self, batch_size):
-        """Sample batch_size windows, each with WT + variants.
+        """Sample batch_size windows with structured mutation sets.
 
         Returns:
-            tokens: (B * (1 + V), L) int32 — all sequences tokenized
-            n_per_window: int — 1 + variants_per_window
-            seq_lengths: (B * (1 + V),) int32
+            tokens: (N, L) int32 — all sequences tokenized
+            n_per_window: int — sequences per window (variable but padded)
+            seq_lengths: (N,) int32
         """
         from seqmat import SeqMat
 
         all_tokens = []
         all_lengths = []
-        n_per = 1 + self.variants_per_window
 
         for _ in range(batch_size):
-            # Sample window
+            # Sample a genomic window
             for _attempt in range(20):
                 ci = self.rng.choice(len(self.chroms), p=self.chrom_weights)
                 chrom_name, chrom_len = self.chroms[ci]
@@ -91,34 +112,82 @@ class GenomicWindowSampler:
                 except Exception:
                     continue
             else:
-                # Fallback: random sequence
                 seq = "".join(self.rng.choice(BASES, size=self.seq_length))
 
-            valid_pos = [p for p in range(len(seq)) if seq[p] in BASES]
-
-            # WT
-            all_tokens.append(self._tokenize(seq))
-            all_lengths.append(len(seq))
-
-            # Variants
             seq_list = list(seq)
-            for _ in range(self.variants_per_window):
-                n_muts = min(
-                    self.rng.geometric(p=0.4),
-                    self.max_mutations,
-                    len(valid_pos),
-                )
-                positions = self.rng.choice(valid_pos, size=n_muts, replace=False)
-                mut_seq = seq_list.copy()
-                for pos in positions:
-                    ref = mut_seq[pos]
-                    alt = self.rng.choice([b for b in BASES if b != ref])
-                    mut_seq[pos] = alt
-                all_tokens.append(self._tokenize("".join(mut_seq)))
-                all_lengths.append(len(seq))
+            L = len(seq)
+            valid_pos = [p for p in range(L) if seq[p] in BASES]
 
-        tokens = np.stack(all_tokens)  # (B * n_per, L)
+            # Pick focal positions — center of the window ± spread
+            center = L // 2
+            spread = min(L // 4, 2000)
+            focal_candidates = [p for p in valid_pos
+                                if center - spread <= p <= center + spread]
+            n_focal = min(self.n_focal, len(focal_candidates))
+            focal_positions = sorted(
+                self.rng.choice(focal_candidates, size=n_focal, replace=False))
+
+            # ---- 1. WT ----
+            all_tokens.append(self._tokenize(seq))
+            all_lengths.append(L)
+
+            # ---- 2. Singles: each focal position × all 3 alt alleles ----
+            for fp in focal_positions:
+                ref = seq_list[fp]
+                for alt in [b for b in BASES if b != ref]:
+                    mut = self._mutate(seq_list, [(fp, alt)])
+                    all_tokens.append(self._tokenize("".join(mut)))
+                    all_lengths.append(L)
+
+            # ---- 3. Doubles: pairs at controlled distances ----
+            for dist in self.PAIR_DISTANCES:
+                # Find a focal position that has a valid partner at this distance
+                candidates = [(fp, fp + dist) for fp in focal_positions
+                              if fp + dist < L and seq[fp + dist] in BASES]
+                if not candidates:
+                    candidates = [(fp, fp - dist) for fp in focal_positions
+                                  if fp - dist >= 0 and seq[fp - dist] in BASES]
+                if not candidates:
+                    continue
+
+                pos1, pos2 = candidates[self.rng.randint(len(candidates))]
+                ref1, ref2 = seq_list[pos1], seq_list[pos2]
+                alt1, alt2 = self._random_alt(ref1), self._random_alt(ref2)
+
+                # Double mutant
+                mut = self._mutate(seq_list, [(pos1, alt1), (pos2, alt2)])
+                all_tokens.append(self._tokenize("".join(mut)))
+                all_lengths.append(L)
+
+                # Also add each single from this pair (if not already a focal)
+                # so the student sees WT, single1, single2, double for this pair
+                for p, a in [(pos1, alt1), (pos2, alt2)]:
+                    if p not in focal_positions:
+                        mut_s = self._mutate(seq_list, [(p, a)])
+                        all_tokens.append(self._tokenize("".join(mut_s)))
+                        all_lengths.append(L)
+
+            # ---- 4. Higher-order: 3-5 mutations at focal positions ----
+            for n_muts in range(3, min(self.max_mutations + 1, n_focal + 1)):
+                chosen = self.rng.choice(focal_positions, size=n_muts, replace=False)
+                muts = [(int(p), self._random_alt(seq_list[p])) for p in chosen]
+                mut = self._mutate(seq_list, muts)
+                all_tokens.append(self._tokenize("".join(mut)))
+                all_lengths.append(L)
+
+            # ---- 5. Random mutations (for diversity) ----
+            for _ in range(3):
+                n_muts = self.rng.geometric(p=0.4)
+                n_muts = min(n_muts, self.max_mutations, len(valid_pos))
+                positions = self.rng.choice(valid_pos, size=n_muts, replace=False)
+                muts = [(int(p), self._random_alt(seq_list[p])) for p in positions]
+                mut = self._mutate(seq_list, muts)
+                all_tokens.append(self._tokenize("".join(mut)))
+                all_lengths.append(L)
+
+        tokens = np.stack(all_tokens)
         lengths = np.array(all_lengths, dtype=np.int32)
+        n_per = len(all_tokens) // batch_size
         return tokens, n_per, lengths
 
 
@@ -276,8 +345,8 @@ def train(args):
     # Sampler
     sampler = GenomicWindowSampler(
         args.fasta, args.seq_length,
+        n_focal_positions=args.n_focal_positions,
         max_mutations=args.max_mutations,
-        variants_per_window=args.variants_per_window,
         seed=args.seed,
     )
 
@@ -526,9 +595,10 @@ def main():
     parser.add_argument("--n-downsamples", type=int, default=5)
     parser.add_argument("--n-transformer-layers", type=int, default=4)
     parser.add_argument("--max-mutations", type=int, default=5)
-    parser.add_argument("--variants-per-window", type=int, default=6)
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Windows per batch (total seqs = batch_size * (1+variants))")
+    parser.add_argument("--n-focal-positions", type=int, default=5,
+                        help="Focal positions per window for structured mutations")
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="Windows per batch (each produces ~40-60 sequences)")
     parser.add_argument("--steps-per-epoch", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
