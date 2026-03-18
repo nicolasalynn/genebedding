@@ -518,9 +518,35 @@ license: apache-2.0
             params, opt_state, loss = train_step(
                 params, opt_state, tokens_jax, teacher_jax, mask_jax)
 
-            total_loss += float(loss)
+            step_loss = float(loss)
+            total_loss += step_loss
             n_steps += 1
             global_step += 1
+
+            # Per-step logging every 10 steps
+            if (step + 1) % 10 == 0:
+                running_avg = total_loss / n_steps
+                logger.info("  step %d/%d: loss=%.6f (running avg=%.6f)",
+                             step + 1, steps_per_epoch, step_loss, running_avg)
+
+            # Mid-epoch HF push every 100 steps
+            if hf_api and args.hf_repo and (step + 1) % 100 == 0:
+                try:
+                    mid_log = {
+                        "epoch": epoch + 1, "step": global_step,
+                        "step_in_epoch": step + 1,
+                        "running_loss": total_loss / n_steps,
+                    }
+                    mid_log_path = output_dir / "progress.json"
+                    mid_log_path.write_text(json.dumps(mid_log, indent=2))
+                    hf_api.upload_file(
+                        path_or_fileobj=str(mid_log_path),
+                        path_in_repo="progress.json",
+                        repo_id=args.hf_repo,
+                        commit_message=f"Step {global_step}: loss={total_loss/n_steps:.6f}",
+                    )
+                except Exception:
+                    pass  # don't interrupt training for HF issues
 
         avg_loss = total_loss / max(n_steps, 1)
         lr_now = float(schedule(global_step))
