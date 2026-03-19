@@ -518,3 +518,45 @@ if len(df_pooled) > 0:
         print(f"   Singles separate high/low selection MORE than epistasis")
 else:
     print("No data — run on cluster with embedding DBs available.")
+
+
+# ---------------------------------------------------------------------------
+# Cell 7: Two-sided within-bin test — no directional assumption
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 110)
+print("TWO-SIDED WITHIN-BIN TEST: are the distributions different at all?")
+print("=" * 110)
+
+if len(model_data) > 0:
+    for mk, df in model_data.items():
+        print(f"\n--- {mk} ---")
+        print(f"{'bin':>10s} | {'n_hi':>5s} {'n_lo':>5s} {'n_germ':>6s} | "
+              f"{'hi_med':>8s} {'lo_med':>8s} {'germ_med':>9s} | "
+              f"{'hi_v_lo':>10s} {'hi_v_germ':>12s} {'lo_v_germ':>12s}")
+
+        for (lo, hi), label in zip(DIST_BINS, DIST_LABELS):
+            h = df[(df["source"] == "tcga_high_selection") &
+                    (df["distance"] >= lo) & (df["distance"] < hi)]
+            l = df[(df["source"] == "tcga_low_selection") &
+                    (df["distance"] >= lo) & (df["distance"] < hi)]
+            g = df[(df["source"] == "okgp_matched_doubles") &
+                    (df["distance"] >= lo) & (df["distance"] < hi)]
+
+            if len(h) < 10 or len(l) < 10 or len(g) < 10:
+                continue
+
+            hv = h["log_magnitude_ratio"].abs()
+            lv = l["log_magnitude_ratio"].abs()
+            gv = g["log_magnitude_ratio"].abs()
+
+            _, p_hl = mannwhitneyu(hv, lv, alternative="two-sided")
+            _, p_hg = mannwhitneyu(hv, gv, alternative="two-sided")
+            _, p_lg = mannwhitneyu(lv, gv, alternative="two-sided")
+
+            sig_hl = "***" if p_hl < 0.001 else "**" if p_hl < 0.01 else "*" if p_hl < 0.05 else ""
+            sig_hg = "***" if p_hg < 0.001 else "**" if p_hg < 0.01 else "*" if p_hg < 0.05 else ""
+            sig_lg = "***" if p_lg < 0.001 else "**" if p_lg < 0.01 else "*" if p_lg < 0.05 else ""
+
+            print(f"{label:>10s} | {len(h):5d} {len(l):5d} {len(g):6d} | "
+                  f"{hv.median():8.4f} {lv.median():8.4f} {gv.median():9.4f} | "
+                  f"{p_hl:9.2e}{sig_hl:>3s} {p_hg:11.2e}{sig_hg:>3s} {p_lg:11.2e}{sig_lg:>3s}")
