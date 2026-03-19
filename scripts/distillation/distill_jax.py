@@ -405,6 +405,36 @@ def train(args):
     logger.info("Student: %d params (%.1fM), embed_dim=%d, padded_len=%d",
                 n_params, n_params / 1e6, embed_dim, padded_len)
 
+    # Resume from checkpoint if available
+    start_epoch = 0
+    resume_path = output_dir / "latest_params.npz"
+    config_path = output_dir / "config.npz"
+    if resume_path.exists() and config_path.exists():
+        try:
+            saved_config = np.load(config_path, allow_pickle=True)
+            start_epoch = int(saved_config.get("last_epoch", 0))
+            logger.info("Resuming from epoch %d (loading %s)", start_epoch, resume_path)
+
+            # Load params — reconstruct tree structure from flat npz
+            saved_flat = np.load(resume_path)
+            # We can't easily reconstruct the pytree from flat keys,
+            # so instead we overwrite leaf values in the initialized params
+            saved_leaves = {k: jnp.array(v) for k, v in saved_flat.items()}
+            flat_params, treedef = jax.tree_util.tree_flatten_with_path(params)
+            new_leaves = []
+            for path, leaf in zip(*jax.tree_util.tree_flatten_with_path(params)):
+                key = "/".join(str(k) for k in path)
+                if key in saved_leaves and saved_leaves[key].shape == leaf.shape:
+                    new_leaves.append(saved_leaves[key])
+                else:
+                    new_leaves.append(leaf)
+            params = jax.tree_util.tree_unflatten(
+                jax.tree_util.tree_structure(params), new_leaves)
+            logger.info("Restored %d parameter arrays", len(new_leaves))
+        except Exception as e:
+            logger.warning("Failed to resume: %s. Starting fresh.", e)
+            start_epoch = 0
+
     # Covariance weighting
     dim_weights = None
     cov_path = args.cov_inv
@@ -432,7 +462,7 @@ def train(args):
     total_steps = args.epochs * steps_per_epoch
     schedule = optax.cosine_decay_schedule(init_value=args.lr, decay_steps=total_steps)
     optimizer = optax.adamw(learning_rate=schedule, weight_decay=0.01)
-    opt_state = optimizer.init(params)
+    opt_state = optimizer.init(params)  # Note: optimizer state resets on resume — momentum is lost
 
     # Loss weights
     w0 = args.loss_w_embedding   # zero-order: absolute embedding match
@@ -473,12 +503,20 @@ license: apache-2.0
     # ---------------------------------------------------------------
     _w = dim_weights
 
+    # Running EMA of each loss component for auto-normalization.
+    # Each loss gets scaled so its EMA ≈ 1.0, then user weights apply on top.
+    # This ensures L0, L1, L2 contribute equally regardless of magnitude.
+    _ema_decay = 0.99
+    _ema = {"L0": 1.0, "L1": 1.0, "L2": 1.0}
+
     @jax.jit
-    def train_step(params, opt_state, tokens, teacher_embs, mask):
+    def train_step(params, opt_state, tokens, teacher_embs, mask,
+                   norm_L0, norm_L1, norm_L2):
         """
         tokens: (N, L) — WT at index 0, variants at 1..N-1
         teacher_embs: (N, L, D)
         mask: (N, L) — 1 for real positions
+        norm_L0/L1/L2: running EMA of each loss for auto-normalization
         """
         def loss_fn(params):
             pred = model.apply(params, tokens)  # (N, L, D)
@@ -493,44 +531,52 @@ license: apache-2.0
             L0 = masked_diff.sum() / (mask.sum() * embed_dim + 1e-10)
 
             # --- L1: Delta (perturbation) matching ---
-            # Mean-pool each sequence, compute delta from WT (index 0)
-            # mask: (N, L) → mean pool respecting mask
+            # Mean-pool, compute deltas from WT (index 0)
             mask_sum = mask.sum(axis=1, keepdims=True).clip(1)  # (N, 1)
             pred_pooled = (pred * mask[:, :, None]).sum(axis=1) / mask_sum  # (N, D)
             teach_pooled = (teacher_embs * mask[:, :, None]).sum(axis=1) / mask_sum
 
             pred_deltas = pred_pooled[1:] - pred_pooled[0:1]  # (N-1, D)
             teach_deltas = teach_pooled[1:] - teach_pooled[0:1]
-            delta_diff = (pred_deltas - teach_deltas) ** 2
+
+            # L1: MSE on delta vectors, normalized by teacher delta magnitude
+            # so it's scale-invariant (cosine-like but differentiable)
+            teach_delta_scale = jnp.mean(jnp.linalg.norm(teach_deltas, axis=1)).clip(1e-10)
+            delta_diff = ((pred_deltas - teach_deltas) / teach_delta_scale) ** 2
             if _w is not None:
                 delta_diff = delta_diff * _w[None, :]
             L1 = delta_diff.mean()
 
-            # --- L2: Epistasis residual matching ---
-            # For any triplet (WT=0, single_i, single_j, double_k) where
-            # double_k = mutations at both positions i and j:
-            # ε = h(AB) - h(A) - h(B) + h(WT)
-            # We approximate by: for each variant with ≥2 mutations relative
-            # to WT, compute the residual against the additive expectation
-            # from available singles. This is complex to track indices, so
-            # we use a simpler proxy: the variance of the residuals around
-            # the mean delta direction should match between teacher and student.
-            # Proxy: cosine similarity of the delta vectors should match.
+            # --- L2: Epistasis geometry — pairwise cosine structure ---
             N_var = pred_deltas.shape[0]
             if N_var >= 2:
-                # Pairwise cosine between all delta vectors
                 pred_norms = jnp.linalg.norm(pred_deltas, axis=1, keepdims=True).clip(1e-10)
                 teach_norms = jnp.linalg.norm(teach_deltas, axis=1, keepdims=True).clip(1e-10)
                 pred_unit = pred_deltas / pred_norms
                 teach_unit = teach_deltas / teach_norms
 
-                pred_cos = pred_unit @ pred_unit.T  # (N-1, N-1)
+                pred_cos = pred_unit @ pred_unit.T
                 teach_cos = teach_unit @ teach_unit.T
                 L2 = ((pred_cos - teach_cos) ** 2).mean()
+
+                # Also: delta magnitude ratio should match
+                # (teacher says mutation A is 3x bigger than B → student should too)
+                pred_mag = pred_norms.squeeze()
+                teach_mag = teach_norms.squeeze()
+                pred_mag_norm = pred_mag / pred_mag.mean().clip(1e-10)
+                teach_mag_norm = teach_mag / teach_mag.mean().clip(1e-10)
+                L2 = L2 + ((pred_mag_norm - teach_mag_norm) ** 2).mean()
             else:
                 L2 = jnp.float32(0.0)
 
-            return w0 * L0 + w1 * L1 + w2 * L2, (L0, L1, L2)
+            # Auto-normalize: divide each loss by its running EMA, then apply weights
+            # So each component contributes ~w regardless of raw magnitude
+            L0_normed = L0 / norm_L0.clip(1e-10)
+            L1_normed = L1 / norm_L1.clip(1e-10)
+            L2_normed = L2 / norm_L2.clip(1e-10)
+
+            total = w0 * L0_normed + w1 * L1_normed + w2 * L2_normed
+            return total, (L0, L1, L2)
 
         (loss, (l0, l1, l2)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
@@ -541,11 +587,19 @@ license: apache-2.0
     # ---------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------
+    # Load existing training log if resuming
+    log_path = output_dir / "training_log.json"
     log_entries = []
-    best_loss = float("inf")
-    global_step = 0
+    if log_path.exists() and start_epoch > 0:
+        try:
+            log_entries = json.loads(log_path.read_text())
+        except Exception:
+            pass
 
-    for epoch in range(args.epochs):
+    best_loss = min((e.get("loss", float("inf")) for e in log_entries), default=float("inf"))
+    global_step = start_epoch * steps_per_epoch
+
+    for epoch in range(start_epoch, args.epochs):
         tot_loss = tot_l0 = tot_l1 = tot_l2 = 0.0
         n_steps = 0
 
@@ -576,12 +630,21 @@ license: apache-2.0
                 jnp.array(tokens_np, dtype=jnp.int32),
                 jnp.array(teacher_embs_np, dtype=jnp.float32),
                 jnp.array(mask_np, dtype=jnp.float32),
+                jnp.float32(_ema["L0"]),
+                jnp.float32(_ema["L1"]),
+                jnp.float32(_ema["L2"]),
             )
 
+            # Update running EMA for auto-normalization
+            l0_v, l1_v, l2_v = float(l0), float(l1), float(l2)
+            _ema["L0"] = _ema_decay * _ema["L0"] + (1 - _ema_decay) * max(l0_v, 1e-10)
+            _ema["L1"] = _ema_decay * _ema["L1"] + (1 - _ema_decay) * max(l1_v, 1e-10)
+            _ema["L2"] = _ema_decay * _ema["L2"] + (1 - _ema_decay) * max(l2_v, 1e-10)
+
             tot_loss += float(loss)
-            tot_l0 += float(l0)
-            tot_l1 += float(l1)
-            tot_l2 += float(l2)
+            tot_l0 += l0_v
+            tot_l1 += l1_v
+            tot_l2 += l2_v
             n_steps += 1
             global_step += 1
 
