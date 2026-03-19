@@ -77,21 +77,38 @@ biologically meaningful axes, not random noise in high-dimensional space.
 
 ## 3. CORRECTIONS — Findings That Do NOT Hold
 
-### 3a. Single-variant vs epistasis comparison: CONFOUNDED
+### 3a. Single-variant vs epistasis: CORRECTED (within-bin analysis)
 
-The residualized comparison (Cell 14 output showing |log_MR| ratio 3.96x) is
-**confounded by distance**. Within-bin analysis shows:
+The residualized ratios (3.96x) were distance-confounded. The within-bin analysis
+(Cell 14 corrected) reveals a nuanced, model-specific picture:
 
-| Model | Metric | Within-bin TCGA/1kGP ratio | Significant? |
-|-------|--------|---------------------------|-------------|
-| NT-50M | \|log_MR\| | 0.4-0.9 across all bins | NO — 1kGP HIGHER |
-| Borzoi | \|log_MR\| | 0.8-1.0 across all bins | NO |
-| MutBERT | \|log_MR\| | 1.2-1.7 at some bins | Partial |
-| DNABERT | \|log_MR\| | <1 at short range, ~1.8 at long | Distance-dependent |
+**Individual mutations (singles):** TCGA > 1kGP in ALL 42 model×bin combinations
+(mean ratio 1.37, 41/42 significant). Cancer somatic mutations are genuinely more
+disruptive than population variants. This is real and universal.
 
-**DO NOT report the residualized ratios.** The distance distributions of TCGA
-(median 4bp) and 1kGP (median 29bp) are too different for residualization to work.
-Only within-bin comparisons are valid.
+**Epistasis (|logMR|):** Only 12/42 bins show TCGA > 1kGP. Mean ratio 1.04 —
+essentially no difference for most models. HOWEVER, two MLM models break the pattern:
+
+| Model | |logMR| ratio range | Significant bins | |R_singles| ratio range |
+|-------|---------------------|-----------------|------------------------|
+| **MutBERT** | 1.13-1.62 | **6/6 (all)** | 1.32-1.70 |
+| **DNABERT** | 1.78-1.88 (at 6-100bp) | **5/6** | 1.48-1.67 |
+| Borzoi | 0.76-0.91 | 0/6 | 0.76-0.98 |
+| AlphaGenome | 0.73-0.95 | 0/6 | 0.81-1.10 |
+| NT-50M | 0.44-0.94 | 0/6 | 0.71-1.04 |
+| Evo2 | 0.91-1.00 | 0/6 | 0.97-0.99 |
+| NTv3 post | 0.94-1.10 | 1/6 | 0.98-1.21 |
+
+**Interpretation for paper:** Short-context MLMs (MutBERT 256bp, DNABERT 512bp)
+detect more non-additive interaction structure in cancer doubles than population
+doubles, while track-based and long-context models do not. This suggests that
+compact MLMs represent local variant interactions more densely, possibly because
+their limited context forces them to encode nearby-mutation relationships in the
+embedding dimensions rather than spreading capacity across long-range features.
+
+This is a genuine architectural insight — not all models encode epistasis equally,
+and the models that detect cancer-specific epistasis are NOT the same models that
+perform best on expression or splicing benchmarks.
 
 ### 3b. Co-occurrence correlation: CONFOUNDED
 
