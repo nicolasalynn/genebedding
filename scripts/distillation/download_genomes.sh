@@ -12,17 +12,19 @@
 
 set -e
 
-GENOME_DIR="${1:-$HOME/data/genomes}"
+SMALL_MODE=false
+GENOME_DIR="$HOME/data/genomes"
+
+for arg in "$@"; do
+    if [[ "$arg" == "--small" ]]; then
+        SMALL_MODE=true
+    else
+        GENOME_DIR="$arg"
+    fi
+done
+
 mkdir -p "$GENOME_DIR"
 cd "$GENOME_DIR"
-
-SMALL_MODE=false
-if [[ "$2" == "--small" ]] || [[ "$1" == "--small" ]]; then
-    SMALL_MODE=true
-    GENOME_DIR="${2:-$HOME/data/genomes}"
-    mkdir -p "$GENOME_DIR"
-    cd "$GENOME_DIR"
-fi
 
 download() {
     local name="$1"
