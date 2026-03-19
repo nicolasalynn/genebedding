@@ -241,21 +241,29 @@ class TeacherExtractor:
         else:
             str_seqs = sequences
 
-        # Run teacher one sequence at a time (safest for variable architectures)
+        # Run teacher one sequence at a time, process in small chunks
+        # to avoid GPU OOM. Free memory between chunks.
+        import gc
         all_embs = []
         max_L = max(seq_lengths)
-        for seq in str_seqs:
-            emb = self.model.embed(seq, pool="tokens", return_numpy=True)
-            # emb shape: (L_tokens, D) — may differ from input length for k-mer models
-            if emb.ndim == 1:
-                emb = emb[np.newaxis, :]  # (1, D)
-            # Pad to max_L
-            if emb.shape[0] < max_L:
-                pad = np.zeros((max_L - emb.shape[0], emb.shape[-1]), dtype=np.float32)
-                emb = np.concatenate([emb, pad], axis=0)
-            elif emb.shape[0] > max_L:
-                emb = emb[:max_L]
-            all_embs.append(emb)
+        chunk_size = 8  # process 8 sequences at a time, free memory between
+
+        for ci in range(0, len(str_seqs), chunk_size):
+            chunk = str_seqs[ci:ci + chunk_size]
+            for seq in chunk:
+                emb = self.model.embed(seq, pool="tokens", return_numpy=True)
+                if emb.ndim == 1:
+                    emb = emb[np.newaxis, :]
+                if emb.shape[0] < max_L:
+                    pad = np.zeros((max_L - emb.shape[0], emb.shape[-1]), dtype=np.float32)
+                    emb = np.concatenate([emb, pad], axis=0)
+                elif emb.shape[0] > max_L:
+                    emb = emb[:max_L]
+                all_embs.append(emb)
+
+            # Free PyTorch GPU memory between chunks
+            torch.cuda.empty_cache()
+            gc.collect()
 
         return np.stack(all_embs).astype(np.float32)  # (B, max_L, D)
 
@@ -672,10 +680,10 @@ def main():
     parser.add_argument("--n-downsamples", type=int, default=3)
     parser.add_argument("--n-transformer-layers", type=int, default=8)
     parser.add_argument("--max-mutations", type=int, default=5)
-    parser.add_argument("--n-focal-positions", type=int, default=5,
+    parser.add_argument("--n-focal-positions", type=int, default=3,
                         help="Focal positions per window for structured mutations")
-    parser.add_argument("--batch-size", type=int, default=2,
-                        help="Windows per batch (each produces ~40-60 sequences)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Windows per batch (each produces ~25-30 sequences)")
     parser.add_argument("--steps-per-epoch", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
