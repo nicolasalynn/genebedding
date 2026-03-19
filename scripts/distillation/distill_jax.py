@@ -415,22 +415,23 @@ def train(args):
             start_epoch = int(saved_config.get("last_epoch", 0))
             logger.info("Resuming from epoch %d (loading %s)", start_epoch, resume_path)
 
-            # Load params — reconstruct tree structure from flat npz
-            saved_flat = np.load(resume_path)
-            # We can't easily reconstruct the pytree from flat keys,
-            # so instead we overwrite leaf values in the initialized params
-            saved_leaves = {k: jnp.array(v) for k, v in saved_flat.items()}
-            flat_params, treedef = jax.tree_util.tree_flatten_with_path(params)
-            new_leaves = []
-            for path, leaf in zip(*jax.tree_util.tree_flatten_with_path(params)):
-                key = "/".join(str(k) for k in path)
-                if key in saved_leaves and saved_leaves[key].shape == leaf.shape:
-                    new_leaves.append(saved_leaves[key])
+            # Load params — match saved arrays to initialized param tree by key
+            saved_flat = dict(np.load(resume_path))
+            saved_jax = {k: jnp.array(v) for k, v in saved_flat.items()}
+
+            # Walk the param tree and replace leaves whose keys match
+            def _restore(tree, prefix=""):
+                if isinstance(tree, dict):
+                    return {k: _restore(v, f"{prefix}/{k}" if prefix else k)
+                            for k, v in tree.items()}
                 else:
-                    new_leaves.append(leaf)
-            params = jax.tree_util.tree_unflatten(
-                jax.tree_util.tree_structure(params), new_leaves)
-            logger.info("Restored %d parameter arrays", len(new_leaves))
+                    key = prefix
+                    if key in saved_jax and saved_jax[key].shape == tree.shape:
+                        return saved_jax[key]
+                    return tree
+
+            params = _restore(params)
+            logger.info("Restored params from %s", resume_path)
         except Exception as e:
             logger.warning("Failed to resume: %s. Starting fresh.", e)
             start_epoch = 0
