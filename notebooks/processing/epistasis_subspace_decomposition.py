@@ -1,38 +1,27 @@
 """
-Epistasis subspace decomposition: what KIND of epistasis does each pair have?
+Epistasis subspace decomposition: TCGA somatic vs 1kGP germline.
 
-For each TCGA double-variant pair, we decompose the epistasis residual vector
-into two components:
+Same anchor mutations, distance-matched. The only difference is the
+second mutation: cancer-selected vs population-occurring.
 
-  ε = ε_expression + ε_orthogonal
+For each pair, decompose the epistasis residual into:
+  ε_expression = component along null's dominant axes (expression)
+  ε_orthogonal = everything else (splicing, structural, etc.)
 
-Where ε_expression is the projection onto the top-k eigenvectors of the null
-(population) covariance — the "expression-dominated" subspace for track models.
-
-The expression fraction = |ε_expression|² / |ε|² tells you how much of the
-pair's epistasis lives in the expression subspace vs orthogonal directions
-(splicing, structural, etc).
-
-Key question: do oncogenes and TSGs differ in expression fraction?
-
-If so, the directional asymmetry (corrective vs cumulative) has a mechanistic
-explanation: different cancer gene classes interact through different biological
-pathways, visible as different subspace projections.
-
-Runs on cluster (needs embedding DBs for residual vectors).
+Question: do cancer pairs interact through different mechanisms
+than germline pairs, even if the overall magnitude is similar?
 """
 
-# ---------------------------------------------------------------------------
-# Cell 1: Setup
-# ---------------------------------------------------------------------------
 import sys, os, logging
 from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import mannwhitneyu, spearmanr
+from scipy.stats import mannwhitneyu
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,21 +54,13 @@ TSGS = (
     | set(census[census["Role in Cancer"].str.contains("TSG", case=False, na=False)]["Gene Symbol"].str.strip())
 )
 
-print(f"Oncogenes: {len(ONCOGENES)}, TSGs: {len(TSGS)}")
-
-
-# ---------------------------------------------------------------------------
-# Cell 2: Load null eigenvectors + compute subspace projections
-# ---------------------------------------------------------------------------
 from genebeddings import VariantEmbeddingDB
 from genebeddings.epistasis_features import _list_epistasis_ids_from_db, _load_residual_from_db
 
+# Two groups: TCGA somatic vs 1kGP germline (matched anchors)
 SOURCES = {
-    "tcga_doubles": "TCGA (original)",
-    "tcga_high_selection": "TCGA high-sel",
-    "tcga_low_selection": "TCGA low-sel",
+    "tcga_high_selection": "TCGA somatic",
     "okgp_matched_doubles": "1kGP germline",
-    "okgp_chr12": "1kGP chr12 (null)",
 }
 
 MODELS = {
@@ -89,29 +70,37 @@ MODELS = {
     "mutbert": "MutBERT",
     "dnabert": "DNABERT",
     "ntv3_100m_post": "NTv3-post",
-    "evo2": "Evo2",
+    "rinalmo": "RiNALMo",
 }
 
-K_DIMS = 50  # number of top null eigenvectors to define "expression subspace"
+K_DIMS = 50
 
-all_decomp = []
+# Distance bins for within-bin comparison
+DIST_BINS = [(1, 6), (6, 21), (21, 101), (101, 501)]
+DIST_LABELS = ["1-5bp", "6-20bp", "21-100bp", "101-500bp"]
+
+print(f"Comparing: {list(SOURCES.values())}")
+print(f"Models: {list(MODELS.values())}")
+print(f"Expression subspace: top-{K_DIMS} null eigenvectors")
+
+
+# ---------------------------------------------------------------------------
+# Compute decomposition for both sources
+# ---------------------------------------------------------------------------
+all_rows = []
 
 for mk, display in MODELS.items():
-    # Load null covariance eigenvectors
     cov_path = CACHE_DIR / f"{mk}_cov_inv.npz"
     if not cov_path.exists():
         logger.warning("No null cov for %s, skipping", mk)
         continue
 
-    cov_data = np.load(cov_path)
-    null_cov = cov_data["cov"]
+    null_cov = np.load(cov_path)["cov"]
     d = null_cov.shape[0]
 
-    # Top-k eigenvectors of null covariance = "expression subspace"
     eigenvalues, eigenvectors = np.linalg.eigh(null_cov)
-    V_expression = eigenvectors[:, -K_DIMS:]  # (d, k)
+    V_expr = eigenvectors[:, -K_DIMS:]  # top-k null eigenvectors
 
-    # Process ALL sources
     for source_key, source_label in SOURCES.items():
         db_path = OUTPUT_BASE / source_key / f"{mk}.db"
         if not db_path.exists():
@@ -119,270 +108,217 @@ for mk, display in MODELS.items():
 
         db = VariantEmbeddingDB(str(db_path))
         epi_ids = _list_epistasis_ids_from_db(db)
-        logger.info("%s/%s: %d pairs, d=%d", mk, source_key, len(epi_ids), d)
+        logger.info("%s / %s: %d pairs", display, source_label, len(epi_ids))
 
         for eid in epi_ids:
-            residual = _load_residual_from_db(db, eid)
-            if residual is None:
+            r = _load_residual_from_db(db, eid)
+            if r is None:
                 continue
-
-            r = residual.astype(np.float64)
+            r = r.astype(np.float64)
             r_norm_sq = np.dot(r, r)
             if r_norm_sq < 1e-30:
                 continue
 
-            r_proj = V_expression @ (V_expression.T @ r)
-            r_proj_norm_sq = np.dot(r_proj, r_proj)
-
-            expression_fraction = r_proj_norm_sq / r_norm_sq
-            r_mag = np.sqrt(r_norm_sq)
+            r_proj = V_expr @ (V_expr.T @ r)
+            r_proj_sq = np.dot(r_proj, r_proj)
+            expr_frac = r_proj_sq / r_norm_sq
 
             gene = eid.split(":")[0]
             parts = eid.split("|")
-            distance = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
+            dist = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
 
-            all_decomp.append({
-                "model": mk,
-                "display": display,
-                "source": source_key,
-                "source_label": source_label,
-                "epistasis_id": eid,
-                "gene": gene,
-                "distance": distance,
-                "expression_fraction": float(expression_fraction),
-                "orthogonal_fraction": 1.0 - float(expression_fraction),
-                "residual_magnitude": float(r_mag),
-                "expression_magnitude": float(np.sqrt(r_proj_norm_sq)),
-                "orthogonal_magnitude": float(np.sqrt(max(0, r_norm_sq - r_proj_norm_sq))),
-                "is_oncogene": gene in ONCOGENES,
-                "is_tsg": gene in TSGS,
-                "gene_class": "Oncogene" if gene in ONCOGENES else ("TSG" if gene in TSGS else "Other"),
+            all_rows.append({
+                "model": mk, "display": display,
+                "source": source_key, "source_label": source_label,
+                "epistasis_id": eid, "gene": gene, "distance": dist,
+                "expression_fraction": float(expr_frac),
+                "orthogonal_fraction": 1.0 - float(expr_frac),
+                "residual_magnitude": float(np.sqrt(r_norm_sq)),
+                "expression_magnitude": float(np.sqrt(r_proj_sq)),
+                "orthogonal_magnitude": float(np.sqrt(max(0, r_norm_sq - r_proj_sq))),
+                "gene_class": ("Oncogene" if gene in ONCOGENES else
+                               "TSG" if gene in TSGS else "Other"),
             })
 
         db.close()
 
-df_decomp = pd.DataFrame(all_decomp)
-print(f"\nTotal: {len(df_decomp)} model×pair entries")
-print(f"Models: {df_decomp['model'].nunique()}")
-print(f"Pairs per model: {df_decomp.groupby('model').size().to_dict()}")
+df = pd.DataFrame(all_rows)
+print(f"\nTotal: {len(df)} entries")
+print(df.groupby(["display", "source_label"]).size().unstack(fill_value=0))
 
 
 # ---------------------------------------------------------------------------
-# Cell 3: Compare expression fraction across sources AND gene classes
+# Head-to-head: TCGA vs 1kGP expression fraction (within-bin)
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 100)
-print(f"EXPRESSION FRACTION by source and gene class (top-{K_DIMS} null eigenvectors)")
-print("High = epistasis along expression axes | Low = orthogonal (splicing/structural)")
+print("HEAD-TO-HEAD: expression fraction — TCGA somatic vs 1kGP germline")
+print("Within-distance-bin comparison (no residualization)")
 print("=" * 100)
 
-# 3a: Source comparison (cancer vs germline)
-print("\n--- SOURCE COMPARISON (all genes) ---")
-source_rows = []
-for mk in df_decomp["model"].unique():
-    sub = df_decomp[df_decomp["model"] == mk]
-    display = sub.iloc[0]["display"]
+for mk, display in MODELS.items():
+    sub = df[df["model"] == mk]
+    tcga = sub[sub["source"] == "tcga_high_selection"]
+    germ = sub[sub["source"] == "okgp_matched_doubles"]
 
-    print(f"\n  {display}:")
-    source_vals = {}
-    for src in SOURCES:
-        vals = sub[sub["source"] == src]["expression_fraction"]
-        if len(vals) >= 10:
-            source_vals[src] = vals
-            print(f"    {SOURCES[src]:25s}: median={vals.median():.4f}, n={len(vals)}")
+    if len(tcga) < 50 or len(germ) < 50:
+        continue
 
-    # Pairwise comparisons
-    for s1, s2 in [("tcga_doubles", "okgp_chr12"),
-                    ("tcga_high_selection", "tcga_low_selection"),
-                    ("tcga_high_selection", "okgp_matched_doubles")]:
-        if s1 in source_vals and s2 in source_vals:
-            _, p = mannwhitneyu(source_vals[s1], source_vals[s2], alternative="two-sided")
-            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
-            source_rows.append({
-                "model": display, "comparison": f"{SOURCES[s1]} vs {SOURCES[s2]}",
-                "median_1": source_vals[s1].median(), "median_2": source_vals[s2].median(),
-                "p": p,
-            })
-            print(f"    {SOURCES[s1]} vs {SOURCES[s2]}: p={p:.2e} {sig}")
+    print(f"\n--- {display} ---")
+    print(f"{'bin':>12s} | {'n_TCGA':>7s} {'n_germ':>7s} | "
+          f"{'TCGA expr_frac':>15s} {'germ expr_frac':>15s} | "
+          f"{'p (two-sided)':>14s} {'dir':>6s}")
 
-df_source_comp = pd.DataFrame(source_rows)
+    for (lo, hi), label in zip(DIST_BINS, DIST_LABELS):
+        t = tcga[(tcga["distance"] >= lo) & (tcga["distance"] < hi)]
+        g = germ[(germ["distance"] >= lo) & (germ["distance"] < hi)]
 
-# 3b: Gene class comparison within TCGA
-print("\n\n--- GENE CLASS COMPARISON (TCGA sources combined) ---")
-summary_rows = []
-for mk in df_decomp["model"].unique():
-    sub = df_decomp[(df_decomp["model"] == mk) &
-                     df_decomp["source"].isin(["tcga_doubles", "tcga_high_selection", "tcga_low_selection"])]
-    display = sub.iloc[0]["display"]
+        if len(t) < 10 or len(g) < 10:
+            continue
 
-    onc = sub[sub["gene_class"] == "Oncogene"]["expression_fraction"]
-    tsg = sub[sub["gene_class"] == "TSG"]["expression_fraction"]
-    other = sub[sub["gene_class"] == "Other"]["expression_fraction"]
+        tv = t["expression_fraction"]
+        gv = g["expression_fraction"]
+        _, p = mannwhitneyu(tv, gv, alternative="two-sided")
+        sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+        direction = "TCGA>" if tv.median() > gv.median() else "germ>"
 
-    if len(onc) < 10 or len(tsg) < 10:
+        print(f"{label:>12s} | {len(t):7d} {len(g):7d} | "
+              f"{tv.median():15.4f} {gv.median():15.4f} | "
+              f"{p:13.2e}{sig:>3s} {direction:>6s}")
+
+    # Pooled
+    _, p_pool = mannwhitneyu(tcga["expression_fraction"],
+                              germ["expression_fraction"], alternative="two-sided")
+    sig = "***" if p_pool < 0.001 else "**" if p_pool < 0.01 else "*" if p_pool < 0.05 else ""
+    direction = "TCGA>" if tcga["expression_fraction"].median() > germ["expression_fraction"].median() else "germ>"
+    print(f"{'POOLED':>12s} | {len(tcga):7d} {len(germ):7d} | "
+          f"{tcga['expression_fraction'].median():15.4f} "
+          f"{germ['expression_fraction'].median():15.4f} | "
+          f"{p_pool:13.2e}{sig:>3s} {direction:>6s}")
+
+
+# ---------------------------------------------------------------------------
+# Gene class breakdown within TCGA
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 100)
+print("GENE CLASS: expression fraction within TCGA somatic pairs")
+print("=" * 100)
+
+for mk, display in MODELS.items():
+    tcga = df[(df["model"] == mk) & (df["source"] == "tcga_high_selection")]
+    if len(tcga) < 50:
+        continue
+
+    onc = tcga[tcga["gene_class"] == "Oncogene"]["expression_fraction"]
+    tsg = tcga[tcga["gene_class"] == "TSG"]["expression_fraction"]
+    other = tcga[tcga["gene_class"] == "Other"]["expression_fraction"]
+
+    if len(onc) < 5 or len(tsg) < 5:
         continue
 
     _, p_ot = mannwhitneyu(onc, tsg, alternative="two-sided")
-    _, p_oo = mannwhitneyu(onc, other, alternative="two-sided")
-    _, p_to = mannwhitneyu(tsg, other, alternative="two-sided")
-
     sig = "***" if p_ot < 0.001 else "**" if p_ot < 0.01 else "*" if p_ot < 0.05 else ""
 
-    summary_rows.append({
-        "model": display,
-        "onc_median": onc.median(),
-        "tsg_median": tsg.median(),
-        "other_median": other.median(),
-        "p_onc_vs_tsg": p_ot,
-        "p_onc_vs_other": p_oo,
-        "p_tsg_vs_other": p_to,
-        "n_onc": len(onc),
-        "n_tsg": len(tsg),
-    })
-
     print(f"\n  {display}:")
-    print(f"    Oncogene: median={onc.median():.4f} (n={len(onc)})")
-    print(f"    TSG:      median={tsg.median():.4f} (n={len(tsg)})")
-    print(f"    Other:    median={other.median():.4f} (n={len(other)})")
+    print(f"    Oncogene:  {onc.median():.4f} (n={len(onc)})")
+    print(f"    TSG:       {tsg.median():.4f} (n={len(tsg)})")
+    print(f"    Other:     {other.median():.4f} (n={len(other)})")
     print(f"    Onc vs TSG: p={p_ot:.2e} {sig}")
 
-df_summary = pd.DataFrame(summary_rows)
-
-# 3c: Null signature matching — what fraction of null pairs look expression-like vs splicing-like?
-print("\n\n--- NULL SIGNATURE DISTRIBUTION ---")
-for mk in df_decomp["model"].unique():
-    sub = df_decomp[df_decomp["model"] == mk]
-    display = sub.iloc[0]["display"]
-
-    for src in SOURCES:
-        vals = sub[sub["source"] == src]["expression_fraction"]
-        if len(vals) < 50:
-            continue
-        expr_like = (vals > 0.5).mean()  # fraction with >50% expression-axis
-        splicing_like = (vals <= 0.5).mean()
-        print(f"  {display:15s} {SOURCES[src]:25s}: "
-              f"expression-like={expr_like:.1%}, orthogonal={splicing_like:.1%} (n={len(vals)})")
-
 
 # ---------------------------------------------------------------------------
-# Cell 4: Figure — expression fraction distributions by gene class
+# Figure: expression fraction by source and gene class
 # ---------------------------------------------------------------------------
-models_to_plot = [mk for mk in MODELS if mk in df_decomp["model"].unique()]
-n_models = len(models_to_plot)
+models_to_plot = [mk for mk in MODELS if mk in df["model"].unique()]
+n_m = len(models_to_plot)
 
-if n_models > 0:
-    fig, axes = plt.subplots(1, n_models, figsize=(4 * n_models, 5), sharey=True)
-    if n_models == 1:
-        axes = [axes]
+if n_m > 0:
+    fig, axes = plt.subplots(2, n_m, figsize=(4 * n_m, 8))
+    if n_m == 1:
+        axes = axes.reshape(2, 1)
 
-    colors = {"Oncogene": "#CB6A49", "TSG": "#4A7FB5", "Other": "#CCCCCC"}
+    source_colors = {"TCGA somatic": "#d62728", "1kGP germline": "#1f77b4"}
+    class_colors = {"Oncogene": "#CB6A49", "TSG": "#4A7FB5", "Other": "#CCCCCC"}
 
-    for ax, mk in zip(axes, models_to_plot):
-        sub = df_decomp[df_decomp["model"] == mk]
+    for j, mk in enumerate(models_to_plot):
         display = MODELS[mk]
+        sub = df[df["model"] == mk]
 
-        for gene_class, color in colors.items():
-            vals = sub[sub["gene_class"] == gene_class]["expression_fraction"]
+        # Top row: source comparison
+        ax = axes[0, j]
+        for src_label, color in source_colors.items():
+            vals = sub[sub["source_label"] == src_label]["expression_fraction"]
             if len(vals) > 0:
-                ax.hist(vals, bins=50, alpha=0.5, color=color, label=gene_class,
-                        density=True, edgecolor="none")
-
-        # Medians
-        for gene_class, color in colors.items():
-            vals = sub[sub["gene_class"] == gene_class]["expression_fraction"]
-            if len(vals) > 0:
+                ax.hist(vals, bins=50, alpha=0.5, color=color,
+                        density=True, label=src_label, edgecolor="none")
                 ax.axvline(vals.median(), color=color, linestyle="--", linewidth=1.5)
+        ax.set_title(display, fontweight="bold", fontsize=10)
+        ax.set_xlabel("Expression fraction")
+        if j == 0:
+            ax.set_ylabel("Density")
+        ax.legend(fontsize=7)
 
-        ax.set_xlabel(f"Expression fraction (top-{K_DIMS} null axes)")
-        ax.set_title(display, fontweight="bold")
-        ax.legend(fontsize=8)
-
-        # Add p-value annotation
-        row = df_summary[df_summary["model"] == display]
-        if len(row) > 0:
-            p = row.iloc[0]["p_onc_vs_tsg"]
-            p_str = f"p={p:.2e}" if p < 0.01 else f"p={p:.3f}"
-            ax.text(0.95, 0.95, f"Onc vs TSG:\n{p_str}",
-                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+        # Add p-value
+        tcga = sub[sub["source"] == "tcga_high_selection"]["expression_fraction"]
+        germ = sub[sub["source"] == "okgp_matched_doubles"]["expression_fraction"]
+        if len(tcga) > 10 and len(germ) > 10:
+            _, p = mannwhitneyu(tcga, germ, alternative="two-sided")
+            ax.text(0.95, 0.95, f"p={p:.2e}", transform=ax.transAxes,
+                    fontsize=8, ha="right", va="top",
                     bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
 
-    axes[0].set_ylabel("Density")
-    fig.suptitle("Epistasis subspace decomposition: expression vs orthogonal",
-                 fontsize=13, fontweight="bold", y=1.02)
+        # Bottom row: gene class within TCGA
+        ax2 = axes[1, j]
+        tcga_sub = sub[sub["source"] == "tcga_high_selection"]
+        for gc, color in class_colors.items():
+            vals = tcga_sub[tcga_sub["gene_class"] == gc]["expression_fraction"]
+            if len(vals) > 0:
+                ax2.hist(vals, bins=50, alpha=0.5, color=color,
+                         density=True, label=gc, edgecolor="none")
+                ax2.axvline(vals.median(), color=color, linestyle="--", linewidth=1.5)
+        ax2.set_xlabel("Expression fraction")
+        if j == 0:
+            ax2.set_ylabel("Density")
+        ax2.legend(fontsize=7)
+
+    axes[0, 0].text(-0.15, 1.1, "a", transform=axes[0, 0].transAxes,
+                     fontsize=14, fontweight="bold")
+    axes[1, 0].text(-0.15, 1.1, "b", transform=axes[1, 0].transAxes,
+                     fontsize=14, fontweight="bold")
+
+    fig.suptitle("Epistasis subspace: expression-axis vs orthogonal\n"
+                 "(a) TCGA somatic vs 1kGP germline  (b) Gene classes within TCGA",
+                 fontsize=12, fontweight="bold", y=1.02)
     fig.tight_layout()
-    fig.savefig(FIG_DIR / "fig_epistasis_subspace_decomposition.png",
-                dpi=200, bbox_inches="tight")
-    fig.savefig(FIG_DIR / "fig_epistasis_subspace_decomposition.pdf",
-                bbox_inches="tight")
-    plt.show()
-    print(f"\nSaved to {FIG_DIR}")
+    fig.savefig(FIG_DIR / "fig_epistasis_subspace.png", dpi=200, bbox_inches="tight")
+    fig.savefig(FIG_DIR / "fig_epistasis_subspace.pdf", bbox_inches="tight")
+    print(f"\nFigure saved to {FIG_DIR / 'fig_epistasis_subspace.png'}")
 
 
 # ---------------------------------------------------------------------------
-# Cell 5: 2D scatter — expression magnitude vs orthogonal magnitude
+# Summary
 # ---------------------------------------------------------------------------
-if n_models > 0:
-    fig2, axes2 = plt.subplots(1, min(n_models, 4), figsize=(5 * min(n_models, 4), 5))
-    if min(n_models, 4) == 1:
-        axes2 = [axes2]
+print("\n" + "=" * 100)
+print("SUMMARY")
+print("=" * 100)
 
-    for ax, mk in zip(axes2, models_to_plot[:4]):
-        sub = df_decomp[df_decomp["model"] == mk]
-        display = MODELS[mk]
+for mk, display in MODELS.items():
+    sub = df[df["model"] == mk]
+    tcga = sub[sub["source"] == "tcga_high_selection"]
+    germ = sub[sub["source"] == "okgp_matched_doubles"]
+    if len(tcga) < 50 or len(germ) < 50:
+        continue
 
-        for gene_class in ["Other", "TSG", "Oncogene"]:  # plot Other first (background)
-            vals = sub[sub["gene_class"] == gene_class]
-            color = colors[gene_class]
-            alpha = 0.1 if gene_class == "Other" else 0.5
-            size = 3 if gene_class == "Other" else 10
-            ax.scatter(vals["expression_magnitude"], vals["orthogonal_magnitude"],
-                       c=color, s=size, alpha=alpha, label=gene_class, edgecolors="none")
+    _, p_source = mannwhitneyu(tcga["expression_fraction"],
+                                germ["expression_fraction"], alternative="two-sided")
 
-        ax.set_xlabel("Expression-axis epistasis")
-        ax.set_ylabel("Orthogonal-axis epistasis")
-        ax.set_title(display, fontweight="bold")
-        ax.legend(fontsize=7, markerscale=3)
+    t_expr = (tcga["expression_fraction"] > 0.5).mean()
+    g_expr = (germ["expression_fraction"] > 0.5).mean()
 
-        # Equal aspect
-        max_val = max(sub["expression_magnitude"].quantile(0.99),
-                      sub["orthogonal_magnitude"].quantile(0.99))
-        ax.set_xlim(0, max_val)
-        ax.set_ylim(0, max_val)
-        ax.plot([0, max_val], [0, max_val], "k--", alpha=0.3, linewidth=0.5)
+    print(f"\n  {display}:")
+    print(f"    TCGA expression-dominant: {t_expr:.1%} of pairs")
+    print(f"    1kGP expression-dominant: {g_expr:.1%} of pairs")
+    print(f"    TCGA vs 1kGP expr_frac: p={p_source:.2e}")
 
-    fig2.suptitle("Epistasis decomposition: expression vs orthogonal magnitude",
-                  fontsize=13, fontweight="bold", y=1.02)
-    fig2.tight_layout()
-    fig2.savefig(FIG_DIR / "fig_epistasis_2d_decomposition.png",
-                 dpi=200, bbox_inches="tight")
-    plt.show()
-
-
-# ---------------------------------------------------------------------------
-# Cell 6: Summary statistics
-# ---------------------------------------------------------------------------
-print("\n" + "=" * 90)
-print("PAPER-READY STATISTICS")
-print("=" * 90)
-
-if len(df_summary) > 0:
-    print(f"\nExpression fraction (top-{K_DIMS} null eigenvectors):")
-    print(df_summary[["model", "onc_median", "tsg_median", "other_median",
-                       "p_onc_vs_tsg", "n_onc", "n_tsg"]].to_string(index=False))
-
-    # Across-model summary
-    n_sig = (df_summary["p_onc_vs_tsg"] < 0.05).sum()
-    mean_onc = df_summary["onc_median"].mean()
-    mean_tsg = df_summary["tsg_median"].mean()
-    print(f"\nAcross models:")
-    print(f"  Mean oncogene expression fraction: {mean_onc:.4f}")
-    print(f"  Mean TSG expression fraction: {mean_tsg:.4f}")
-    print(f"  Significant (p<0.05): {n_sig}/{len(df_summary)} models")
-
-    if mean_onc > mean_tsg:
-        print(f"  → Oncogenes have MORE expression-aligned epistasis")
-    else:
-        print(f"  → TSGs have MORE expression-aligned epistasis")
-
-# Save decomposition data
-df_decomp.to_parquet(FIG_DIR / "epistasis_subspace_decomposition.parquet", index=False)
-print(f"\nDecomposition data saved to {FIG_DIR / 'epistasis_subspace_decomposition.parquet'}")
+# Save data
+df.to_parquet(FIG_DIR / "epistasis_subspace_decomposition.parquet", index=False)
+print(f"\nData saved to {FIG_DIR / 'epistasis_subspace_decomposition.parquet'}")
