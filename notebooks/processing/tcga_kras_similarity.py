@@ -68,6 +68,17 @@ MODELS = {
     "borzoi": "Borzoi",
 }
 
+# All sources to score
+SOURCES = {
+    "tcga_high_selection": "TCGA high-sel",
+    "tcga_low_selection": "TCGA low-sel",
+    "tcga_doubles": "TCGA original",
+    "okgp_matched_doubles": "1kGP germline",
+}
+
+DIST_BINS = [(1, 6), (6, 21), (21, 101), (101, 501)]
+DIST_LABELS = ["1-5bp", "6-20bp", "21-100bp", "101-500bp"]
+
 
 def cosine_sim(a, b):
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -77,11 +88,11 @@ def cosine_sim(a, b):
 
 
 # =========================================================================
-# Load KRAS template + score all TCGA pairs
+# Score ALL sources against KRAS template
 # =========================================================================
 for mk, display in MODELS.items():
     print(f"\n{'=' * 90}")
-    print(f"{display}: finding TCGA pairs similar to KRAS G60G-Q61K")
+    print(f"{display}: scoring all sources against KRAS G60G-Q61K")
     print(f"{'=' * 90}")
 
     # Load KRAS template
@@ -99,113 +110,143 @@ for mk, display in MODELS.items():
         continue
 
     kras_vec = kras_residual.astype(np.float64)
-    kras_norm = np.linalg.norm(kras_vec)
-    print(f"  KRAS template: dim={len(kras_vec)}, |ε|={kras_norm:.6f}")
+    print(f"  KRAS template: dim={len(kras_vec)}, |ε|={np.linalg.norm(kras_vec):.6f}")
 
-    # Score all TCGA pairs
-    tcga_db = OUTPUT_BASE / "tcga_doubles" / f"{mk}.db"
-    if not tcga_db.exists():
-        print(f"  No TCGA DB, skipping")
-        continue
-
-    db = VariantEmbeddingDB(str(tcga_db))
-    epi_ids = _list_epistasis_ids_from_db(db)
-    print(f"  Scoring {len(epi_ids)} TCGA pairs...")
-
-    rows = []
-    for eid in epi_ids:
-        r = _load_residual_from_db(db, eid)
-        if r is None:
-            continue
-        r = r.astype(np.float64)
-        r_norm = np.linalg.norm(r)
-        if r_norm < 1e-20:
+    # Score all sources
+    all_rows = []
+    for source_key, source_label in SOURCES.items():
+        src_db = OUTPUT_BASE / source_key / f"{mk}.db"
+        if not src_db.exists():
             continue
 
-        cos = cosine_sim(r, kras_vec)
+        db = VariantEmbeddingDB(str(src_db))
+        epi_ids = _list_epistasis_ids_from_db(db)
+        logger.info("%s / %s: %d pairs", display, source_label, len(epi_ids))
 
-        gene = eid.split(":")[0]
-        parts = eid.split("|")
-        dist = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
+        for eid in epi_ids:
+            r = _load_residual_from_db(db, eid)
+            if r is None:
+                continue
+            r = r.astype(np.float64)
+            r_norm = np.linalg.norm(r)
+            if r_norm < 1e-20:
+                continue
 
-        row = {
-            "epistasis_id": eid,
-            "gene": gene,
-            "distance": dist,
-            "cosine_to_kras": cos,
-            "abs_cosine_to_kras": abs(cos),
-            "residual_magnitude": float(r_norm),
-            "gene_class": ("Oncogene" if gene in ONCOGENES else
-                           "TSG" if gene in TSGS else "Other"),
-        }
+            gene = eid.split(":")[0]
+            parts = eid.split("|")
+            dist = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
 
-        # Add metadata
-        if tcga_meta is not None and eid in tcga_meta.index:
-            for col in ["n_cases_both", "cond_prob_dependent"]:
-                if col in tcga_meta.columns:
-                    row[col] = tcga_meta.loc[eid, col]
+            all_rows.append({
+                "source": source_key,
+                "source_label": source_label,
+                "epistasis_id": eid,
+                "gene": gene,
+                "distance": dist,
+                "cosine_to_kras": cosine_sim(r, kras_vec),
+                "abs_cosine_to_kras": abs(cosine_sim(r, kras_vec)),
+                "residual_magnitude": float(r_norm),
+                "gene_class": ("Oncogene" if gene in ONCOGENES else
+                               "TSG" if gene in TSGS else "Other"),
+            })
+        db.close()
 
-        rows.append(row)
+    df = pd.DataFrame(all_rows)
+    print(f"  Total scored: {len(df)}")
+    print(f"  Per source: {df.groupby('source_label').size().to_dict()}")
 
-    db.close()
-    df = pd.DataFrame(rows)
-    df = df.sort_values("abs_cosine_to_kras", ascending=False).reset_index(drop=True)
-    df["percentile"] = (df.index + 1) / len(df) * 100
+    # ---- Within-bin comparison: TCGA vs 1kGP ----
+    from scipy.stats import mannwhitneyu
 
-    # Top 30 most KRAS-like pairs
-    print(f"\n  TOP 30 TCGA pairs most similar to KRAS G60G-Q61K ({display}):")
-    print(f"  {'rank':>4s} {'gene':>12s} {'class':>10s} {'cos':>7s} {'|ε|':>8s} "
-          f"{'dist':>5s} {'n_pts':>5s} {'epistasis_id'}")
-    print(f"  " + "-" * 100)
+    print(f"\n  WITHIN-BIN: |cosine to KRAS| — TCGA sources vs 1kGP germline")
+    print(f"  {'bin':>12s} | {'source':>15s} {'n':>6s} {'median':>8s} | "
+          f"{'vs 1kGP p':>12s} {'dir':>6s}")
 
-    for i, r in df.head(30).iterrows():
-        n_pts = f"{int(r['n_cases_both']):>5d}" if "n_cases_both" in r and pd.notna(r.get("n_cases_both")) else "    ?"
-        print(f"  {i+1:>4d} {r['gene']:>12s} {r['gene_class']:>10s} "
-              f"{r['cosine_to_kras']:>+7.3f} {r['residual_magnitude']:>8.4f} "
-              f"{r['distance']:>5d} {n_pts} {r['epistasis_id']}")
+    for (lo, hi), label in zip(DIST_BINS, DIST_LABELS):
+        germ = df[(df["source"] == "okgp_matched_doubles") &
+                   (df["distance"] >= lo) & (df["distance"] < hi)]
+        if len(germ) < 10:
+            continue
 
-    # Top cancer gene pairs
-    cancer = df[df["gene_class"] != "Other"].head(20)
-    print(f"\n  TOP 20 CANCER GENE pairs most similar to KRAS ({display}):")
-    print(f"  {'rank':>4s} {'gene':>12s} {'class':>10s} {'cos':>7s} {'|ε|':>8s} "
-          f"{'dist':>5s} {'%ile':>6s}")
-    print(f"  " + "-" * 70)
+        gv = germ["abs_cosine_to_kras"]
+
+        for src_key in ["tcga_high_selection", "tcga_low_selection", "tcga_doubles"]:
+            src = df[(df["source"] == src_key) &
+                      (df["distance"] >= lo) & (df["distance"] < hi)]
+            if len(src) < 10:
+                continue
+
+            sv = src["abs_cosine_to_kras"]
+            _, p = mannwhitneyu(sv, gv, alternative="two-sided")
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+            direction = "TCGA>" if sv.median() > gv.median() else "germ>"
+
+            print(f"  {label:>12s} | {SOURCES[src_key]:>15s} {len(src):6d} "
+                  f"{sv.median():8.4f} | {p:11.2e}{sig:>3s} {direction:>6s}")
+
+        # Print germline reference
+        print(f"  {label:>12s} | {'1kGP germline':>15s} {len(germ):6d} "
+              f"{gv.median():8.4f} | {'(reference)':>15s}")
+        print()
+
+    # ---- Pooled comparison ----
+    print(f"\n  POOLED comparison:")
+    germ_all = df[df["source"] == "okgp_matched_doubles"]["abs_cosine_to_kras"]
+    for src_key in ["tcga_high_selection", "tcga_low_selection", "tcga_doubles"]:
+        src_all = df[df["source"] == src_key]["abs_cosine_to_kras"]
+        if len(src_all) < 10:
+            continue
+        _, p = mannwhitneyu(src_all, germ_all, alternative="two-sided")
+        sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+        direction = "TCGA>" if src_all.median() > germ_all.median() else "germ>"
+        print(f"    {SOURCES[src_key]:>15s}: median={src_all.median():.4f} vs "
+              f"1kGP={germ_all.median():.4f}, p={p:.2e}{sig} {direction}")
+
+    # ---- Tail enrichment: at top X% of combined ranking, what fraction is TCGA? ----
+    print(f"\n  TAIL ENRICHMENT: fraction TCGA among most KRAS-like pairs")
+
+    # Combined TCGA high-sel + 1kGP (the matched pair)
+    matched = df[df["source"].isin(["tcga_high_selection", "okgp_matched_doubles"])].copy()
+    matched = matched.sort_values("abs_cosine_to_kras", ascending=False).reset_index(drop=True)
+    n_tcga_total = (matched["source"] == "tcga_high_selection").sum()
+    n_germ_total = (matched["source"] == "okgp_matched_doubles").sum()
+    base_rate = n_tcga_total / len(matched)
+
+    print(f"    Base rate TCGA: {base_rate:.1%} ({n_tcga_total}/{len(matched)})")
+
+    from scipy.stats import fisher_exact
+    for top_pct in [1, 2, 5, 10]:
+        n_top = max(1, int(len(matched) * top_pct / 100))
+        top = matched.head(n_top)
+        n_tcga_top = (top["source"] == "tcga_high_selection").sum()
+        n_germ_top = (top["source"] == "okgp_matched_doubles").sum()
+        frac_tcga = n_tcga_top / n_top
+
+        # Fisher's exact
+        table = [[n_tcga_top, n_germ_top],
+                 [n_tcga_total - n_tcga_top, n_germ_total - n_germ_top]]
+        odds, p_fisher = fisher_exact(table, alternative="two-sided")
+        sig = "***" if p_fisher < 0.001 else "**" if p_fisher < 0.01 else "*" if p_fisher < 0.05 else ""
+
+        print(f"    Top {top_pct:>2d}% ({n_top:>5d}): TCGA={n_tcga_top}/{n_top} "
+              f"({frac_tcga:.1%} vs base {base_rate:.1%}), "
+              f"OR={odds:.2f}, p={p_fisher:.2e}{sig}")
+
+    # ---- Top TCGA nominations ----
+    tcga_only = df[df["source"] == "tcga_doubles"].sort_values(
+        "abs_cosine_to_kras", ascending=False).reset_index(drop=True)
+
+    print(f"\n  TOP 20 CANCER GENE nominations ({display}):")
+    cancer = tcga_only[tcga_only["gene_class"] != "Other"].head(20)
+    print(f"  {'rank':>4s} {'gene':>12s} {'class':>10s} {'cos':>7s} {'|ε|':>8s} {'dist':>5s}")
+    print(f"  " + "-" * 55)
     for _, r in cancer.iterrows():
         print(f"  {int(r.name)+1:>4d} {r['gene']:>12s} {r['gene_class']:>10s} "
               f"{r['cosine_to_kras']:>+7.3f} {r['residual_magnitude']:>8.4f} "
-              f"{r['distance']:>5d} {r['percentile']:>5.1f}%")
-
-    # Stats
-    print(f"\n  Summary:")
-    print(f"    Mean |cos| all: {df['abs_cosine_to_kras'].mean():.4f}")
-    print(f"    Mean |cos| cancer genes: {df[df['gene_class'] != 'Other']['abs_cosine_to_kras'].mean():.4f}")
-    print(f"    Mean |cos| oncogenes: {df[df['gene_class'] == 'Oncogene']['abs_cosine_to_kras'].mean():.4f}")
-    print(f"    Mean |cos| TSGs: {df[df['gene_class'] == 'TSG']['abs_cosine_to_kras'].mean():.4f}")
-
-    # Are cancer genes more KRAS-like?
-    from scipy.stats import mannwhitneyu
-    cancer_cos = df[df["gene_class"] != "Other"]["abs_cosine_to_kras"]
-    other_cos = df[df["gene_class"] == "Other"]["abs_cosine_to_kras"]
-    if len(cancer_cos) > 10:
-        _, p = mannwhitneyu(cancer_cos, other_cos, alternative="two-sided")
-        print(f"    Cancer vs Other |cos|: p={p:.2e}")
-
-    # Enrichment: are cancer genes overrepresented in top 5%?
-    from scipy.stats import hypergeom
-    n_top = max(1, int(len(df) * 0.05))
-    top = df.head(n_top)
-    k_obs = (top["gene_class"] != "Other").sum()
-    K = (df["gene_class"] != "Other").sum()
-    N = len(df)
-    k_exp = K * n_top / N
-    p_enrich = hypergeom.sf(k_obs - 1, N, K, n_top)
-    fold = k_obs / (k_exp + 1e-10)
-    print(f"    Cancer gene enrichment in top 5%: fold={fold:.2f}, "
-          f"k={k_obs}/{n_top}, exp={k_exp:.1f}, p={p_enrich:.4f}")
+              f"{r['distance']:>5d}")
 
     # Save
     out_path = FIG_DIR / f"tcga_kras_similarity_{mk}.csv"
     df.to_csv(out_path, index=False)
-    print(f"\n  Full ranking saved to {out_path}")
+    print(f"\n  Saved to {out_path}")
 
 print("\nDone.")
