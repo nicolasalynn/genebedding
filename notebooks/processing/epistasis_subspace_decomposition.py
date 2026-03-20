@@ -74,10 +74,14 @@ print(f"Oncogenes: {len(ONCOGENES)}, TSGs: {len(TSGS)}")
 from genebeddings import VariantEmbeddingDB
 from genebeddings.epistasis_features import _list_epistasis_ids_from_db, _load_residual_from_db
 
-TCGA_SOURCE = "tcga_doubles"
+SOURCES = {
+    "tcga_doubles": "TCGA (original)",
+    "tcga_high_selection": "TCGA high-sel",
+    "tcga_low_selection": "TCGA low-sel",
+    "okgp_matched_doubles": "1kGP germline",
+    "okgp_chr12": "1kGP chr12 (null)",
+}
 
-# Models to analyze — focus on track models (clear expression axes)
-# plus MLMs (for comparison)
 MODELS = {
     "borzoi": "Borzoi",
     "alphagenome": "AlphaGenome",
@@ -105,67 +109,57 @@ for mk, display in MODELS.items():
 
     # Top-k eigenvectors of null covariance = "expression subspace"
     eigenvalues, eigenvectors = np.linalg.eigh(null_cov)
-    # eigh returns ascending order, top-k are at the end
-    V_expression = eigenvectors[:, -K_DIMS:]  # (d, k) — top-k null eigenvecs
+    V_expression = eigenvectors[:, -K_DIMS:]  # (d, k)
 
-    # Projection matrix onto expression subspace: P = V @ V.T
-    # For a vector x: x_expression = P @ x, x_orthogonal = x - P @ x
-    # Expression fraction = |P @ x|² / |x|²
-
-    # Load TCGA residuals
-    db_path = OUTPUT_BASE / TCGA_SOURCE / f"{mk}.db"
-    if not db_path.exists():
-        logger.warning("No TCGA DB for %s, skipping", mk)
-        continue
-
-    db = VariantEmbeddingDB(str(db_path))
-    epi_ids = _list_epistasis_ids_from_db(db)
-    logger.info("%s: %d TCGA pairs, d=%d, k=%d", mk, len(epi_ids), d, K_DIMS)
-
-    for eid in epi_ids:
-        residual = _load_residual_from_db(db, eid)
-        if residual is None:
+    # Process ALL sources
+    for source_key, source_label in SOURCES.items():
+        db_path = OUTPUT_BASE / source_key / f"{mk}.db"
+        if not db_path.exists():
             continue
 
-        r = residual.astype(np.float64)
-        r_norm_sq = np.dot(r, r)
-        if r_norm_sq < 1e-30:
-            continue
+        db = VariantEmbeddingDB(str(db_path))
+        epi_ids = _list_epistasis_ids_from_db(db)
+        logger.info("%s/%s: %d pairs, d=%d", mk, source_key, len(epi_ids), d)
 
-        # Project onto expression subspace
-        r_proj = V_expression @ (V_expression.T @ r)  # (d,)
-        r_proj_norm_sq = np.dot(r_proj, r_proj)
+        for eid in epi_ids:
+            residual = _load_residual_from_db(db, eid)
+            if residual is None:
+                continue
 
-        expression_fraction = r_proj_norm_sq / r_norm_sq
-        orthogonal_fraction = 1.0 - expression_fraction
+            r = residual.astype(np.float64)
+            r_norm_sq = np.dot(r, r)
+            if r_norm_sq < 1e-30:
+                continue
 
-        # Also get the sign: is the residual in the expression direction
-        # more corrective or cumulative?
-        # Use the mean of the projected components
-        r_orth = r - r_proj
-        r_mag = np.sqrt(r_norm_sq)
+            r_proj = V_expression @ (V_expression.T @ r)
+            r_proj_norm_sq = np.dot(r_proj, r_proj)
 
-        gene = eid.split(":")[0]
-        parts = eid.split("|")
-        distance = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
+            expression_fraction = r_proj_norm_sq / r_norm_sq
+            r_mag = np.sqrt(r_norm_sq)
 
-        all_decomp.append({
-            "model": mk,
-            "display": display,
-            "epistasis_id": eid,
-            "gene": gene,
-            "distance": distance,
-            "expression_fraction": float(expression_fraction),
-            "orthogonal_fraction": float(orthogonal_fraction),
-            "residual_magnitude": float(r_mag),
-            "expression_magnitude": float(np.sqrt(r_proj_norm_sq)),
-            "orthogonal_magnitude": float(np.sqrt(max(0, r_norm_sq - r_proj_norm_sq))),
-            "is_oncogene": gene in ONCOGENES,
-            "is_tsg": gene in TSGS,
-            "gene_class": "Oncogene" if gene in ONCOGENES else ("TSG" if gene in TSGS else "Other"),
-        })
+            gene = eid.split(":")[0]
+            parts = eid.split("|")
+            distance = abs(int(parts[1].split(":")[2]) - int(parts[0].split(":")[2]))
 
-    db.close()
+            all_decomp.append({
+                "model": mk,
+                "display": display,
+                "source": source_key,
+                "source_label": source_label,
+                "epistasis_id": eid,
+                "gene": gene,
+                "distance": distance,
+                "expression_fraction": float(expression_fraction),
+                "orthogonal_fraction": 1.0 - float(expression_fraction),
+                "residual_magnitude": float(r_mag),
+                "expression_magnitude": float(np.sqrt(r_proj_norm_sq)),
+                "orthogonal_magnitude": float(np.sqrt(max(0, r_norm_sq - r_proj_norm_sq))),
+                "is_oncogene": gene in ONCOGENES,
+                "is_tsg": gene in TSGS,
+                "gene_class": "Oncogene" if gene in ONCOGENES else ("TSG" if gene in TSGS else "Other"),
+            })
+
+        db.close()
 
 df_decomp = pd.DataFrame(all_decomp)
 print(f"\nTotal: {len(df_decomp)} model×pair entries")
@@ -174,16 +168,50 @@ print(f"Pairs per model: {df_decomp.groupby('model').size().to_dict()}")
 
 
 # ---------------------------------------------------------------------------
-# Cell 3: Do oncogenes and TSGs differ in expression fraction?
+# Cell 3: Compare expression fraction across sources AND gene classes
 # ---------------------------------------------------------------------------
-print("\n" + "=" * 90)
-print(f"EXPRESSION FRACTION by gene class (top-{K_DIMS} null eigenvectors)")
-print("High = epistasis along expression axes | Low = epistasis along orthogonal axes")
-print("=" * 90)
+print("\n" + "=" * 100)
+print(f"EXPRESSION FRACTION by source and gene class (top-{K_DIMS} null eigenvectors)")
+print("High = epistasis along expression axes | Low = orthogonal (splicing/structural)")
+print("=" * 100)
 
-summary_rows = []
+# 3a: Source comparison (cancer vs germline)
+print("\n--- SOURCE COMPARISON (all genes) ---")
+source_rows = []
 for mk in df_decomp["model"].unique():
     sub = df_decomp[df_decomp["model"] == mk]
+    display = sub.iloc[0]["display"]
+
+    print(f"\n  {display}:")
+    source_vals = {}
+    for src in SOURCES:
+        vals = sub[sub["source"] == src]["expression_fraction"]
+        if len(vals) >= 10:
+            source_vals[src] = vals
+            print(f"    {SOURCES[src]:25s}: median={vals.median():.4f}, n={len(vals)}")
+
+    # Pairwise comparisons
+    for s1, s2 in [("tcga_doubles", "okgp_chr12"),
+                    ("tcga_high_selection", "tcga_low_selection"),
+                    ("tcga_high_selection", "okgp_matched_doubles")]:
+        if s1 in source_vals and s2 in source_vals:
+            _, p = mannwhitneyu(source_vals[s1], source_vals[s2], alternative="two-sided")
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+            source_rows.append({
+                "model": display, "comparison": f"{SOURCES[s1]} vs {SOURCES[s2]}",
+                "median_1": source_vals[s1].median(), "median_2": source_vals[s2].median(),
+                "p": p,
+            })
+            print(f"    {SOURCES[s1]} vs {SOURCES[s2]}: p={p:.2e} {sig}")
+
+df_source_comp = pd.DataFrame(source_rows)
+
+# 3b: Gene class comparison within TCGA
+print("\n\n--- GENE CLASS COMPARISON (TCGA sources combined) ---")
+summary_rows = []
+for mk in df_decomp["model"].unique():
+    sub = df_decomp[(df_decomp["model"] == mk) &
+                     df_decomp["source"].isin(["tcga_doubles", "tcga_high_selection", "tcga_low_selection"])]
     display = sub.iloc[0]["display"]
 
     onc = sub[sub["gene_class"] == "Oncogene"]["expression_fraction"]
@@ -193,11 +221,11 @@ for mk in df_decomp["model"].unique():
     if len(onc) < 10 or len(tsg) < 10:
         continue
 
-    stat_ot, p_ot = mannwhitneyu(onc, tsg, alternative="two-sided")
-    stat_oo, p_oo = mannwhitneyu(onc, other, alternative="two-sided")
-    stat_to, p_to = mannwhitneyu(tsg, other, alternative="two-sided")
+    _, p_ot = mannwhitneyu(onc, tsg, alternative="two-sided")
+    _, p_oo = mannwhitneyu(onc, other, alternative="two-sided")
+    _, p_to = mannwhitneyu(tsg, other, alternative="two-sided")
 
-    sig_ot = "***" if p_ot < 0.001 else "**" if p_ot < 0.01 else "*" if p_ot < 0.05 else ""
+    sig = "***" if p_ot < 0.001 else "**" if p_ot < 0.01 else "*" if p_ot < 0.05 else ""
 
     summary_rows.append({
         "model": display,
@@ -215,9 +243,24 @@ for mk in df_decomp["model"].unique():
     print(f"    Oncogene: median={onc.median():.4f} (n={len(onc)})")
     print(f"    TSG:      median={tsg.median():.4f} (n={len(tsg)})")
     print(f"    Other:    median={other.median():.4f} (n={len(other)})")
-    print(f"    Onc vs TSG: p={p_ot:.4e} {sig_ot}")
+    print(f"    Onc vs TSG: p={p_ot:.2e} {sig}")
 
 df_summary = pd.DataFrame(summary_rows)
+
+# 3c: Null signature matching — what fraction of null pairs look expression-like vs splicing-like?
+print("\n\n--- NULL SIGNATURE DISTRIBUTION ---")
+for mk in df_decomp["model"].unique():
+    sub = df_decomp[df_decomp["model"] == mk]
+    display = sub.iloc[0]["display"]
+
+    for src in SOURCES:
+        vals = sub[sub["source"] == src]["expression_fraction"]
+        if len(vals) < 50:
+            continue
+        expr_like = (vals > 0.5).mean()  # fraction with >50% expression-axis
+        splicing_like = (vals <= 0.5).mean()
+        print(f"  {display:15s} {SOURCES[src]:25s}: "
+              f"expression-like={expr_like:.1%}, orthogonal={splicing_like:.1%} (n={len(vals)})")
 
 
 # ---------------------------------------------------------------------------
