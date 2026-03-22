@@ -28,7 +28,7 @@ import os
 from pathlib import Path
 
 _CLUSTER_ROOT = Path("/tamir2/nicolaslynn/data/epistasis_paper")
-_HOME_ROOT = Path.home() / "data" / "epistasis_paper"
+_HOME_ROOT = Path.home() / "Documents" / "phd" / "data" / "epistasis_paper"
 
 # Use cluster path if it exists (Tamir cluster), otherwise ~/data/epistasis_paper.
 # Override with env EPISTASIS_PAPER_ROOT.

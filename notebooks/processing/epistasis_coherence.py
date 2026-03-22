@@ -219,6 +219,89 @@ df_coh = pd.DataFrame(coherence_rows)
 
 
 # =========================================================================
+# Analysis 1b: TAIL — do TCGA pairs have more high-cosine neighbors?
+# =========================================================================
+print(f"\n{'=' * 90}")
+print("ANALYSIS 1b: HIGH-COSINE TAIL")
+print("For each pair, count how many other same-source pairs have |cos| > threshold.")
+print("If TCGA has a directional cluster (even small), its tail will be heavier.")
+print("=" * 90)
+
+COSINE_THRESHOLDS = [0.3, 0.5, 0.7]
+
+for mk, display in MODELS.items():
+    print(f"\n--- {display} ---")
+
+    for label in DIST_LABELS:
+        tcga_group = residuals.get((mk, "tcga_high_selection", label), [])
+        germ_group = residuals.get((mk, "okgp_matched_doubles", label), [])
+
+        if len(tcga_group) < 20 or len(germ_group) < 20:
+            continue
+
+        tcga_vecs = np.stack([r for r, _, _ in tcga_group])
+        germ_vecs = np.stack([r for r, _, _ in germ_group])
+
+        # Normalize
+        tcga_unit = tcga_vecs / np.linalg.norm(tcga_vecs, axis=1, keepdims=True).clip(1e-20)
+        germ_unit = germ_vecs / np.linalg.norm(germ_vecs, axis=1, keepdims=True).clip(1e-20)
+
+        # Sample pairwise cosines (full matrix is too big)
+        n_sample = min(2000, len(tcga_unit) * (len(tcga_unit) - 1) // 2)
+        idx1 = rng.randint(0, len(tcga_unit), size=n_sample)
+        idx2 = rng.randint(0, len(tcga_unit), size=n_sample)
+        mask = idx1 != idx2
+        tcga_cosines = np.abs(np.sum(tcga_unit[idx1[mask]] * tcga_unit[idx2[mask]], axis=1))
+
+        n_sample_g = min(2000, len(germ_unit) * (len(germ_unit) - 1) // 2)
+        idx1g = rng.randint(0, len(germ_unit), size=n_sample_g)
+        idx2g = rng.randint(0, len(germ_unit), size=n_sample_g)
+        maskg = idx1g != idx2g
+        germ_cosines = np.abs(np.sum(germ_unit[idx1g[maskg]] * germ_unit[idx2g[maskg]], axis=1))
+
+        parts = []
+        for thresh in COSINE_THRESHOLDS:
+            t_frac = (tcga_cosines > thresh).mean()
+            g_frac = (germ_cosines > thresh).mean()
+            ratio = t_frac / (g_frac + 1e-10)
+            parts.append(f"|cos|>{thresh}: TCGA={t_frac:.3%} germ={g_frac:.3%} ratio={ratio:.2f}")
+
+        print(f"  {label:>12s} (n={len(tcga_group)}/{len(germ_group)}): " + " | ".join(parts))
+
+    # Pooled across all bins
+    all_tcga_vecs = []
+    all_germ_vecs = []
+    for label in DIST_LABELS:
+        all_tcga_vecs.extend([r for r, _, _ in residuals.get((mk, "tcga_high_selection", label), [])])
+        all_germ_vecs.extend([r for r, _, _ in residuals.get((mk, "okgp_matched_doubles", label), [])])
+
+    if len(all_tcga_vecs) > 20 and len(all_germ_vecs) > 20:
+        tcga_a = np.stack(all_tcga_vecs)
+        germ_a = np.stack(all_germ_vecs)
+        tcga_u = tcga_a / np.linalg.norm(tcga_a, axis=1, keepdims=True).clip(1e-20)
+        germ_u = germ_a / np.linalg.norm(germ_a, axis=1, keepdims=True).clip(1e-20)
+
+        ns = min(5000, len(tcga_u) * (len(tcga_u) - 1) // 2)
+        i1 = rng.randint(0, len(tcga_u), size=ns)
+        i2 = rng.randint(0, len(tcga_u), size=ns)
+        m = i1 != i2
+        tc = np.abs(np.sum(tcga_u[i1[m]] * tcga_u[i2[m]], axis=1))
+
+        i1g = rng.randint(0, len(germ_u), size=ns)
+        i2g = rng.randint(0, len(germ_u), size=ns)
+        mg = i1g != i2g
+        gc = np.abs(np.sum(germ_u[i1g[mg]] * germ_u[i2g[mg]], axis=1))
+
+        parts = []
+        for thresh in COSINE_THRESHOLDS:
+            t_f = (tc > thresh).mean()
+            g_f = (gc > thresh).mean()
+            ratio = t_f / (g_f + 1e-10)
+            parts.append(f"|cos|>{thresh}: TCGA={t_f:.3%} germ={g_f:.3%} ratio={ratio:.2f}")
+        print(f"  {'POOLED':>12s} (n={len(all_tcga_vecs)}/{len(all_germ_vecs)}): " + " | ".join(parts))
+
+
+# =========================================================================
 # Analysis 2: Gene class coherence within TCGA
 # =========================================================================
 print(f"\n{'=' * 90}")

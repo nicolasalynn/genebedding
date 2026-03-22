@@ -167,12 +167,80 @@ aligned with splicing signal.
 
 ---
 
-## 6. Pending Analyses
+## 6. TCGA Survival Epistasis — NEW SECTION (March 2026)
 
+### Overview
+
+We identified 20,628 FDR-significant double mutation pairs (BH q<0.10, from 1.1M
+burden-matched survival tests) across all genic variant types: coding, silent,
+intronic, UTR, and splice region. 715 pairs survive a 4-level confounder cascade
+(gene mutation count, TMB, cancer type stratification). 525 of 715 (73%) involve
+exclusively non-coding mutations (345 intron/intron, 17 silent/silent).
+
+### Key result: epistasis geometry distinguishes survival-significant pairs
+
+From 1,545 survival-significant pairs with existing embedding scores, compared to
+8,735 burden-matched non-significant controls from the same genes:
+
+| Metric | Sig (n=7,694) | Null (n=43,602) | MWU p | Perm p (mean) |
+|--------|--------------|----------------|-------|---------------|
+| epi_R_singles (median) | 0.199 | 0.145 | <0.0001 | <0.0001 |
+| epi_R_raw (median) | 0.020 | 0.015 | <0.0001 | 0.023 |
+| global_epi_mahal (median) | 7.11 | 5.03 | <0.0001 | 0.0004 |
+
+All 5 models individually significant for epi_R_singles (p<0.0001 each).
+
+The effect is heavy-tailed: survival-significant pairs have significantly wider
+variance than controls (Levene p<1e-43 for mahal_ratio, p<1e-17 for epi_R_singles).
+A subset of pairs show extreme epistasis (epi_R_singles > 1.0, meaning the
+non-additive residual exceeds single-variant effects).
+
+### Cross-model outliers
+
+| Gene | Type | epi_R_singles | Models detecting | Biology |
+|------|------|--------------|-----------------|---------|
+| TTL | Intron/Intron | 18.5 (RiNALMo) | 2/5 | Tubulin tyrosine ligase |
+| POU2F3 | Intron/Intron | 3.6 (AlphaGenome) | 1/5 | Taste cell TF, cancer |
+| HLA-DQA1 | Intron/Intron | 3.2 (Borzoi) | 2/5 | MHC class II |
+| SLC25A5 | Missense/Missense | 3.6 (NTv3) | 2/5 | Mitochondrial transporter |
+| CDH1 | Intron/Intron | 1.9 (Borzoi) | 1/5 | E-cadherin, major TSG |
+| FMR1 | Silent/Missense | 2.3 (RiNALMo) | 1/5 | Fragile X gene |
+
+### What this shows
+
+DNA language models detect non-additive interaction in double mutations that predict
+patient survival. The signal is strongest in non-coding variants (intronic, silent)
+where protein-level epistasis models have no explanatory power. The survival
+selection is completely independent of the embedding computation — models never
+see clinical data.
+
+### Pipeline
+
+- `tcga_survival_epistasis.py` — pair discovery with burden-matched controls
+- `survival_confounder_framework.py` — L0-L3 confounder cascade
+- `run_survival_epistasis.ipynb` — cluster embedding + analysis
+- Sources: `survival_significant`, `survival_tcga_null`, `survival_germline_null`
+  in `all_pairs_combined.tsv`
+- 6,146 pairs total (715 sig + 2,325 TCGA null + 3,106 germline null)
+
+### TODO: Apply enrichment analysis
+
+Run the KRAS-similarity enrichment (from `tcga_kras_similarity.py`) and the
+tail enrichment / Fisher's exact framework on the survival target vs both null
+sets. If survival-significant pairs are enriched at the tail of the KRAS
+similarity distribution, that connects the survival finding to the validated
+KRAS compensatory mechanism.
+
+---
+
+## 7. Pending Analyses
+
+- [ ] Run `run_survival_epistasis.ipynb` on cluster (6,128 new pairs to embed)
+- [ ] Apply KRAS-similarity enrichment on survival sig vs TCGA null vs germline null
+- [ ] Run full confounder cascade on the 20,628 FDR-sig pairs (currently done for 2,810 from old run)
 - [ ] Selection pressure comparison (fig_selection_pressure.py — 4 models embedded, needs to run)
 - [ ] Mahalanobis diagnostics: shrinkage intensity per model
 - [ ] Distance-binned covariance shift (run_metrics_only Cell 4 — binned data now available)
-- [ ] Update Cell 14 to use within-bin comparison instead of residualization
 
 ---
 
